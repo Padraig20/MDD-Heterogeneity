@@ -4,6 +4,7 @@ import logging
 import scanpy as sc
 import pandas as pd
 import numpy as np
+import re
 from pathlib import Path
 
 """
@@ -38,6 +39,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Increase verbosity."
     )
+    parser.add_argument(
+        "-chr", "--chromosome",
+        default=False,
+        action="store_true",
+        help="Specify if should be grouped by chromosome."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -55,26 +62,71 @@ def load_data(input_path: Path) -> sc.AnnData:
     logging.info("Loading data from %s", input_path)
     return sc.read_h5ad(input_path)
 
-def prepare_target_vars(data: sc.AnnData) -> pd.DataFrame:
+# chromosomes are named weirly sometimes
+# we don't like that, so we map back (if possible) to standard names
+# examples: 'chrUn_GL000219v1', 'chr1_KI270711v1', 'chrUn_GL000218v1', 'chrM'
+def simplify_chr(c: str) -> str | None:
+        m = re.match(r"^(chr(?:\d+|X|Y))\b", c)
+        return m.group(1) if m else None
+
+def prepare_target_vars(data: sc.AnnData, group_by_chromosome: bool = True) -> pd.DataFrame:
     """Transform raw data into target variables."""
     logging.info("Preparing target variables")
 
     cell_types = data.obs['cell_type']
     cell_types_unique = cell_types.unique().tolist()
-    logging.debug("Identified cell types: %s", cell_types_unique)
+    logging.debug("Cell types: %s", cell_types_unique)
 
-    Y = pd.DataFrame(
-        index=cell_types_unique, # cell types
-        columns = data.var_names # genes
-    )
+    gene_names = data.var['Gene']
+    gene_names_unique = gene_names.unique().tolist()
+    logging.debug("Genes (first 10): %s", gene_names_unique[:10])
 
-    for ct in Y.index:
-        idx = np.where(cell_types == ct)[0]
-        Y.loc[ct] = data.X[idx].mean(axis=0).A1 # matrices are sparse
+    if group_by_chromosome:
+        chromosome_names_raw = data.var['Chromosome']
+        chromosome_names = chromosome_names_raw.map(simplify_chr)
+        chromosome_names_unique = chromosome_names.unique().tolist()
+        logging.debug("Chromosomes: %s", chromosome_names_unique)
+
+        # combine cell type and chromosome into "cell_type,chromo"
+        combined = [f"{ct},{ch}"
+                    for ct in cell_types_unique
+                    for ch in chromosome_names_unique
+                    if ch is not None]
+        logging.debug("Combined cell_type,chromo (unique): %s", combined)
+
+        Y = pd.DataFrame(
+            index=combined,       # cell type x chromosome
+            columns=gene_names,   # genes
+        )
+
+        for ct_chr in Y.index:
+            ct, ch = ct_chr.split(",")
+            idx_cells = np.where(cell_types == ct)[0]
+            if idx_cells.size == 0:
+                continue
+            means = data.X[idx_cells].mean(axis=0).A1
+            mask_ch = (chromosome_names == ch).values
+            row = np.full_like(means, 0, dtype=float)
+            row[mask_ch] = means[mask_ch]
+            Y.loc[ct_chr] = row
+
+    else: # don't group by chromosome
+        Y = pd.DataFrame(
+            index=cell_types_unique,  # cell types
+            columns=gene_names,       # genes
+        )
+        for ct in Y.index:
+            idx = np.where(cell_types == ct)[0]
+            Y.loc[ct] = data.X[idx].mean(axis=0).A1
+
+    for g in gene_names_unique:
+        cols = np.where(gene_names == g)[0]
+        if len(cols) > 1: # collapse duplicate genes by averaging
+            Y[g] = Y.iloc[:, cols].mean(axis=1)
     
     logging.info("Prepared target variables with shape %s", Y.shape)
     logging.debug("Target variables preview:\n%s", Y.head())
-    
+
     return Y
 
 def save_output(data: pd.DataFrame, output_path: Path) -> None:
@@ -89,7 +141,7 @@ def main() -> None:
     logging.debug("Arguments: %s", args)
 
     data = load_data(args.input)
-    targets = prepare_target_vars(data)
+    targets = prepare_target_vars(data, args.chromosome)
 
     save_output(targets, args.output)
     logging.info("Done.")
