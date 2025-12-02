@@ -77,7 +77,7 @@ def prepare_target_vars(data: sc.AnnData, group_by_chromosome: bool = True) -> p
     cell_types_unique = cell_types.unique().tolist()
     logging.debug("Cell types: %s", cell_types_unique)
 
-    gene_names = data.var['Gene']
+    gene_names = data.var.index # using Ensembl IDs
     gene_names_unique = gene_names.unique().tolist()
     logging.debug("Genes (first 10): %s", gene_names_unique[:10])
 
