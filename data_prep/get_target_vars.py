@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Specify if should be grouped by chromosome."
     )
+    parser.add_argument(
+        "--mdd_genes",
+        type=Path,
+        default=None,
+        help="If provided, path to MDD gene list (TSV) to filter target variables."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -69,7 +75,7 @@ def simplify_chr(c: str) -> str | None:
         m = re.match(r"^(chr(?:\d+|X|Y))\b", c)
         return m.group(1) if m else None
 
-def prepare_target_vars(data: sc.AnnData, group_by_chromosome: bool = True) -> pd.DataFrame:
+def prepare_target_vars(data: sc.AnnData, mdd_genes_path: Path | None, group_by_chromosome: bool = True) -> pd.DataFrame:
     """Transform raw data into target variables."""
     logging.info("Preparing target variables")
 
@@ -80,6 +86,15 @@ def prepare_target_vars(data: sc.AnnData, group_by_chromosome: bool = True) -> p
     gene_names = data.var.index # using Ensembl IDs
     gene_names_unique = gene_names.unique().tolist()
     logging.debug("Genes (first 10): %s", gene_names_unique[:10])
+
+    if mdd_genes_path is not None:
+        logging.info("Filtering target variables to MDD genes from %s", mdd_genes_path)
+        mdd_genes_df = pd.read_csv(mdd_genes_path, sep="\t")
+        mdd_gene_list = mdd_genes_df['ENSID'].tolist()
+        mask_mdd = gene_names.isin(mdd_gene_list)
+        gene_names = gene_names[mask_mdd]
+        data = data[:, mask_mdd]
+        logging.info("After filtering, %d genes of %d remain...", len(gene_names), len(mdd_gene_list))
 
     if group_by_chromosome:
         chromosome_names_raw = data.var['Chromosome']
@@ -141,7 +156,7 @@ def main() -> None:
     logging.debug("Arguments: %s", args)
 
     data = load_data(args.input)
-    targets = prepare_target_vars(data, args.chromosome)
+    targets = prepare_target_vars(data, args.mdd_genes, args.chromosome)
 
     save_output(targets, args.output)
     logging.info("Done.")
