@@ -29,7 +29,9 @@ $3=="gene" {
     gene_id = "NA"
     if (match($9, /gene_id "([^"]+)"/, a)) gene_id = a[1]
 
+    chrom = $1
+
     if (gene_id ~ pattern) {
-        print gene_id, tss-window, tss+window
+        print chrom, gene_id, tss-window, tss+window
     }
 }' "$INPUT_FILE"
