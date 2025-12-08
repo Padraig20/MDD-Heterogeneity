@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
         help="Name of the model to use for feature extraction. List of available models will be expanded in the future."
     )
     parser.add_argument(
+        "-b", "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for feature extraction."
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="count",
         default=0,
@@ -76,16 +82,11 @@ def save_output(feats: np.array, ensids: np.array, output_path: Path) -> None:
     np.savez(output_path, features=feats, ensids=ensids)
 
 def dna_seq_to_tensor(seq: str) -> torch.Tensor:
-    """Convert a DNA sequence string to a one-hot encoded tensor."""
-    
-    seq_len = len(seq)
-    tensor = torch.zeros((1, seq_len), dtype=torch.long)
+    """Convert a DNA sequence string to an integer-encoded tensor (1D)."""
+    ids = [mapping[nuc] for nuc in seq]
+    return torch.tensor(ids, dtype=torch.long, device=device)  # (L,)
 
-    for i, nucleotide in enumerate(seq):
-        tensor[0, i] = mapping[nucleotide]
-    return tensor.to(device)
-
-def get_features(data: pd.DataFrame, model_name: str) -> pd.DataFrame:
+def get_features(data: pd.DataFrame, model_name: str, batch_size: int) -> pd.DataFrame:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
     if model_name == "enformer":
@@ -95,19 +96,25 @@ def get_features(data: pd.DataFrame, model_name: str) -> pd.DataFrame:
         all_feats  = []
         all_ensids = []
 
-        for _, row in tqdm(data.iterrows(), total=len(data), desc="Extracting features", unit="gene"):
-            ensid = row['ensid']
-            seq   = dna_seq_to_tensor(row['sequence']) # (1, 896, 5313)
+        num_rows = len(data)
+
+        for start_idx in tqdm(range(0, num_rows, batch_size), total=(num_rows + batch_size - 1) // batch_size, desc="Extracting features", unit="batch"):
+
+            end_idx = min(start_idx + batch_size, num_rows)
+            batch   = data.iloc[start_idx:end_idx]
+
+            batch_seqs   = [dna_seq_to_tensor(seq) for seq in batch["sequence"]]
+            batch_tensor = torch.stack(batch_seqs, dim=0)  # (B, L)
 
             with torch.no_grad():
-                output = model(seq)['human']           # (1, 896, 5313)
-            features  = output.squeeze().cpu().numpy() # (896, 5313)
+                output = model(batch_tensor)['human']      # (B, 896, 5313)
+            features  = output.cpu().numpy()               # (B, 896, 5313)
 
             all_feats.append(features)
-            all_ensids.append(ensid)
+            all_ensids.extend(batch["ensid"].tolist())
 
-        features_arr = np.stack(all_feats, axis=0)     # (N, 896, 5313)
-        ensid_arr    = np.array(all_ensids)            # (N,)
+        features_arr = np.concatenate(all_feats, axis=0)   # (N, 896, 5313)
+        ensid_arr    = np.array(all_ensids)                # (N,)
 
         logging.info("Feature extraction completed.")
         logging.debug("Sample of extracted features:\n%s", features_arr[0])
@@ -122,7 +129,7 @@ def main() -> None:
     logging.debug("Arguments: %s", args)
 
     data = load_data(args.input)
-    feats_arr, ensid_arr = get_features(data, args.model_name)
+    feats_arr, ensid_arr = get_features(data, args.model_name, args.batch_size)
 
     save_output(feats_arr, ensid_arr, args.output)
     logging.info("Done.")
