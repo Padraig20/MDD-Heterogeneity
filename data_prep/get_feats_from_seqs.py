@@ -5,6 +5,7 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
+from numpy.lib.format import open_memmap
 
 import torch
 from enformer_pytorch import Enformer
@@ -37,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         "-o", "--output",
         type=Path,
         required=True,
-        help="Path to write output file (*.npz)."
+        help="Path to write output file (just name, *.npy suffix will be added)."
     )
     parser.add_argument(
         "-m", "--model-name",
@@ -75,30 +76,41 @@ def load_data(input_path: Path) -> pd.DataFrame:
     logging.info("Loading data from %s", input_path)
     return pd.read_csv(input_path)
 
-def save_output(feats: np.array, ensids: np.array, output_path: Path) -> None:
-    """Save features and ensids to `output_path`."""
-    logging.info("Saving output to %s", output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(output_path, features=feats, ensids=ensids)
-
 def dna_seq_to_tensor(seq: str) -> torch.Tensor:
     """Convert a DNA sequence string to an integer-encoded tensor (1D)."""
     ids = [mapping[nuc] for nuc in seq]
     return torch.tensor(ids, dtype=torch.long, device=device)  # (L,)
 
-def get_features(data: pd.DataFrame, model_name: str, batch_size: int) -> pd.DataFrame:
+def get_features(data: pd.DataFrame, model_name: str, batch_size: int, output_path: Path) -> pd.DataFrame:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
     if model_name == "enformer":
         model = Enformer.from_pretrained("EleutherAI/enformer-official-rough", dtype="auto").to(device)
         model.eval()
 
-        all_feats  = []
-        all_ensids = []
+        feats_mm_path = output_path.with_suffix(".features.npy")
+        ensids_mm_path = output_path.with_suffix(".ensids.npy")
 
         num_rows = len(data)
+        logging.info("Number of sequences to process: %d", num_rows)
 
-        for start_idx in tqdm(range(0, num_rows, batch_size), total=(num_rows + batch_size - 1) // batch_size, desc="Extracting features", unit="batch"):
+        # create memmaps to immediately flush to disk
+        logging.debug("Creating memmap arrays at %s and %s", feats_mm_path, ensids_mm_path)
+
+        # pre-allocate
+        feats_mm = open_memmap(
+            feats_mm_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(num_rows, 896, 5313)
+        )
+
+        # don't need a memmap, small enough to fit in RAM
+        ensids = np.empty(num_rows, dtype=object)
+
+        for start_idx in tqdm(range(0, num_rows, batch_size),
+                              total=(num_rows + batch_size - 1) // batch_size,
+                              desc="Extracting features", unit="batch"):
 
             end_idx = min(start_idx + batch_size, num_rows)
             batch   = data.iloc[start_idx:end_idx]
@@ -107,19 +119,21 @@ def get_features(data: pd.DataFrame, model_name: str, batch_size: int) -> pd.Dat
             batch_tensor = torch.stack(batch_seqs, dim=0)  # (B, L)
 
             with torch.no_grad():
-                output = model(batch_tensor)['human']      # (B, 896, 5313)
-            features  = output.cpu().numpy()               # (B, 896, 5313)
+                output = model(batch_tensor)['human']            # (B, 896, 5313)
+            features  = output.cpu().numpy().astype(np.float16)  # (B, 896, 5313)
 
-            all_feats.append(features)
-            all_ensids.extend(batch["ensid"].tolist())
+            feats_mm[start_idx:end_idx, :, :] = features
+            ensids[start_idx:end_idx] = batch["ensid"].to_numpy()
 
-        features_arr = np.concatenate(all_feats, axis=0)   # (N, 896, 5313)
-        ensid_arr    = np.array(all_ensids)                # (N,)
+        logging.info("Features successfully extracted.")
 
-        logging.info("Feature extraction completed.")
-        logging.debug("Sample of extracted features:\n%s", features_arr[0])
+        logging.debug("Sample of extracted features:\n%s", feats_mm[0])
+        logging.debug("Features saved to %s, now flushing...", feats_mm_path)
+
+        del feats_mm
+        
+        np.save(output_path.with_suffix(".ensids.npy"), ensids)
  
-        return features_arr, ensid_arr
     else:
         raise ValueError(f"Model {model_name} not supported.")
 
@@ -129,9 +143,8 @@ def main() -> None:
     logging.debug("Arguments: %s", args)
 
     data = load_data(args.input)
-    feats_arr, ensid_arr = get_features(data, args.model_name, args.batch_size)
+    get_features(data, args.model_name, args.batch_size, args.output)
 
-    save_output(feats_arr, ensid_arr, args.output)
     logging.info("Done.")
 
 if __name__ == "__main__":
