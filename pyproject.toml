@@ -5,7 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "enformer-pytorch>=0.8.11",
     "fastapy>=1.0.5",
     "numpy>=2.3.5",
     "scanpy>=1.11.5",
+    "torch>=2.9.1",
+    "transformers>=4.57.3",
 ]
