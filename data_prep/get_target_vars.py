@@ -79,7 +79,7 @@ def prepare_target_vars(data: sc.AnnData, mdd_genes_path: Path | None, group_by_
     """Transform raw data into target variables."""
     logging.info("Preparing target variables")
 
-    cell_types = data.obs['cell_type']
+    cell_types = data.obs['cluster_id'] # dim <= 461 for sc human brain atlas v1.0
     cell_types_unique = cell_types.unique().tolist()
     logging.debug("Cell types: %s", cell_types_unique)
 
