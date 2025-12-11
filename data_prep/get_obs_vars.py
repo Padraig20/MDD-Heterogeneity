@@ -122,8 +122,32 @@ def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Seque
             logging.warning("Chromosome %s not found in FASTA", chrom)
             continue
 
-        # extract sub-sequence
-        gene_seq = seq.seq[tss_start:tss_end]
+        # now we want to exctract the sub-sequence around the TSS
+        # idea from seq2cells: if TSS cannot be centered without padding
+        # the sequence, shift the window to avoid padding as much as possible
+        window_size = tss_end - tss_start
+        seq_len = len(seq.seq)
+        
+        if tss_start < 0:
+            actual_start = 0
+            actual_end   = min(window_size, seq_len)
+        elif tss_end > seq_len:
+            actual_end   = seq_len
+            actual_start = max(0, seq_len - window_size)
+        else:
+            actual_start = tss_start
+            actual_end   = tss_end
+        
+        # extract sequence
+        gene_seq = seq.seq[actual_start:actual_end]
+        # if new end exceeds original end, we pad with Ns
+        if len(gene_seq) < window_size:
+            padding_needed = window_size - len(gene_seq)
+            if actual_start == 0: # pad at beginning
+                gene_seq = "N" * padding_needed + gene_seq
+            else: # pad at end
+                gene_seq = gene_seq + "N" * padding_needed
+
         assert len(gene_seq) == (tss_end - tss_start), "Sequence length mismatch"
 
         # save sequence back to dataframe
