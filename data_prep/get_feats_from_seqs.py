@@ -157,7 +157,7 @@ def main() -> None:
     setup_logging(args.verbose)
     logging.debug("Arguments: %s", args)
 
-    data = load_data(args.input)[:10]
+    data = load_data(args.input)
     get_features(data, args.model_name, args.batch_size, args.window_size, args.output)
 
     logging.info("Done.")
