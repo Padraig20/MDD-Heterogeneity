@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         "-i", "--input",
         type=Path,
         required=True,
-        help="Path to input file (*.h5ad)."
+        help="Path to input file (*.csv)."
     )
     parser.add_argument(
         "-o", "--output",
@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Batch size for feature extraction."
+    )
+    parser.add_argument(
+        "-w", "--window-size",
+        type=int,
+        default=4,
+        help="Window size for feature extraction, i.e. number of bins."
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -81,7 +87,7 @@ def dna_seq_to_tensor(seq: str) -> torch.Tensor:
     ids = [mapping[nuc] for nuc in seq]
     return torch.tensor(ids, dtype=torch.long, device=device)  # (L,)
 
-def get_features(data: pd.DataFrame, model_name: str, batch_size: int, output_path: Path) -> pd.DataFrame:
+def get_features(data: pd.DataFrame, model_name: str, batch_size: int, window_size: int, output_path: Path) -> pd.DataFrame:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
     if model_name == "enformer":
@@ -102,11 +108,12 @@ def get_features(data: pd.DataFrame, model_name: str, batch_size: int, output_pa
             feats_mm_path,
             mode="w+",
             dtype=np.float32,
-            shape=(num_rows, 896, 5313)
+            shape=(num_rows, 5313)
         )
 
         # don't need a memmap, small enough to fit in RAM
         ensids = np.empty(num_rows, dtype=object)
+        chroms = np.empty(num_rows, dtype=object)
 
         for start_idx in tqdm(range(0, num_rows, batch_size),
                               total=(num_rows + batch_size - 1) // batch_size,
@@ -120,10 +127,17 @@ def get_features(data: pd.DataFrame, model_name: str, batch_size: int, output_pa
 
             with torch.no_grad():
                 output = model(batch_tensor)['human']            # (B, 896, 5313)
-            features  = output.cpu().numpy().astype(np.float16)  # (B, 896, 5313)
+            features = output.cpu().numpy().astype(np.float32)   # (B, 896, 5313)
 
-            feats_mm[start_idx:end_idx, :, :] = features
+            # select central bin, average over window size
+            central_bin = features.shape[1] // 2
+            window_size_half = window_size // 2
+            features = features[:, central_bin-window_size_half:central_bin+window_size_half, :]  # (B, W, 5313)
+            features = features.mean(axis=1)  # (B, 5313)
+
+            feats_mm[start_idx:end_idx, :] = features
             ensids[start_idx:end_idx] = batch["ensid"].to_numpy()
+            chroms[start_idx:end_idx] = batch["chrom"].to_numpy()
 
         logging.info("Features successfully extracted.")
 
@@ -133,6 +147,7 @@ def get_features(data: pd.DataFrame, model_name: str, batch_size: int, output_pa
         del feats_mm
         
         np.save(output_path.with_suffix(".ensids.npy"), ensids)
+        np.save(output_path.with_suffix(".chroms.npy"), chroms)
  
     else:
         raise ValueError(f"Model {model_name} not supported.")
@@ -142,8 +157,8 @@ def main() -> None:
     setup_logging(args.verbose)
     logging.debug("Arguments: %s", args)
 
-    data = load_data(args.input)
-    get_features(data, args.model_name, args.batch_size, args.output)
+    data = load_data(args.input)[:10]
+    get_features(data, args.model_name, args.batch_size, args.window_size, args.output)
 
     logging.info("Done.")
 
