@@ -211,3 +211,4 @@ __marimo__/
 uv.lock
 data/
 *.csv
+*.npy

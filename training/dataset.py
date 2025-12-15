@@ -1,0 +1,62 @@
+import torch
+from torch.utils.data import Dataset
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+class MddDataset(Dataset):
+    
+    def __init__(self, X_feats: Path|np.ndarray, X_ensids: Path|np.ndarray, X_chroms: Path|np.ndarray, y: Path|pd.DataFrame):
+        """
+        Args:
+            X_feats (Path|np.ndarray):  Path to input features file (npy) or numpy array:
+                                        Contains the pLM/gLM embeddings.
+            X_ensids (Path|np.ndarray): Path to input ensids (for features) file (npy) or numpy array:
+                                        Contains the ensids corresponding to the rows in X_feats.
+            X_chroms (Path|np.ndarray): Path to input chroms (for features) file (npy) or numpy array:
+                                        Contains the chromosomes corresponding to the rows in X_feats.
+            y (Path|pd.DataFrame):      Path to target labels file (csv) or pandas DataFrame:
+                                        2d array; (rows: cell-types, columns: ensid)
+        """
+        if isinstance(X_feats, Path) and isinstance(X_ensids, Path) and \
+           isinstance(X_chroms, Path) and isinstance(y, Path):
+            self.X_feats  = np.load(X_feats, mmap_mode='r')
+            self.X_ensids = np.load(X_ensids, allow_pickle=True)
+            self.X_chroms = np.load(X_chroms, allow_pickle=True).astype(str)
+            self.y        = pd.read_csv(y, index_col=0)
+        else:
+            self.X_feats  = X_feats
+            self.X_ensids = X_ensids
+            self.X_chroms = X_chroms
+            self.y        = y
+    
+    def split_by_chromosome(self, chrom: list[str]) -> Dataset:
+        """Return a new MddDataset containing only data from the specified chromosomes."""
+        mask = np.isin(self.X_chroms, chrom)
+        X_feats_chrom  = self.X_feats[mask]
+        X_ensids_chrom = self.X_ensids[mask]
+        X_chroms_chrom = self.X_chroms[mask]
+        return MddDataset(X_feats_chrom, X_ensids_chrom, X_chroms_chrom, self.y)
+    
+    def __len__(self) -> int:
+        return self.X_ensids.shape[0]
+    
+    def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor]:
+        ensid = self.X_ensids[idx]
+        if ensid not in self.y.columns:
+            raise KeyError(f"Ensid {ensid} not found in target labels.")
+        return torch.from_numpy(self.X_feats[idx]), torch.from_numpy(self.y[ensid].values)
+
+if __name__ == "__main__":
+    # example usage
+    dataset = MddDataset(X_feats=Path("X_sub.features.npy"), X_ensids=Path("X_sub.ensids.npy"), X_chroms=Path("X_sub.chroms.npy"), y=Path("y_sub.csv"))
+    print(f"Dataset size: {len(dataset)}")
+    for i in range(len(dataset)):
+        input_data, label = dataset[i]
+        print(f"Input shape at index {i}: {input_data.shape}, Label: {label.shape}")
+    print(dataset.y.head())
+    print("Splitting dataset by chromosomes 1 and 2...")
+    new_dataset = dataset.split_by_chromosome(['1', '2'])
+    print(f"New dataset size (chromosomes 1 and 2): {len(new_dataset)}")
+    print(new_dataset.y.head())
