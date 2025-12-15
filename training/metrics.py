@@ -111,6 +111,4 @@ class MeanGenePearson(Metric):
 
         assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
 
-        print((cov / (denom + 1e-12)).shape)
-
         return cov / (denom + 1e-12) # [n]; account for possible 0 division
