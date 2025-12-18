@@ -83,7 +83,7 @@ def get_gene_tss(ensids: list[str], gtf_path: Path) -> pd.DataFrame:
     """Get TSS locations for given ENSEMBL IDs using the GTF file."""
     logging.info("Getting TSS locations for %d genes", len(ensids))
 
-    cmd = ["./data_prep/get_gene_tss.sh", str(gtf_path), *ensids]
+    cmd = ["./preprocessing/get_gene_tss.sh", str(gtf_path), *ensids]
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:

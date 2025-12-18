@@ -11,7 +11,7 @@ from pathlib import Path
 get_target_vars.py
 
 Script that takes input from the Human Brain Cell Atlas v1.0 and extracts
-target variables for downstream asnalysis.
+target variables for downstream analysis.
 
 https://cellxgene.cziscience.com/collections/283d65eb-dd53-496d-adb7-7570c7caa443
 """
