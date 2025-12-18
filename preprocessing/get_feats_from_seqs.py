@@ -1,14 +1,20 @@
 from __future__ import annotations
 import argparse
+import sys
+import csv
 import logging
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 from numpy.lib.format import open_memmap
+from typing import Any, Dict, Iterator, List
 
 import torch
 from enformer_pytorch import Enformer
+
+# we have very long sequences...
+csv.field_size_limit(sys.maxsize)
 
 """
 get_feats_from_seqs.py
@@ -77,27 +83,42 @@ def setup_logging(verbosity: int) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-def load_data(input_path: Path) -> pd.DataFrame:
-    """Load data from `input_path`."""
-    logging.info("Loading data from %s", input_path)
-    return pd.read_csv(input_path)
+def count_rows_csv(input_path: Path) -> int:
+    with input_path.open(newline="", encoding="utf-8") as f:
+        return sum(1 for _ in f) - 1 # exclude header
+    
+def iter_rows_csv(input_path: Path) -> Iterator[Dict[str, Any]]:
+    with input_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        yield from reader # already excludes header
+
+def batched_rows(rows: Iterator[Dict[str, Any]], batch_size: int) -> Iterator[List[Dict[str, Any]]]:
+    batch: List[Dict[str, Any]] = []
+    for row in rows:
+        batch.append(row)
+        if len(batch) == batch_size:
+            yield batch
+            batch = []
+        break
+    if batch: # to yield also remaining rows
+        yield batch
 
 def dna_seq_to_tensor(seq: str) -> torch.Tensor:
     """Convert a DNA sequence string to an integer-encoded tensor (1D)."""
     ids = [mapping[nuc] for nuc in seq]
     return torch.tensor(ids, dtype=torch.long, device=device)  # (L,)
 
-def get_features(data: pd.DataFrame, model_name: str, batch_size: int, window_size: int, output_path: Path) -> pd.DataFrame:
+def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path) -> pd.DataFrame:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
     if model_name == "enformer":
         model = Enformer.from_pretrained("EleutherAI/enformer-official-rough", dtype="auto").to(device)
         model.eval()
 
-        feats_mm_path = output_path.with_suffix(".features.npy")
+        feats_mm_path  = output_path.with_suffix(".features.npy")
         ensids_mm_path = output_path.with_suffix(".ensids.npy")
 
-        num_rows = len(data)
+        num_rows = count_rows_csv(data_path)
         logging.info("Number of sequences to process: %d", num_rows)
 
         # create memmaps to immediately flush to disk
@@ -115,14 +136,17 @@ def get_features(data: pd.DataFrame, model_name: str, batch_size: int, window_si
         ensids = np.empty(num_rows, dtype=object)
         chroms = np.empty(num_rows, dtype=object)
 
-        for start_idx in tqdm(range(0, num_rows, batch_size),
+        idx = 0
+
+        for batch in tqdm(batched_rows(iter_rows_csv(data_path), batch_size),
                               total=(num_rows + batch_size - 1) // batch_size,
                               desc="Extracting features", unit="batch"):
 
-            end_idx = min(start_idx + batch_size, num_rows)
-            batch   = data.iloc[start_idx:end_idx]
+            seqs_b   = [b["sequence"] for b in batch]
+            ensids_b = [b["ensid"] for b in batch]
+            chroms_b = [b["chrom"] for b in batch]
 
-            batch_seqs   = [dna_seq_to_tensor(seq) for seq in batch["sequence"]]
+            batch_seqs   = [dna_seq_to_tensor(seq) for seq in seqs_b]
             batch_tensor = torch.stack(batch_seqs, dim=0)  # (B, L)
 
             with torch.no_grad():
@@ -130,14 +154,19 @@ def get_features(data: pd.DataFrame, model_name: str, batch_size: int, window_si
             features = output.cpu().numpy().astype(np.float32)   # (B, 896, 5313)
 
             # select central bin, average over window size
-            central_bin = features.shape[1] // 2
+            central_bin      = features.shape[1] // 2
             window_size_half = window_size // 2
+
             features = features[:, central_bin-window_size_half:central_bin+window_size_half, :]  # (B, W, 5313)
             features = features.mean(axis=1)  # (B, 5313)
 
-            feats_mm[start_idx:end_idx, :] = features
-            ensids[start_idx:end_idx] = batch["ensid"].to_numpy()
-            chroms[start_idx:end_idx] = batch["chrom"].to_numpy()
+            actual_bsz = features.shape[0] # actual batch size
+
+            feats_mm[idx : idx + actual_bsz, :] = features
+            ensids[idx : idx + actual_bsz]      = ensids_b
+            chroms[idx : idx + actual_bsz]      = chroms_b
+
+            idx += actual_bsz
 
         logging.info("Features successfully extracted.")
 
@@ -157,8 +186,7 @@ def main() -> None:
     setup_logging(args.verbose)
     logging.debug("Arguments: %s", args)
 
-    data = load_data(args.input)
-    get_features(data, args.model_name, args.batch_size, args.window_size, args.output)
+    get_features(args.input, args.model_name, args.batch_size, args.window_size, args.output)
 
     logging.info("Done.")
 
