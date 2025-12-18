@@ -11,27 +11,30 @@ GENE_IDS=("$@")           # all remaining args are gene IDs
 
 WINDOW=98304              # 196,608 kb window centered on TSS, as in Enformer
 
-# convert bash array into AWK regex => id1|id2|id3
-GENE_REGEX=$(printf "%s|" "${GENE_IDS[@]}")
-GENE_REGEX=${GENE_REGEX%|}   # remove trailing |
+# feed gene IDs to awk via STDIN (not as a giant regex, will kill process)
+printf "%s\n" "${GENE_IDS[@]}" | awk -F'\t' -v window="$WINDOW" '
+BEGIN { OFS="\t" }
 
-awk -F'\t' -v genes="$GENE_REGEX" -v window="$WINDOW" '
-BEGIN {
-    pattern = "(" genes ")"
+# stdin => build a set
+NR==FNR {
+  gsub(/\r$/, "", $0)          # tolerate CRLF
+  if ($0 != "") ids[$0] = 1
+  next
 }
-$3=="gene" {
-    OFS = "\t"
 
-    # TSS depends on strand... start or end
-    if ($7 == "+") tss = $4
-    else           tss = $5
+# handle gtf
+$3 == "gene" {
+  # TSS depends on strand... start or end
+  tss = ($7 == "+") ? $4 : $5
 
-    gene_id = "NA"
-    if (match($9, /gene_id "([^"]+)"/, a)) gene_id = a[1]
+  gene_id = "NA"
+  if (match($9, /gene_id "([^"]+)"/, a)) gene_id = a[1]
+  else next
 
-    chrom = $1
-
-    if (gene_id ~ pattern) {
-        print chrom, gene_id, tss-window, tss+window
-    }
-}' "$INPUT_FILE"
+  if (gene_id in ids) {
+    start = tss - window
+    end   = tss + window
+    print $1, gene_id, start, end
+  }
+}
+' - "$INPUT_FILE"
