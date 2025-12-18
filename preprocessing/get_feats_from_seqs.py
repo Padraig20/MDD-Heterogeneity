@@ -99,7 +99,6 @@ def batched_rows(rows: Iterator[Dict[str, Any]], batch_size: int) -> Iterator[Li
         if len(batch) == batch_size:
             yield batch
             batch = []
-        break
     if batch: # to yield also remaining rows
         yield batch
 
