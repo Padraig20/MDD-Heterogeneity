@@ -126,8 +126,8 @@ def train_model(
     for epoch in range(epochs):
         total_loss     = 0.0
         unc_total_loss = 0.0
-        metric_cells = MeanCellPearson(n_cells=model.output_dim)
-        metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(train_loader.dataset))
+        metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
+        metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(train_loader.dataset)).to(device)
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
             inputs, targets = batch
             inputs, targets = inputs.to(device), targets.to(device)
@@ -177,8 +177,8 @@ def evaluate_model(
         unc_model.eval()
     total_loss = 0.0
     unc_total_loss = 0.0
-    metric_cells = MeanCellPearson(n_cells=model.output_dim)
-    metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(test_loader.dataset))
+    metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
+    metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(test_loader.dataset)).to(device)
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating"):
             inputs, targets = batch
