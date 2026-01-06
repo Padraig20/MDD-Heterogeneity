@@ -12,15 +12,14 @@ from loss.composite_loss import CompositeLoss
 from loss.seq2cells_loss import Seq2CellsLoss
 from loss.lika_loss import LikaLoss
 from metrics import MeanCellPearson, MeanGenePearson
+from wandb_logger import WandBLogger
 
 """
-get_feats_from_seqs.py
+train.py
 
-Script that takes input from the human reference genome sequences we extracted
-earlier (around the TSS) and then extracts features from these sequences using
-some sort of pLM/gLM model. Here, we use e.g. Enformer via Hugging Face
-
-https://huggingface.co/EleutherAI/enformer-official-rough
+We train a model to predict cell type-specific gene expression from
+epigenetic features using MLP. Optionally, we can also train an uncertainty
+estimation model alongside the main model using LikA loss.
 """
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -97,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Increase verbosity."
     )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Name of the WandB run. Leave empty to not use WandB logging."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -117,9 +122,24 @@ def train_model(
     unc_loss_fn: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     unc_optimizer: torch.optim.Optimizer,
-    epochs: int = 10
+    wb_logger: WandBLogger,
+    epochs: int = 10,
 ) -> None:
     """Train the model."""
+    is_composite = isinstance(loss_fn, CompositeLoss)
+
+    log_dict = {
+        "train/loss": 0.0,
+        "train/pearson_cells": 0.0,
+        "train/pearson_genes": 0.0,
+    }
+    if is_composite:
+        log_dict["train/mpc_loss"]    = 0.0
+        log_dict["train/poisson_nll"] = 0.0
+        log_dict["train/mse_loss"]    = 0.0
+    if unc_model:
+        log_dict["train/uncertainty_loss"] = 0.0
+
     model.train()
     if unc_model:
         unc_model.train()
@@ -135,6 +155,11 @@ def train_model(
             optimizer.zero_grad()
             outputs = model(inputs)
             loss    = loss_fn(outputs, targets)
+            if is_composite:
+                log_dict["train/mpc_loss"]    += loss[0].item()
+                log_dict["train/poisson_nll"] += loss[1].item()
+                log_dict["train/mse_loss"]    += loss[2].item()
+                loss = loss[3]
             loss.backward()
             optimizer.step()
             metric_cells.update(outputs, targets)
@@ -163,15 +188,44 @@ def train_model(
             tqdm.write(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, Uncertainty: {avg_unc_loss:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
         else:
             tqdm.write(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
+        
+        wb_logger.log({
+            "train/loss": avg_loss,
+            "train/pearson_cells": metric_cells.compute().mean().item(),
+            "train/pearson_genes": metric_genes.compute().mean().item(),
+            **({
+                "train/mpc_loss": log_dict["train/mpc_loss"] / len(train_loader),
+                "train/poisson_nll": log_dict["train/poisson_nll"] / len(train_loader),
+                "train/mse_loss": log_dict["train/mse_loss"] / len(train_loader),
+            } if is_composite else {}),
+            **({
+                "train/uncertainty_loss": avg_unc_loss,
+            } if unc_model else {})
+        })
 
 def evaluate_model(
     model: torch.nn.Module,
     unc_model: torch.nn.Module,
     test_loader: torch.utils.data.DataLoader,
     loss_fn: torch.nn.Module,
-    unc_loss_fn: torch.nn.Module
+    unc_loss_fn: torch.nn.Module,
+    wb_logger: WandBLogger,
 ) -> None:
     """Evaluate the model."""
+    is_composite = isinstance(loss_fn, CompositeLoss)
+
+    log_dict = {
+        "eval/loss": 0.0,
+        "eval/pearson_cells": 0.0,
+        "eval/pearson_genes": 0.0,
+    }
+    if is_composite:
+        log_dict["eval/mpc_loss"]    = 0.0
+        log_dict["eval/poisson_nll"] = 0.0
+        log_dict["eval/mse_loss"]    = 0.0
+    if unc_model:
+        log_dict["eval/uncertainty_loss"] = 0.0
+
     model.eval()
     if unc_model:
         unc_model.eval()
@@ -186,6 +240,11 @@ def evaluate_model(
 
             outputs = model(inputs)
             loss    = loss_fn(outputs, targets)
+            if is_composite:
+                log_dict["eval/mpc_loss"]    += loss[0].item()
+                log_dict["eval/poisson_nll"] += loss[1].item()
+                log_dict["eval/mse_loss"]    += loss[2].item()
+                loss = loss[3]
             total_loss += loss.item()
             metric_cells.update(outputs, targets)
             metric_genes.update(outputs, targets)
@@ -203,6 +262,20 @@ def evaluate_model(
         logging.info(f"Test Loss: {avg_loss:.4f}, Uncertainty: {avg_unc_loss:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
     else:
         logging.info(f"Test Loss: {avg_loss:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
+    
+    wb_logger.log({
+        "eval/loss": avg_loss,
+        "eval/pearson_cells": metric_cells.compute().mean().item(),
+        "eval/pearson_genes": metric_genes.compute().mean().item(),
+        **({
+            "eval/mpc_loss": log_dict["eval/mpc_loss"] / len(test_loader),
+            "eval/poisson_nll": log_dict["eval/poisson_nll"] / len(test_loader),
+            "eval/mse_loss": log_dict["eval/mse_loss"] / len(test_loader),
+        } if is_composite else {}),
+        **({
+            "eval/uncertainty_loss": avg_unc_loss,
+        } if unc_model else {})
+    })
 
 def main() -> None:
     args = parse_args()
@@ -239,6 +312,11 @@ def main() -> None:
     else:
         raise ValueError(f"Model {args.model_name} is not supported.")
     
+    if args.run_name is not None:
+        wb_logger = WandBLogger(enabled=True, model=model, run_name=args.run_name)
+    else:
+        wb_logger = WandBLogger(enabled=False)
+    
     unc_model     = None
     unc_loss_fn   = None
     unc_optimizer = None
@@ -268,6 +346,7 @@ def main() -> None:
         unc_loss_fn=unc_loss_fn,
         optimizer=optimizer,
         unc_optimizer=unc_optimizer,
+        wb_logger=wb_logger,
         epochs=args.epochs
     )
 
@@ -278,7 +357,8 @@ def main() -> None:
         unc_model=unc_model,
         test_loader=test_loader,
         loss_fn=loss_fn,
-        unc_loss_fn=unc_loss_fn
+        unc_loss_fn=unc_loss_fn,
+        wb_logger=wb_logger,
     )
 
     if args.output is not None:
@@ -289,6 +369,8 @@ def main() -> None:
             unc_path = args.output.with_name(args.output.stem + "_uncertainty.pth")
             torch.save(unc_model.state_dict(), unc_path)
             logging.info(f"Uncertainty model saved to {unc_path}.")
+    
+    wb_logger.finish()
 
     logging.info("Done.")
 

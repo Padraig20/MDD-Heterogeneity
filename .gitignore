@@ -212,3 +212,6 @@ uv.lock
 data/
 *.csv
 *.npy
+
+# WandB
+wandb/

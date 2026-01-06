@@ -30,10 +30,10 @@ class CompositeLoss(nn.Module):
         eps: float = 1e-8,
     ):
         super().__init__()
-        self.lambda_mpc = lambda_mpc
+        self.lambda_mpc  = lambda_mpc
         self.lambda_pnll = lambda_pnll
-        self.lambda_mse = lambda_mse
-        self.eps = eps
+        self.lambda_mse  = lambda_mse
+        self.eps         = eps
     
     def forward(self, predictions, targets):
         """
@@ -50,7 +50,7 @@ class CompositeLoss(nn.Module):
             targets: Target values (t)
         
         Returns:
-            Computed loss value
+            Computed loss values: L_mpc, poisson_nll, mse_loss, and composite loss
         """
         if predictions.shape != targets.shape:
             raise ValueError(
@@ -86,12 +86,12 @@ class CompositeLoss(nn.Module):
             + self.lambda_pnll * poisson_nll
             + self.lambda_mse * mse_loss
         )
-        return loss
+        return L_mpc, poisson_nll, mse_loss, loss
 
 if __name__ == "__main__":
     # example usage
     loss_fn = CompositeLoss()
     preds = torch.randn(4, 10, 5).abs()  # positive for Poisson
     targets = torch.randn(4, 10, 5)
-    loss_value = loss_fn(preds, targets)
+    _, _, _, loss_value = loss_fn(preds, targets)
     print(f"Composite Loss: {loss_value.item()}")
