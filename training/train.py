@@ -147,6 +147,7 @@ def train_model(
     """Train the model. Evaluate after each epoch."""
 
     log_dict = {
+        "train/epoch": 0,
         "train/loss": 0.0,
         "train/pearson_cells": 0.0,
         "train/pearson_genes": 0.0,
@@ -182,6 +183,7 @@ def train_model(
             metric_genes.update(outputs, targets)
             log_dict["train/loss"] += composite_loss.item()
 
+        log_dict["train/epoch"] = epoch
         log_dict["train/loss"] /= len(train_loader)
         log_dict["train/pearson_cells"] = metric_cells.compute().mean().item()
         log_dict["train/pearson_genes"] = metric_genes.compute().mean().item()

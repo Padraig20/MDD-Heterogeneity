@@ -16,7 +16,7 @@ def get_train_test_dataset(dataset: MddDataset):
     return train_dataset, val_dataset, test_dataset
 
 class EarlyStopping:
-    def __init__(self, patience: int = 20, min_delta: float = 1e-6, mode: str = "min"):
+    def __init__(self, patience: int = 5, min_delta: float = 1e-6, mode: str = "min"):
         self.patience = patience
         self.min_delta = min_delta
         self.mode = mode  # "min" or "max"
