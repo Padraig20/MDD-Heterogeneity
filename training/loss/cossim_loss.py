@@ -1,4 +1,4 @@
-""""Loss is taken from Seq2Cells paper."""
+""""Cosine Similarity Loss (taken from Seq2Cells paper)."""
 
 import torch
 import torch.nn as nn
@@ -28,7 +28,7 @@ def nonzero_median(tensor: torch.Tensor, axis: int, keepdim: bool) -> torch.Tens
 
     return medians
 
-class Seq2CellsLoss(nn.Module):
+class CosineSimilarityLoss(nn.Module):
     """Loss function as defined in the Seq2Cells paper."""
 
     def __init__(
@@ -38,7 +38,7 @@ class Seq2CellsLoss(nn.Module):
         norm_by: Literal["mean", "nonzero_median"] = "mean",
         eps: float = 1e-8,
     ):
-        """Initialise Seq2CellsLoss.
+        """Initialise CosineSimilarityLoss.
 
         Parameter
         ---------
@@ -60,7 +60,7 @@ class Seq2CellsLoss(nn.Module):
     
     def forward(self, predictions, targets):
         """
-        Compute the Seq2Cells loss.
+        Compute the Cosine Similarity loss.
         
         Uses cosine-similarity-based loss to equally emphasize across-cell 
         and across-gene correlations, independent of cell count growth.
@@ -135,8 +135,8 @@ class Seq2CellsLoss(nn.Module):
     
 if __name__ == "__main__":
     # example usage
-    loss_fn = Seq2CellsLoss()
+    loss_fn = CosineSimilarityLoss()
     preds = torch.randn(4, 10, 5) # (batch_size, n_cells, n_genes)
     targets = torch.randn(4, 10, 5)
     loss_value = loss_fn(preds, targets)
-    print(f"Seq2Cells Loss: {loss_value.item()}")
+    print(f"Cosine Similarity Loss: {loss_value.item()}")

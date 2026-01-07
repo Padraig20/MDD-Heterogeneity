@@ -1,4 +1,4 @@
-"""Composite loss made of Pearson Correlation, Poisson NLL, and MSE. Idea adapted from UNICORN paper."""
+"""Mutual Pearson Correlation Loss."""
 
 import torch
 import torch.nn as nn
@@ -19,38 +19,26 @@ def pearson_corr_dim(x: torch.Tensor, y: torch.Tensor, dim: int = -1, eps: float
 
     return num / denom
 
-class CompositeLoss(nn.Module):
-    """Loss function similarly defined in the UNICORN paper."""
+class MPCLoss(nn.Module):
+    """Mutual Pearson Correlation Loss."""
 
     def __init__(
         self,
-        lambda_mpc: float = 1.0,
-        lambda_pnll: float = 1.0,
-        lambda_mse: float = 1.0,
         eps: float = 1e-8,
     ):
         super().__init__()
-        self.lambda_mpc  = lambda_mpc
-        self.lambda_pnll = lambda_pnll
-        self.lambda_mse  = lambda_mse
-        self.eps         = eps
+        self.eps = eps
     
     def forward(self, predictions, targets):
         """
-        Compute the Composite loss.
-        
-        Essentially just a weighted combination of Pearson correlation,
-        Poisson negative log likelihood and MSE.
-
-        Implemented what is described in:
-        https://www.nature.com/articles/s41467-025-64506-8
+        Compute the Mutual Pearson Correlation loss.
 
         Args:
             predictions: Model predictions (p)
             targets: Target values (t)
         
         Returns:
-            Computed loss values: L_mpc, poisson_nll, mse_loss, and composite loss
+            Computed loss value: L_mpc
         """
         if predictions.shape != targets.shape:
             raise ValueError(
@@ -73,25 +61,12 @@ class CompositeLoss(nn.Module):
 
         L_mpc = -(g_corr + c_corr)
 
-        # ----- Poisson NLL -----
-        p_pos = p.clamp_min(self.eps)
-        poisson_nll = torch.mean(p_pos - t * torch.log(p_pos))
-
-        # ----- MSE -----
-        mse_loss = torch.mean((p - t) ** 2)
-
-        # ----- Total -----
-        loss = (
-            self.lambda_mpc * L_mpc
-            + self.lambda_pnll * poisson_nll
-            + self.lambda_mse * mse_loss
-        )
-        return L_mpc, poisson_nll, mse_loss, loss
+        return L_mpc
 
 if __name__ == "__main__":
     # example usage
-    loss_fn = CompositeLoss()
-    preds = torch.randn(4, 10, 5).abs()  # positive for Poisson
+    loss_fn = MPCLoss()
+    preds = torch.randn(4, 10, 5)
     targets = torch.randn(4, 10, 5)
-    _, _, _, loss_value = loss_fn(preds, targets)
-    print(f"Composite Loss: {loss_value.item()}")
+    loss_value = loss_fn(preds, targets)
+    print(f"Mutual Pearson Correlation Loss: {loss_value.item()}")

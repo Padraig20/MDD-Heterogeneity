@@ -3,7 +3,7 @@
 learning_rates=(5e-4 5e-5 5e-6)
 batch_sizes=(128 256)
 loss_functions=("seq2cells" "composite")
-hidden_dims=(264 512 1024)
+hidden_dims=(256 512 1024)
 
 epochs=50
 X="./X"
@@ -19,4 +19,3 @@ for lr in "${learning_rates[@]}"; do
         done
     done
 done
-

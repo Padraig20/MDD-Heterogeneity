@@ -8,8 +8,10 @@ import torch
 from utils import get_train_test_dataset
 from models.mlp import MLPPredictor
 from dataset import MddDataset
-from loss.composite_loss import CompositeLoss
-from loss.seq2cells_loss import Seq2CellsLoss
+from loss.cossim_loss import CosineSimilarityLoss
+from loss.mpc_loss import MPCLoss
+from loss.mse_loss import MSELoss
+from loss.pnll_loss import PNLLLoss
 from metrics import MeanCellPearson, MeanGenePearson
 from wandb_logger import WandBLogger
 
@@ -95,6 +97,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Name of the WandB run. Leave empty to not use WandB logging."
     )
+    parser.add_argument(
+        "--cossim-lambda",
+        type=float,
+        default=0.0,
+        help="Lambda parameter (weight) for the Cosine Similarity loss."
+    )
+    parser.add_argument(
+        "--mpc-lambda",
+        type=float,
+        default=0.0,
+        help="Lambda parameter (weight) for the Mutual Pearson Correlation loss."
+    )
+    parser.add_argument(
+        "--mse-lambda",
+        type=float,
+        default=1.0,
+        help="Lambda parameter (weight) for the Mean Squared Error loss."
+    )
+    parser.add_argument(
+        "--pnll-lambda",
+        type=float,
+        default=0.0,
+        help="Lambda parameter (weight) for the Poisson Negative Log Likelihood loss."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -110,27 +136,25 @@ def setup_logging(verbosity: int) -> None:
 def train_model(
     model: torch.nn.Module,
     train_loader: torch.utils.data.DataLoader,
-    loss_fn: torch.nn.Module,
+    loss_dict: dict,
+    loss_lambda_dict: dict,
     optimizer: torch.optim.Optimizer,
     wb_logger: WandBLogger,
     epochs: int = 10,
 ) -> None:
     """Train the model."""
-    is_composite = isinstance(loss_fn, CompositeLoss)
 
     log_dict = {
         "train/loss": 0.0,
         "train/pearson_cells": 0.0,
         "train/pearson_genes": 0.0,
     }
-    if is_composite:
-        log_dict["train/mpc_loss"]    = 0.0
-        log_dict["train/poisson_nll"] = 0.0
-        log_dict["train/mse_loss"]    = 0.0
+
+    for key in loss_dict.keys():
+        log_dict[f"train/{key}_loss"] = 0.0
 
     model.train()
     for epoch in range(epochs):
-        total_loss     = 0.0
         metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
         metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(train_loader.dataset)).to(device)
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
@@ -139,86 +163,77 @@ def train_model(
 
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss    = loss_fn(outputs, targets)
-            if is_composite:
-                log_dict["train/mpc_loss"]    += loss[0].item()
-                log_dict["train/poisson_nll"] += loss[1].item()
-                log_dict["train/mse_loss"]    += loss[2].item()
-                loss = loss[3]
-            loss.backward()
+
+            composite_loss = torch.tensor(0.0, device=device)
+            for key in loss_dict.keys():
+                loss = loss_dict[key](outputs, targets) * loss_lambda_dict[key]
+                log_dict[f"train/{key}_loss"] += loss.item()
+                composite_loss += loss
+
+            composite_loss.backward()
             optimizer.step()
             metric_cells.update(outputs, targets)
             metric_genes.update(outputs, targets)
-            total_loss += loss.item()
+            log_dict["train/loss"] += composite_loss.item()
 
-        avg_loss = total_loss / len(train_loader)
+        log_dict["train/loss"] /= len(train_loader)
+        log_dict["train/pearson_cells"] = metric_cells.compute().mean().item()
+        log_dict["train/pearson_genes"] = metric_genes.compute().mean().item()
+
+        for key in loss_dict.keys():
+            log_dict[f"train/{key}_loss"] /= len(train_loader)
         
-        tqdm.write(f"Epoch {epoch + 1}/{epochs}, Loss: {avg_loss:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
+        tqdm.write(f"Epoch {epoch + 1}/{epochs}, Loss: {log_dict['train/loss']:.4f}, PC Cells: {log_dict['train/pearson_cells']:.4f}, PC Genes: {log_dict['train/pearson_genes']:.4f}")
         
-        wb_logger.log({
-            "train/loss": avg_loss,
-            "train/pearson_cells": metric_cells.compute().mean().item(),
-            "train/pearson_genes": metric_genes.compute().mean().item(),
-            **({
-                "train/mpc_loss": log_dict["train/mpc_loss"] / len(train_loader),
-                "train/poisson_nll": log_dict["train/poisson_nll"] / len(train_loader),
-                "train/mse_loss": log_dict["train/mse_loss"] / len(train_loader),
-            } if is_composite else {})
-        })
+        wb_logger.log(log_dict)
 
 def evaluate_model(
     model: torch.nn.Module,
-    test_loader: torch.utils.data.DataLoader,
-    loss_fn: torch.nn.Module,
+    eval_loader: torch.utils.data.DataLoader,
+    loss_dict: dict,
+    loss_lambda_dict: dict,
     wb_logger: WandBLogger,
 ) -> None:
     """Evaluate the model."""
-    is_composite = isinstance(loss_fn, CompositeLoss)
 
     log_dict = {
         "eval/loss": 0.0,
         "eval/pearson_cells": 0.0,
         "eval/pearson_genes": 0.0,
     }
-    if is_composite:
-        log_dict["eval/mpc_loss"]    = 0.0
-        log_dict["eval/poisson_nll"] = 0.0
-        log_dict["eval/mse_loss"]    = 0.0
+    
+    for key in loss_dict.keys():
+        log_dict[f"eval/{key}_loss"] = 0.0
 
     model.eval()
-    total_loss = 0.0
     metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
-    metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(test_loader.dataset)).to(device)
+    metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Evaluating"):
+        for batch in tqdm(eval_loader, desc="Evaluating"):
             inputs, targets = batch
             inputs, targets = inputs.to(device), targets.to(device)
 
             outputs = model(inputs)
-            loss    = loss_fn(outputs, targets)
-            if is_composite:
-                log_dict["eval/mpc_loss"]    += loss[0].item()
-                log_dict["eval/poisson_nll"] += loss[1].item()
-                log_dict["eval/mse_loss"]    += loss[2].item()
-                loss = loss[3]
-            total_loss += loss.item()
+            composite_loss = torch.tensor(0.0, device=device)
+            for key in loss_dict.keys():
+                loss = loss_dict[key](outputs, targets) * loss_lambda_dict[key]
+                log_dict[f"eval/{key}_loss"] += loss.item()
+                composite_loss += loss
+
+            log_dict["eval/loss"] += composite_loss.item()
             metric_cells.update(outputs, targets)
             metric_genes.update(outputs, targets)
 
-    avg_loss = total_loss / len(test_loader)
+    log_dict["eval/loss"] /= len(eval_loader)
+    log_dict["eval/pearson_cells"] = metric_cells.compute().mean().item()
+    log_dict["eval/pearson_genes"] = metric_genes.compute().mean().item()
+
+    for key in loss_dict.keys():
+        log_dict[f"eval/{key}_loss"] /= len(eval_loader)
     
-    logging.info(f"Test Loss: {avg_loss:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
+    logging.info(f"Test Loss: {log_dict['eval/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
     
-    wb_logger.log({
-        "eval/loss": avg_loss,
-        "eval/pearson_cells": metric_cells.compute().mean().item(),
-        "eval/pearson_genes": metric_genes.compute().mean().item(),
-        **({
-            "eval/mpc_loss": log_dict["eval/mpc_loss"] / len(test_loader),
-            "eval/poisson_nll": log_dict["eval/poisson_nll"] / len(test_loader),
-            "eval/mse_loss": log_dict["eval/mse_loss"] / len(test_loader),
-        } if is_composite else {})
-    })
+    wb_logger.log(log_dict)
 
 def main() -> None:
     args = parse_args()
@@ -232,17 +247,17 @@ def main() -> None:
         y=args.targets,
     )
 
-    train_dataset, test_dataset = get_train_test_dataset(dataset)
+    train_dataset, eval_dataset = get_train_test_dataset(dataset)
 
     logging.debug(f"Train dataset size: {len(train_dataset)}")
-    logging.debug(f"Test dataset size:  {len(test_dataset)}")
+    logging.debug(f"Eval dataset size:  {len(eval_dataset)}")
     logging.debug(f"Total dataset size: {len(dataset)}")
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True
     )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=args.batch_size, shuffle=False
+    eval_loader = torch.utils.data.DataLoader(
+        eval_dataset, batch_size=args.batch_size, shuffle=False
     )
 
     input_dim = train_dataset[0][0].shape[0]
@@ -260,12 +275,23 @@ def main() -> None:
     else:
         wb_logger = WandBLogger(enabled=False)
         
-    if args.loss == 'composite':
-        loss_fn = CompositeLoss()
-    elif args.loss == 'seq2cells':
-        loss_fn = Seq2CellsLoss()
-    else:
-        raise ValueError(f"Loss function {args.loss} is not supported.")
+    if args.cossim_lambda + args.mpc_lambda + args.mse_lambda + args.pnll_lambda <= 0.0:
+        raise ValueError("I'm afraid you'll have to set at least one loss lambda to a positive value ;)")
+    
+    loss_dict = {}
+    loss_lambda_dict = {}
+    if args.cossim_lambda > 0.0:
+        loss_dict['cossim'] = CosineSimilarityLoss()
+        loss_lambda_dict['cossim'] = args.cossim_lambda
+    if args.mpc_lambda > 0.0:
+        loss_dict['mpc'] = MPCLoss()
+        loss_lambda_dict['mpc'] = args.mpc_lambda
+    if args.mse_lambda > 0.0:
+        loss_dict['mse'] = MSELoss()
+        loss_lambda_dict['mse'] = args.mse_lambda
+    if args.pnll_lambda > 0.0:
+        loss_dict['pnll'] = PNLLLoss()
+        loss_lambda_dict['pnll'] = args.pnll_lambda
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     logging.info("Starting training...")
@@ -273,7 +299,8 @@ def main() -> None:
     train_model(
         model=model,
         train_loader=train_loader,
-        loss_fn=loss_fn,
+        loss_dict=loss_dict,
+        loss_lambda_dict=loss_lambda_dict,
         optimizer=optimizer,
         wb_logger=wb_logger,
         epochs=args.epochs
@@ -283,8 +310,9 @@ def main() -> None:
 
     evaluate_model(
         model=model,
-        test_loader=test_loader,
-        loss_fn=loss_fn,
+        eval_loader=eval_loader,
+        loss_dict=loss_dict,
+        loss_lambda_dict=loss_lambda_dict,
         wb_logger=wb_logger,
     )
 
