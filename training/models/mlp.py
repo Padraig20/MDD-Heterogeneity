@@ -17,16 +17,6 @@ class MLP(nn.Module):
         x = self.softplus(self.fc4(x))
         return x
 
-class MLPUncertainty(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(MLPUncertainty, self).__init__()
-        self.mlp = MLP(input_dim, hidden_dim, output_dim)
-        self.input_dim  = input_dim
-        self.output_dim = output_dim
-    
-    def forward(self, x):
-        return self.mlp(x)
-
 class MLPPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(MLPPredictor, self).__init__()
