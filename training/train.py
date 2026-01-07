@@ -5,6 +5,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 import torch
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from utils import get_train_test_dataset, EarlyStopping
 from models.mlp import MLPPredictor
 from dataset import MddDataset
@@ -138,6 +139,7 @@ def train_model(
     loss_dict: dict,
     loss_lambda_dict: dict,
     optimizer: torch.optim.Optimizer,
+    scheduler: SequentialLR,
     wb_logger: WandBLogger,
     early_stopping: EarlyStopping,
     epochs: int = 10,
@@ -172,6 +174,10 @@ def train_model(
 
             composite_loss.backward()
             optimizer.step()
+
+            scheduler.step() # update lr and log
+            wb_logger.log({"train/lr": optimizer.param_groups[0]['lr']})
+
             metric_cells.update(outputs, targets)
             metric_genes.update(outputs, targets)
             log_dict["train/loss"] += composite_loss.item()
@@ -319,6 +325,15 @@ def main() -> None:
     logging.debug(f"Early stopping: {early_stopping is not None}")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+
+    total_steps = args.epochs * len(train_loader)
+    warmup_steps = int(0.1 * total_steps)  # 10% warmup
+
+    # start at 1% or lr and linearly warm up to 100%
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+
     logging.info("Starting training...")
 
     train_model(
@@ -328,6 +343,7 @@ def main() -> None:
         loss_dict=loss_dict,
         loss_lambda_dict=loss_lambda_dict,
         optimizer=optimizer,
+        scheduler=scheduler,
         wb_logger=wb_logger,
         early_stopping=early_stopping,
         epochs=args.epochs
