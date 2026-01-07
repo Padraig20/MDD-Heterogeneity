@@ -74,10 +74,10 @@ def parse_args() -> argparse.Namespace:
         help="Number of training epochs."
     )
     parser.add_argument(
-        "-hd", "--hidden-dim",
+        "-nl", "--n-layers",
         type=int,
-        default=512,
-        help="Hidden dimension of neural network."
+        default=1,
+        help="Number of layers in the neural network."
     )
     parser.add_argument(
         "-o", "--output",
@@ -275,13 +275,13 @@ def main() -> None:
         test_dataset, batch_size=args.batch_size, shuffle=False
     )
 
-    input_dim = train_dataset[0][0].shape[0]
+    input_dim  = train_dataset[0][0].shape[0]
     output_dim = train_dataset[0][1].shape[0]
     logging.debug(f"Input dim: {input_dim}, Output dim: {output_dim}")
     if args.model_name == 'mlp':
         model = MLPPredictor(input_dim=input_dim,
                              output_dim=output_dim,
-                             hidden_dim=args.hidden_dim).to(device)
+                             n_layers=args.n_layers).to(device)
     else:
         raise ValueError(f"Model {args.model_name} is not supported.")
     
