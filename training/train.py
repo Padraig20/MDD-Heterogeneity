@@ -49,13 +49,6 @@ def parse_args() -> argparse.Namespace:
         help="Name of the model to train. List of available models will be expanded in the future."
     )
     parser.add_argument(
-        "-l", "--loss",
-        type=str,
-        default="seq2cells",
-        choices=["seq2cells", "composite"],
-        help="Name of the loss function to use."
-    )
-    parser.add_argument(
         "-b", "--batch-size",
         type=int,
         default=1,
