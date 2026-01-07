@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mse-lambda",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Lambda parameter (weight) for the Mean Squared Error loss."
     )
     parser.add_argument(
