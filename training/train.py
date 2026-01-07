@@ -5,7 +5,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 import torch
-from utils import get_train_test_dataset
+from utils import get_train_test_dataset, EarlyStopping
 from models.mlp import MLPPredictor
 from dataset import MddDataset
 from loss.cossim_loss import CosineSimilarityLoss
@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of layers in the neural network."
     )
     parser.add_argument(
+        "--early-stop",
+        action="store_true",
+        help="Enable early stopping on eval metric."
+    )
+    parser.add_argument(
         "-o", "--output",
         type=Path,
         default=None,
@@ -134,6 +139,7 @@ def train_model(
     loss_lambda_dict: dict,
     optimizer: torch.optim.Optimizer,
     wb_logger: WandBLogger,
+    early_stopping: EarlyStopping,
     epochs: int = 10,
 ) -> None:
     """Train the model. Evaluate after each epoch."""
@@ -181,14 +187,20 @@ def train_model(
         
         wb_logger.log(log_dict)
 
-        evaluate_model(
-            model=model,
-            eval_loader=eval_loader,
-            loss_dict=loss_dict,
-            loss_lambda_dict=loss_lambda_dict,
-            wb_logger=wb_logger,
-            mode="eval"
+        eval_loss = evaluate_model(
+                        model=model,
+                        eval_loader=eval_loader,
+                        loss_dict=loss_dict,
+                        loss_lambda_dict=loss_lambda_dict,
+                        wb_logger=wb_logger,
+                    mode="eval"
         )
+
+        if early_stopping is not None:
+            if early_stopping.step(eval_loss, model):
+                logging.info("Early stopping triggered! Restoring best model weights...")
+                early_stopping.restore_best_weights(model)
+                break
 
 def evaluate_model(
     model: torch.nn.Module,
@@ -197,7 +209,7 @@ def evaluate_model(
     loss_lambda_dict: dict,
     wb_logger: WandBLogger,
     mode : str = "eval" # eval or test
-) -> None:
+) -> float:
     """Evaluate the model."""
 
     log_dict = {
@@ -238,6 +250,8 @@ def evaluate_model(
     logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
     
     wb_logger.log(log_dict)
+
+    return log_dict[f"{mode}/loss"]
 
 def main() -> None:
     args = parse_args()
@@ -300,6 +314,9 @@ def main() -> None:
     if args.pnll_lambda > 0.0:
         loss_dict['pnll'] = PNLLLoss()
         loss_lambda_dict['pnll'] = args.pnll_lambda
+
+    early_stopping = EarlyStopping(patience=20, min_delta=1e-6, mode="min") if args.early_stop else None
+    logging.debug(f"Early stopping: {early_stopping is not None}")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
     logging.info("Starting training...")
@@ -312,6 +329,7 @@ def main() -> None:
         loss_lambda_dict=loss_lambda_dict,
         optimizer=optimizer,
         wb_logger=wb_logger,
+        early_stopping=early_stopping,
         epochs=args.epochs
     )
 
