@@ -16,7 +16,7 @@
 echo ""
 echo "==============================================================================="
 echo ""
-echo "LR=$2, BS=$4, NL=$6, Epochs=$8, Loss=${10}, CosSim=${12}, MPC=${14}, MSE=${16}, PNLL=${18}, X=${20}, y=${22}"
+echo "LR=$2, BS=$4, NL=$6, Epochs=$8, X=${10}, y=${12}, CosSim=${14}, MPC=${16}, MSE=${18}, PNLL=${20}"
 echo ""
 echo "==============================================================================="
 echo ""
@@ -28,10 +28,10 @@ uv run python ./training/train.py \
     -e  "$8"    \
     -es         \
     -v          \
-    -X "${20}"  \
-    -y "${22}"  \
-    --cossim-lambda "${12}" \
-    --mpc-lambda "${14}"      \
-    --mse-lambda "${16}"      \
-    --pnll-lambda "${18}"     \
-    --run-name "lr${2}_b${4}_nl${6}_cs${12}_mpc${14}_mse${16}_pnll${18}"
+    -X "${10}"  \
+    -y "${12}"  \
+    --cossim-lambda "${14}" \
+    --mpc-lambda "${16}"      \
+    --mse-lambda "${18}"      \
+    --pnll-lambda "${20}"     \
+    --run-name "lr${2}_b${4}_nl${6}_cs${14}_mpc${16}_mse${18}_pnll${20}"
