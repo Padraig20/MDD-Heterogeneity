@@ -136,13 +136,14 @@ def setup_logging(verbosity: int) -> None:
 def train_model(
     model: torch.nn.Module,
     train_loader: torch.utils.data.DataLoader,
+    eval_loader: torch.utils.data.DataLoader,
     loss_dict: dict,
     loss_lambda_dict: dict,
     optimizer: torch.optim.Optimizer,
     wb_logger: WandBLogger,
     epochs: int = 10,
 ) -> None:
-    """Train the model."""
+    """Train the model. Evaluate after each epoch."""
 
     log_dict = {
         "train/loss": 0.0,
@@ -187,24 +188,34 @@ def train_model(
         
         wb_logger.log(log_dict)
 
+        evaluate_model(
+            model=model,
+            eval_loader=eval_loader,
+            loss_dict=loss_dict,
+            loss_lambda_dict=loss_lambda_dict,
+            wb_logger=wb_logger,
+            mode="eval"
+        )
+
 def evaluate_model(
     model: torch.nn.Module,
     eval_loader: torch.utils.data.DataLoader,
     loss_dict: dict,
     loss_lambda_dict: dict,
     wb_logger: WandBLogger,
+    mode : str = "eval" # eval or test
 ) -> None:
     """Evaluate the model."""
 
     log_dict = {
-        "eval/loss": 0.0,
-        "eval/pearson_cells": 0.0,
-        "eval/pearson_genes": 0.0,
+        f"{mode}/loss": 0.0,
+        f"{mode}/pearson_cells": 0.0,
+        f"{mode}/pearson_genes": 0.0,
     }
     
     for key in loss_dict.keys():
-        log_dict[f"eval/{key}_loss"] = 0.0
-
+        log_dict[f"{mode}/{key}_loss"] = 0.0
+    
     model.eval()
     metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
     metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
@@ -217,21 +228,21 @@ def evaluate_model(
             composite_loss = torch.tensor(0.0, device=device)
             for key in loss_dict.keys():
                 loss = loss_dict[key](outputs, targets) * loss_lambda_dict[key]
-                log_dict[f"eval/{key}_loss"] += loss.item()
+                log_dict[f"{mode}/{key}_loss"] += loss.item()
                 composite_loss += loss
 
-            log_dict["eval/loss"] += composite_loss.item()
+            log_dict[f"{mode}/loss"] += composite_loss.item()
             metric_cells.update(outputs, targets)
             metric_genes.update(outputs, targets)
 
-    log_dict["eval/loss"] /= len(eval_loader)
-    log_dict["eval/pearson_cells"] = metric_cells.compute().mean().item()
-    log_dict["eval/pearson_genes"] = metric_genes.compute().mean().item()
+    log_dict[f"{mode}/loss"] /= len(eval_loader)
+    log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().mean().item()
+    log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().mean().item()
 
     for key in loss_dict.keys():
-        log_dict[f"eval/{key}_loss"] /= len(eval_loader)
+        log_dict[f"{mode}/{key}_loss"] /= len(eval_loader)
     
-    logging.info(f"Test Loss: {log_dict['eval/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
+    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
     
     wb_logger.log(log_dict)
 
@@ -247,10 +258,11 @@ def main() -> None:
         y=args.targets,
     )
 
-    train_dataset, eval_dataset = get_train_test_dataset(dataset)
+    train_dataset, eval_dataset, test_dataset = get_train_test_dataset(dataset)
 
     logging.debug(f"Train dataset size: {len(train_dataset)}")
     logging.debug(f"Eval dataset size:  {len(eval_dataset)}")
+    logging.debug(f"Test dataset size:  {len(test_dataset)}")
     logging.debug(f"Total dataset size: {len(dataset)}")
 
     train_loader = torch.utils.data.DataLoader(
@@ -258,6 +270,9 @@ def main() -> None:
     )
     eval_loader = torch.utils.data.DataLoader(
         eval_dataset, batch_size=args.batch_size, shuffle=False
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False
     )
 
     input_dim = train_dataset[0][0].shape[0]
@@ -299,6 +314,7 @@ def main() -> None:
     train_model(
         model=model,
         train_loader=train_loader,
+        eval_loader=eval_loader,
         loss_dict=loss_dict,
         loss_lambda_dict=loss_lambda_dict,
         optimizer=optimizer,
@@ -310,10 +326,11 @@ def main() -> None:
 
     evaluate_model(
         model=model,
-        eval_loader=eval_loader,
+        eval_loader=test_loader,
         loss_dict=loss_dict,
         loss_lambda_dict=loss_lambda_dict,
         wb_logger=wb_logger,
+        mode="test"
     )
 
     if args.output is not None:

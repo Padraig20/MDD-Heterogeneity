@@ -7,7 +7,8 @@ val_set = ["11", "14", "7"]
 test_set = ["12", "20", "5"]
 
 def get_train_test_dataset(dataset: MddDataset):
-    """Load dataset and split into train and test sets."""
+    """Load dataset and split into train, val and test sets."""
     train_dataset = dataset.split_by_chromosome(train_set)
-    test_dataset  = dataset.split_by_chromosome(val_set + test_set)
-    return train_dataset, test_dataset
+    val_dataset   = dataset.split_by_chromosome(val_set)
+    test_dataset  = dataset.split_by_chromosome(test_set)
+    return train_dataset, val_dataset, test_dataset
