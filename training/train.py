@@ -201,6 +201,7 @@ def train_model(
                         loss_dict=loss_dict,
                         loss_lambda_dict=loss_lambda_dict,
                         wb_logger=wb_logger,
+                        epoch=epoch,
                     mode="eval"
         )
 
@@ -216,11 +217,13 @@ def evaluate_model(
     loss_dict: dict,
     loss_lambda_dict: dict,
     wb_logger: WandBLogger,
-    mode : str = "eval" # eval or test
+    mode : str = "eval", # eval or test
+    epoch: int = 0,
 ) -> float:
     """Evaluate the model."""
 
     log_dict = {
+        f"{mode}/epoch": epoch,
         f"{mode}/loss": 0.0,
         f"{mode}/pearson_cells": 0.0,
         f"{mode}/pearson_genes": 0.0,
