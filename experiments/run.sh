@@ -1,9 +1,17 @@
 #!/bin/bash
 
-learning_rates=(5e-4 5e-5 5e-6)
-batch_sizes=(128 256)
-loss_functions=("seq2cells" "composite")
-hidden_dims=(256 512 1024)
+# ./slurm/submit.sh --learning-rate "$lr" --batch-size "$bs" --n-layers "$nl" 
+#                   --epochs "$epochs" -X "$X" -y "$y" --cossim-lambda "$cossim_lambda"
+#                   --mpc-lambda "$mpc_lambda" --mse-lambda "$mse_lambda" --pnll-lambda "$pnll_lambda"
+
+learning_rates=(5e-6)
+batch_sizes=(256)
+n_layers=(1 3 5)
+
+cossim_lambdas=(0 0.2 1.0)
+mpc_lambdas=(0 0.2 1.0)
+mse_lambdas=(0 0.2 1.0)
+pnll_lambdas=(0 0.2 1.0)
 
 epochs=50
 X="./X"
@@ -11,10 +19,16 @@ y="./y.csv"
 
 for lr in "${learning_rates[@]}"; do
     for bs in "${batch_sizes[@]}"; do
-        for lf in "${loss_functions[@]}"; do
-            for hd in "${hidden_dims[@]}"; do
-                echo "Submitting job with lr=$lr, bs=$bs, lf=$lf, hd=$hd, epochs=$epochs"
-                sbatch ./experiments/submit.sh --learning-rate "$lr" --batch-size "$bs" --hidden-dim "$hd" --epochs "$epochs" --loss-function "$lf" -X "$X" -y "$y"
+        for nl in "${n_layers[@]}"; do
+            for cossim_lambda in "${cossim_lambdas[@]}"; do
+                for mpc_lambda in "${mpc_lambdas[@]}"; do
+                    for mse_lambda in "${mse_lambdas[@]}"; do
+                        for pnll_lambda in "${pnll_lambdas[@]}"; do
+                            echo "Submitting job with lr=$lr, bs=$bs, nl=$nl, epochs=$epochs, cossim_lambda=$cossim_lambda, mpc_lambda=$mpc_lambda, mse_lambda=$mse_lambda, pnll_lambda=$pnll_lambda"
+                            sbatch ./experiments/submit.sh --learning-rate "$lr" --batch-size "$bs" --n-layers "$nl" --epochs "$epochs" -X "$X" -y "$y" --cossim-lambda "$cossim_lambda" --mpc-lambda "$mpc_lambda" --mse-lambda "$mse_lambda" --pnll-lambda "$pnll_lambda"
+                        done
+                    done
+                done
             done
         done
     done

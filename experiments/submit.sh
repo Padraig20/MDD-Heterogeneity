@@ -9,12 +9,14 @@
 #SBATCH --job-name=mdd-heterogeneity
 #SBATCH --output=experiments/logs/slurm-%j.out
 
-# ./slurm/submit.sh --learning-rate "$lr" --batch-size "$bs" --hidden-dim "$hd" --epochs "$epochs" --loss-function "$lf" -X "$X" -y "$y"
+# ./slurm/submit.sh --learning-rate "$lr" --batch-size "$bs" --n-layers "$nl" 
+#                   --epochs "$epochs" -X "$X" -y "$y" --cossim-lambda "$cossim_lambda"
+#                   --mpc-lambda "$mpc_lambda" --mse-lambda "$mse_lambda" --pnll-lambda "$pnll_lambda"
 
 echo ""
 echo "==============================================================================="
 echo ""
-echo "LR=$2, BS=$4, HD=$6, Epochs=$8, Loss=${10}, X=${12}, y=${14}"
+echo "LR=$2, BS=$4, NL=$6, Epochs=$8, Loss=${10}, CosSim=${12}, MPC=${14}, MSE=${16}, PNLL=${18}, X=${20}, y=${22}"
 echo ""
 echo "==============================================================================="
 echo ""
@@ -22,11 +24,14 @@ echo ""
 uv run python ./training/train.py \
     -lr "$2"    \
     -b  "$4"    \
-    -hd "$6"    \
+    -nl "$6"    \
     -e  "$8"    \
-    -l  "${10}" \
-    -u          \
+    -es         \
     -v          \
-    -X "${12}"  \
-    -y "${14}"  \
-    --run-name "lr${2}_b${4}_hd${6}_l${10}"
+    -X "${20}"  \
+    -y "${22}"  \
+    --cossim-lambda "${12}" \
+    --mpc-lambda "${14}"      \
+    --mse-lambda "${16}"      \
+    --pnll-lambda "${18}"     \
+    --run-name "lr${2}_b${4}_nl${6}_cs${12}_mpc${14}_mse${16}_pnll${18}"

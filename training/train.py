@@ -74,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         help="Number of layers in the neural network."
     )
     parser.add_argument(
-        "--early-stop",
+        "-es", "--early-stop",
         action="store_true",
         help="Enable early stopping on eval metric."
     )
