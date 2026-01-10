@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Lambda parameter (weight) for the Poisson Negative Log Likelihood loss."
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for splitting the data."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -276,8 +282,9 @@ def main() -> None:
         y=args.targets,
     )
 
-    train_dataset, eval_dataset, test_dataset = get_train_test_dataset(dataset)
+    train_dataset, eval_dataset, test_dataset = get_train_test_dataset(dataset, seed=args.seed)
 
+    logging.debug(f"Dataset loaded and split according to seed {args.seed}.")
     logging.debug(f"Train dataset size: {len(train_dataset)}")
     logging.debug(f"Eval dataset size:  {len(eval_dataset)}")
     logging.debug(f"Test dataset size:  {len(test_dataset)}")
