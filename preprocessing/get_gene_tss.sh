@@ -25,16 +25,24 @@ NR==FNR {
 # handle gtf
 $3 == "gene" {
   # TSS depends on strand... start or end
-  tss = ($7 == "+") ? $4 : $5
+  if ($7 == "+") {
+    tss = $4
+  } else {
+    tss = $5
+  }
 
-  gene_id = "NA"
-  if (match($9, /gene_id "([^"]+)"/, a)) gene_id = a[1]
-  else next
-
-  if (gene_id in ids) {
-    start = tss - window
-    end   = tss + window
-    print $1, gene_id, start, end
+  # Extract gene_id from attributes field
+  if (match($9, /gene_id "([^"]+)"/)) {
+    gene_id_start = index($9, "gene_id \"") + 9
+    gene_id_substr = substr($9, gene_id_start)
+    gene_id_end = index(gene_id_substr, "\"")
+    gene_id = substr(gene_id_substr, 1, gene_id_end - 1)
+    
+    if (gene_id in ids) {
+      start = tss - window
+      end   = tss + window
+      print $1, gene_id, start, end
+    }
   }
 }
 ' - "$INPUT_FILE"

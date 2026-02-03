@@ -4,11 +4,10 @@ import torch
 import torch.nn as nn
 
 class MSELoss(nn.Module):
-    """MSE Loss..."""
+    """MSE Loss"""
 
     def __init__(
-        self,
-        eps: float = 1e-8,
+        self
     ):
         super().__init__()
     
