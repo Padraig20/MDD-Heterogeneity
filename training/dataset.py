@@ -7,7 +7,7 @@ from pathlib import Path
 
 class MddDataset(Dataset):
     
-    def __init__(self, X_feats: Path|np.ndarray, X_ensids: Path|np.ndarray, X_chroms: Path|np.ndarray, y: Path|pd.DataFrame):
+    def __init__(self, X_feats: Path|np.ndarray, X_ensids: Path|np.ndarray, X_chroms: Path|np.ndarray, y: Path|pd.DataFrame, normalize: bool = False):
         """
         Args:
             X_feats (Path|np.ndarray):  Path to input features file (npy) or numpy array:
@@ -18,6 +18,7 @@ class MddDataset(Dataset):
                                         Contains the chromosomes corresponding to the rows in X_feats.
             y (Path|pd.DataFrame):      Path to target labels file (csv) or pandas DataFrame:
                                         2d array; (rows: cell-types, columns: ensid)
+            normalize (bool):           Whether to log-transform the target labels.
         """
         if isinstance(X_feats, Path) and isinstance(X_ensids, Path) and \
            isinstance(X_chroms, Path) and isinstance(y, Path):
@@ -30,6 +31,7 @@ class MddDataset(Dataset):
             self.X_ensids = X_ensids
             self.X_chroms = X_chroms
             self.y        = y
+        self.normalize = normalize
     
     def split_by_chromosome(self, chrom: list[str]) -> Dataset:
         """Return a new MddDataset containing only data from the specified chromosomes."""
@@ -37,7 +39,7 @@ class MddDataset(Dataset):
         X_feats_chrom  = self.X_feats[mask]
         X_ensids_chrom = self.X_ensids[mask]
         X_chroms_chrom = self.X_chroms[mask]
-        return MddDataset(X_feats_chrom, X_ensids_chrom, X_chroms_chrom, self.y)
+        return MddDataset(X_feats_chrom, X_ensids_chrom, X_chroms_chrom, self.y, normalize=self.normalize)
     
     def __len__(self) -> int:
         return self.X_ensids.shape[0]
@@ -46,7 +48,11 @@ class MddDataset(Dataset):
         ensid = self.X_ensids[idx]
         if ensid not in self.y.columns:
             raise KeyError(f"Ensid {ensid} not found in target labels.")
-        return torch.from_numpy(self.X_feats[idx]), torch.from_numpy(self.y[ensid].values)
+        x = torch.from_numpy(self.X_feats[idx])
+        y = torch.from_numpy(self.y[ensid].values)
+        if self.normalize:
+            y = torch.log(1 + y)
+        return x, y
 
 if __name__ == "__main__":
     # example usage

@@ -22,13 +22,16 @@ class MLP(nn.Module):
         return x
 
 class MLPPredictor(nn.Module):
-    def __init__(self, input_dim, n_layers, output_dim):
+    def __init__(self, input_dim, n_layers, output_dim, layer_norm=False):
         super(MLPPredictor, self).__init__()
         self.mlp = MLP(input_dim, n_layers, output_dim)
         self.input_dim  = input_dim
         self.output_dim = output_dim
+        self.layer_norm = nn.LayerNorm(input_dim) if layer_norm else None
     
     def forward(self, x):
+        if self.layer_norm:
+            x = self.layer_norm(x)
         return self.mlp(x)
     
 if __name__ == "__main__":

@@ -126,6 +126,16 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for splitting the data."
     )
+    parser.add_argument(
+        "--norm-inputs",
+        action="store_true",
+        help="Enable layer normalization on inputs."
+    )
+    parser.add_argument(
+        "--norm-targets",
+        action="store_true",
+        help="Log-transform target labels."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -280,6 +290,7 @@ def main() -> None:
         X_ensids=args.observations.with_suffix(".ensids.npy"),
         X_chroms=args.observations.with_suffix(".chroms.npy"),
         y=args.targets,
+        normalize=args.norm_targets,
     )
 
     train_dataset, eval_dataset, test_dataset = get_train_test_dataset(dataset, seed=args.seed)
@@ -306,7 +317,8 @@ def main() -> None:
     if args.model_name == 'mlp':
         model = MLPPredictor(input_dim=input_dim,
                              output_dim=output_dim,
-                             n_layers=args.n_layers).to(device)
+                             n_layers=args.n_layers,
+                             layer_norm=args.norm_inputs).to(device)
     else:
         raise ValueError(f"Model {args.model_name} is not supported.")
     
