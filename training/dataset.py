@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+from scipy.stats import skew
+
 class MddDataset(Dataset):
     
     def __init__(self, X_feats: Path|np.ndarray, X_ensids: Path|np.ndarray, X_chroms: Path|np.ndarray, y: Path|pd.DataFrame, normalize: bool = False):
@@ -31,7 +33,9 @@ class MddDataset(Dataset):
             self.X_ensids = X_ensids
             self.X_chroms = X_chroms
             self.y        = y
+
         self.normalize = normalize
+        self.norm_features = None
     
     def split_by_chromosome(self, chrom: list[str]) -> Dataset:
         """Return a new MddDataset containing only data from the specified chromosomes."""
@@ -40,6 +44,15 @@ class MddDataset(Dataset):
         X_ensids_chrom = self.X_ensids[mask]
         X_chroms_chrom = self.X_chroms[mask]
         return MddDataset(X_feats_chrom, X_ensids_chrom, X_chroms_chrom, self.y, normalize=self.normalize)
+
+    def apply_feature_log_transform(self, threshold=1.0) -> None:
+        """Apply log-transform to input features."""
+        self.norm_features = torch.zeros(self.X_feats.shape[1])
+        for i in range(self.X_feats.shape[1]):
+            col = self.X_feats[:, i]
+            # if all values are non-negative and skewed, apply log-transform
+            if np.all(col >= 0) and skew(col) > threshold:
+                self.norm_features[i] = 1.0
     
     def __len__(self) -> int:
         return self.X_ensids.shape[0]
@@ -50,6 +63,9 @@ class MddDataset(Dataset):
             raise KeyError(f"Ensid {ensid} not found in target labels.")
         x = torch.from_numpy(self.X_feats[idx])
         y = torch.from_numpy(self.y[ensid].values)
+        if self.norm_features is not None:
+            x = x.clone()
+            x[self.norm_features == 1.0] = torch.log(1 + x[self.norm_features == 1.0])
         if self.normalize:
             y = torch.log(1 + y)
         return x, y

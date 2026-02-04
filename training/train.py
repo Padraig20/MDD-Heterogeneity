@@ -129,6 +129,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--norm-inputs",
         action="store_true",
+        help="Log-transform input features."
+    )
+    parser.add_argument(
+        "--norm-layer",
+        action="store_true",
         help="Enable layer normalization on inputs."
     )
     parser.add_argument(
@@ -311,6 +316,12 @@ def main() -> None:
         test_dataset, batch_size=args.batch_size, shuffle=False
     )
 
+    if args.norm_inputs:
+        logging.debug("Applying log-transform to input features...")
+        train_dataset.apply_feature_log_transform()
+        eval_dataset.norm_features = train_dataset.norm_features
+        test_dataset.norm_features = train_dataset.norm_features
+
     input_dim  = train_dataset[0][0].shape[0]
     output_dim = train_dataset[0][1].shape[0]
     logging.debug(f"Input dim: {input_dim}, Output dim: {output_dim}")
@@ -318,7 +329,7 @@ def main() -> None:
         model = MLPPredictor(input_dim=input_dim,
                              output_dim=output_dim,
                              n_layers=args.n_layers,
-                             layer_norm=args.norm_inputs).to(device)
+                             layer_norm=args.norm_layer).to(device)
     else:
         raise ValueError(f"Model {args.model_name} is not supported.")
     
