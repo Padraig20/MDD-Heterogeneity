@@ -1,0 +1,48 @@
+# sweep.yaml
+program: training/train.py
+method: bayes
+metric:
+  name: val_loss
+  goal: minimize
+
+parameters:
+  learning-rate:
+    values: [5e-6]
+  batch-size:
+    values: [256]
+  n-layers:
+    values: [3, 5]
+
+  cossim-lambda:
+    values: [0, 0.2, 1.0]
+  mpc-lambda:
+    values: [0, 0.2, 1.0]
+  mse-lambda:
+    values: [0, 0.2, 1.0]
+  pnll-lambda:
+    values: [0, 0.2, 1.0]
+
+  # booleans: sweep both; wandb will emit flags only when true
+  norm-inputs:
+    values: [true, false]
+  norm-targets:
+    values: [true, false]
+  norm-layer:
+    values: [true, false]
+
+  epochs:
+    value: 50
+
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - ${program}
+  - -X
+  - ./X
+  - -y
+  - ./y.csv
+  - --seed
+  - "777"
+  - ${args_no_boolean_flags}
