@@ -20,9 +20,9 @@ if ! command -v sbatch >/dev/null 2>&1; then
 fi
 
 # You really should set the WANDB key :)
-if [[ -z "${WANDB_API_KEY:-}" ]]; then
-  echo "WARNING: WANDB_API_KEY is not set. If you're not already logged in, set it:"
-  echo '  export WANDB_API_KEY="..."'
+if [[ -z "${WANDB_KEY:-}" ]]; then
+  echo "WARNING: WANDB_KEY is not set. If you're not already logged in, set it:"
+  echo '  export WANDB_KEY="..."'
 fi
 
 echo "Creating sweep from: $SWEEP_YAML (project=$PROJECT)"
