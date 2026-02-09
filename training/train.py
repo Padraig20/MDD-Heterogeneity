@@ -172,6 +172,7 @@ def train_model(
         "train/loss": 0.0,
         "train/pearson_cells": 0.0,
         "train/pearson_genes": 0.0,
+        "train/pearson": 0.0
     }
 
     for key in loss_dict.keys():
@@ -208,11 +209,12 @@ def train_model(
         log_dict["train/loss"] /= len(train_loader)
         log_dict["train/pearson_cells"] = metric_cells.compute().mean().item()
         log_dict["train/pearson_genes"] = metric_genes.compute().mean().item()
+        log_dict["train/pearson"] = (log_dict["train/pearson_cells"] + log_dict["train/pearson_genes"]) / 2.0
 
         for key in loss_dict.keys():
             log_dict[f"train/{key}_loss"] /= len(train_loader)
         
-        tqdm.write(f"Epoch {epoch + 1}/{epochs}, Loss: {log_dict['train/loss']:.4f}, PC Cells: {log_dict['train/pearson_cells']:.4f}, PC Genes: {log_dict['train/pearson_genes']:.4f}")
+        tqdm.write(f"Epoch {epoch + 1}/{epochs}, Loss: {log_dict['train/loss']:.4f}, PC Cells: {log_dict['train/pearson_cells']:.4f}, PC Genes: {log_dict['train/pearson_genes']:.4f}, PC: {log_dict['train/pearson']:.4f}")
         
         wb_logger.log(log_dict)
 
@@ -248,6 +250,7 @@ def evaluate_model(
         f"{mode}/loss": 0.0,
         f"{mode}/pearson_cells": 0.0,
         f"{mode}/pearson_genes": 0.0,
+        f"{mode}/pearson": 0.0
     }
     
     for key in loss_dict.keys():
@@ -275,11 +278,12 @@ def evaluate_model(
     log_dict[f"{mode}/loss"] /= len(eval_loader)
     log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().mean().item()
     log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().mean().item()
+    log_dict[f"{mode}/pearson"] = (log_dict[f"{mode}/pearson_cells"] + log_dict[f"{mode}/pearson_genes"]) / 2.0
 
     for key in loss_dict.keys():
         log_dict[f"{mode}/{key}_loss"] /= len(eval_loader)
     
-    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}")
+    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
     
     wb_logger.log(log_dict)
 

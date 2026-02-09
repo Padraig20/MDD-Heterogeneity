@@ -2,25 +2,25 @@
 program: training/train.py
 method: bayes
 metric:
-  name: val_loss
-  goal: minimize
+  name: eval/pearson
+  goal: maximize
 
 parameters:
   learning-rate:
-    values: [5e-6]
+    values: [5e-4, 5e-5, 5e-6]
   batch-size:
-    values: [256]
+    values: [128, 256]
   n-layers:
-    values: [3, 5]
+    values: [1, 3, 5]
 
   cossim-lambda:
-    values: [0, 0.2, 1.0]
+    values: [0, 0.1, 0.5, 1.0]
   mpc-lambda:
-    values: [0, 0.2, 1.0]
+    values: [0, 0.1, 0.5, 1.0]
   mse-lambda:
-    values: [0, 0.2, 1.0]
+    values: [0, 0.1, 0.5, 1.0]
   pnll-lambda:
-    values: [0, 0.2, 1.0]
+    values: [0, 0.1, 0.5, 1.0]
 
   # booleans: sweep both; wandb will emit flags only when true
   norm-inputs:
@@ -45,4 +45,6 @@ command:
   - ./y.csv
   - --seed
   - "777"
+  - --run-name
+  - "sweep"
   - ${args_no_boolean_flags}

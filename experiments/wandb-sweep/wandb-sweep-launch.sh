@@ -29,13 +29,8 @@ echo "Creating sweep from: $SWEEP_YAML (project=$PROJECT)"
 OUT="$(wandb sweep --project "$PROJECT" "$SWEEP_YAML" 2>&1 | tee /dev/stderr)"
 
 # We then parse the sweep id from output lines, e.g.:
-# "Create sweep with ID: entity/project/somethingsomething"
-SWEEP_ID="$(echo "$OUT" | sed -n 's/.*Create sweep with ID:[[:space:]]*\([^[:space:]]*\).*/\1/p' | tail -n 1)"
-
-#if [[ -z "$SWEEP_ID" ]]; then
-  # if output is different?
-#  SWEEP_ID="$(echo "$OUT" | grep -Eo '[^[:space:]]+/[^[:space:]]+/[^[:space:]]+' | tail -n 1)"
-#fi
+# "Create sweep with ID: entity/project/something"
+SWEEP_ID="$(echo "$OUT" | sed -n 's/.*Run sweep agent with: wandb agent \([^[:space:]]*\).*/\1/p' | tail -n 1)"
 
 if [[ -z "$SWEEP_ID" ]]; then
   echo "ERROR: Could not parse SWEEP_ID from wandb output."
@@ -48,6 +43,6 @@ echo "Sweep ID: $SWEEP_ID"
 echo "Submitting Slurm array: total=$TOTAL_RUNS, max_parallel=$MAX_PARALLEL"
 
 ARRAY_SPEC="0-$((TOTAL_RUNS-1))%${MAX_PARALLEL}"
-sbatch --array="$ARRAY_SPEC" experiments/wandb-sweep/wandb_agent.sbatch "$SWEEP_ID"
+sbatch --array="$ARRAY_SPEC" experiments/wandb-sweep/wandb-sweep-agent.sbatch "$SWEEP_ID"
 
 echo "Done."
