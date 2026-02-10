@@ -53,7 +53,7 @@ class MLPEnsemble(nn.Module):
                 model.train()
                 preds = model(x)
                 means.append(preds[..., :self.output_dim])
-                vars.append(preds[..., self.output_dim:].clamp(min=1e-8)) # avoid zero div
+                vars.append(preds[..., self.output_dim:])
             return means, vars
 
         else: # calculate aggregated predictions and uncertainties
@@ -63,7 +63,7 @@ class MLPEnsemble(nn.Module):
                 model.eval()
                 preds = model(x) # shape (batch_size, output_dim*2)
                 mu    = preds[..., :self.output_dim]
-                var   = preds[..., self.output_dim:].clamp(min=1e-8) # avoid zero div
+                var   = preds[..., self.output_dim:]
                 means.append(mu)
                 vars.append(var)
 

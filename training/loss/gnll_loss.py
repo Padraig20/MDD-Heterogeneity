@@ -36,7 +36,7 @@ class GaussianNLLLoss(nn.Module):
         mu      = preds[..., 0]
         raw_var = preds[..., 1]
 
-        sigma2 = torch.sigmoid(raw_var).clamp_min(self.eps) # bound variance to be positive, and not too small
+        sigma2 = torch.sigmoid(raw_var).clamp_min(self.eps) # bound variance to be positive and > 0
         resid2 = (t - mu) ** 2
 
         # negative log-likelihood up to additive constant:
