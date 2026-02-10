@@ -136,7 +136,7 @@ def train_single_model(
                         wb_logger=wb_logger,
                         device=device,
                         epoch=epoch,
-                    mode="eval"
+                        mode="eval"
         )
 
         if early_stopping is not None:
@@ -205,4 +205,157 @@ def evaluate_single_model(
 # -------------- TRAINING AND EVALUATION FOR ENSEMBLE MODEL ------------------ #
 # ---------------------------------------------------------------------------- #
 
-# TBA...
+def train_ensemble_model(
+    model: torch.nn.Module,
+    train_loader: torch.utils.data.DataLoader,
+    eval_loader: torch.utils.data.DataLoader,
+    loss_dict: dict,
+    loss_lambda_dict: dict,
+    optimizer: torch.optim.Optimizer,
+    scheduler: SequentialLR,
+    wb_logger: WandBLogger,
+    early_stopping: EarlyStopping,
+    epochs: int = 10,
+    device: torch.device = torch.device("cpu")
+) -> None:
+    """Train the ensemble model. Evaluate after each epoch."""
+
+    log_dict = {
+        "train/epoch": 0,
+        "train/loss": 0.0,
+        "train/pearson_cells": 0.0,
+        "train/pearson_genes": 0.0,
+        "train/pearson": 0.0
+    }
+
+    for key in loss_dict.keys():
+        log_dict[f"train/{key}_loss"] = 0.0
+
+    model.train()
+    for epoch in range(epochs):
+        metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
+        metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(train_loader.dataset)).to(device)
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            optimizer.zero_grad()
+
+            means, vars = model(inputs)
+
+            composite_loss = torch.tensor(0.0, device=device)
+            for m, v in zip(means, vars):
+                output = torch.stack([m, v], dim=2)
+                for key in loss_dict.keys():
+                    loss = loss_dict[key](output, targets) * loss_lambda_dict[key]
+                    log_dict[f"train/{key}_loss"] += loss.item()
+                    composite_loss += loss
+
+            composite_loss.backward()
+            optimizer.step()
+
+            output = torch.mean(torch.stack(means), dim=0)
+
+            scheduler.step() # update lr and log
+            wb_logger.log({"train/lr": optimizer.param_groups[0]['lr']})
+            metric_cells.update(output, targets)
+            metric_genes.update(output, targets)
+            log_dict["train/loss"] += composite_loss.item()
+
+        log_dict["train/epoch"] = epoch
+        log_dict["train/loss"] /= len(train_loader)
+        log_dict["train/pearson_cells"] = metric_cells.compute().mean().item()
+        log_dict["train/pearson_genes"] = metric_genes.compute().mean().item()
+        log_dict["train/pearson"] = (log_dict["train/pearson_cells"] + log_dict["train/pearson_genes"]) / 2.0
+
+        for key in loss_dict.keys():
+            log_dict[f"train/{key}_loss"] /= len(train_loader)
+        
+        tqdm.write(f"Epoch {epoch + 1}/{epochs}, Loss: {log_dict['train/loss']:.4f}, PC Cells: {log_dict['train/pearson_cells']:.4f}, PC Genes: {log_dict['train/pearson_genes']:.4f}, PC: {log_dict['train/pearson']:.4f}")
+        
+        wb_logger.log(log_dict)
+
+        eval_loss = evaluate_ensemble_model(
+                        model=model,
+                        eval_loader=eval_loader,
+                        loss_dict=loss_dict,
+                        loss_lambda_dict=loss_lambda_dict,
+                        wb_logger=wb_logger,
+                        device=device,
+                        epoch=epoch,
+                        mode="eval"
+        )
+
+        if early_stopping is not None:
+            if early_stopping.step(eval_loss, model):
+                logging.info("Early stopping triggered! Restoring best model weights...")
+                early_stopping.restore_best_weights(model)
+                break
+
+def evaluate_ensemble_model(
+    model: torch.nn.Module,
+    eval_loader: torch.utils.data.DataLoader,
+    loss_dict: dict,
+    loss_lambda_dict: dict,
+    wb_logger: WandBLogger,
+    device: torch.device = torch.device("cpu"),
+    mode : str = "eval", # eval or test
+    epoch: int = 0,
+) -> float:
+    """Evaluate the ensemble model."""
+
+    log_dict = {
+        f"{mode}/epoch": epoch,
+        f"{mode}/loss": 0.0,
+        f"{mode}/pearson_cells": 0.0,
+        f"{mode}/pearson_genes": 0.0,
+        f"{mode}/pearson": 0.0,
+        f"{mode}/aleatoric": 0.0, # should theoretically stay consistent
+        f"{mode}/epistemic": 0.0  # should theoretically go down with training
+    }
+    
+    for key in loss_dict.keys():
+        log_dict[f"{mode}/{key}_loss"] = 0.0
+    
+    model.eval()
+    metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
+    metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
+
+    epistemic_uncertainties = []
+    aleatoric_uncertainties = []
+
+    with torch.no_grad():
+        for batch in tqdm(eval_loader, desc="Evaluating"):
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            outputs, aleatoric_unc, epistemic_unc = model(inputs)
+            
+            aleatoric_uncertainties.append(aleatoric_unc.mean(dim=0)) # avg aleatoric uncertainty across cells
+            epistemic_uncertainties.append(epistemic_unc.mean(dim=0)) # avg epistemic uncertainty across cells
+
+            composite_loss = torch.tensor(0.0, device=device)
+            for key in loss_dict.keys():
+                loss = loss_dict[key](outputs, targets) * loss_lambda_dict[key]
+                log_dict[f"{mode}/{key}_loss"] += loss.item()
+                composite_loss += loss
+
+            log_dict[f"{mode}/loss"] += composite_loss.item()
+            metric_cells.update(outputs, targets)
+            metric_genes.update(outputs, targets)
+
+    log_dict[f"{mode}/loss"] /= len(eval_loader)
+    log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().mean().item()
+    log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().mean().item()
+    log_dict[f"{mode}/pearson"] = (log_dict[f"{mode}/pearson_cells"] + log_dict[f"{mode}/pearson_genes"]) / 2.0
+    log_dict[f"{mode}/aleatoric"] = torch.mean(torch.stack(aleatoric_uncertainties)).item()
+    log_dict[f"{mode}/epistemic"] = torch.mean(torch.stack(epistemic_uncertainties)).item()
+
+    for key in loss_dict.keys():
+        log_dict[f"{mode}/{key}_loss"] /= len(eval_loader)
+    
+    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
+    
+    wb_logger.log(log_dict)
+
+    return log_dict[f"{mode}/loss"]

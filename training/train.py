@@ -12,6 +12,7 @@ from models.mlp import MLPPredictor
 from models.mlp_deep_ensemble import MLPEnsemble
 
 from utils import train_single_model, evaluate_single_model
+from utils import train_ensemble_model, evaluate_ensemble_model
 
 from loss.cossim_loss import CosineSimilarityLoss
 from loss.mpc_loss import MPCLoss
@@ -243,7 +244,7 @@ def main() -> None:
         loss_dict['gnll'] = GaussianNLLLoss()
         loss_lambda_dict['gnll'] = 1.0 # TODO implement scale later, or not?
 
-    early_stopping = EarlyStopping(patience=20, min_delta=1e-6, mode="min") if args.early_stop else None
+    early_stopping = EarlyStopping(patience=5, min_delta=1e-6, mode="min") if args.early_stop else None
     logging.debug(f"Early stopping: {early_stopping is not None}")
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -254,35 +255,62 @@ def main() -> None:
     # start at 1% or lr and linearly warm up to 100%
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
-    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
+    scheduler        = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
     logging.info("Starting training...")
 
-    train_single_model(
-        model=model,
-        train_loader=train_loader,
-        eval_loader=eval_loader,
-        loss_dict=loss_dict,
-        loss_lambda_dict=loss_lambda_dict,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        wb_logger=wb_logger,
-        early_stopping=early_stopping,
-        epochs=args.epochs,
-        device=device
-    )
+    if args.model_name == 'deep_ensemble':
+        train_ensemble_model(
+            model=model,
+            train_loader=train_loader,
+            eval_loader=eval_loader,
+            loss_dict=loss_dict,
+            loss_lambda_dict=loss_lambda_dict,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            wb_logger=wb_logger,
+            early_stopping=early_stopping,
+            epochs=args.epochs,
+            device=device
+        )
 
-    logging.info("Training done, starting evaluation...")
+        logging.info("Training done, starting evaluation...")
 
-    evaluate_single_model(
-        model=model,
-        eval_loader=test_loader,
-        loss_dict=loss_dict,
-        loss_lambda_dict=loss_lambda_dict,
-        device=device,
-        wb_logger=wb_logger,
-        mode="test"
-    )
+        evaluate_ensemble_model(
+            model=model,
+            eval_loader=test_loader,
+            loss_dict=loss_dict,
+            loss_lambda_dict=loss_lambda_dict,
+            device=device,
+            wb_logger=wb_logger,
+            mode="test"
+        )
+    else:
+        train_single_model(
+            model=model,
+            train_loader=train_loader,
+            eval_loader=eval_loader,
+            loss_dict=loss_dict,
+            loss_lambda_dict=loss_lambda_dict,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            wb_logger=wb_logger,
+            early_stopping=early_stopping,
+            epochs=args.epochs,
+            device=device
+        )
+
+        logging.info("Training done, starting evaluation...")
+
+        evaluate_single_model(
+            model=model,
+            eval_loader=test_loader,
+            loss_dict=loss_dict,
+            loss_lambda_dict=loss_lambda_dict,
+            device=device,
+            wb_logger=wb_logger,
+            mode="test"
+        )
 
     if args.output is not None:
         torch.save(model.state_dict(), args.output)
