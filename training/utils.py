@@ -88,8 +88,8 @@ def train_single_model(
     for key in loss_dict.keys():
         log_dict[f"train/{key}_loss"] = 0.0
 
-    model.train()
     for epoch in range(epochs):
+        model.train()
         metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
         metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(train_loader.dataset)).to(device)
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
@@ -231,8 +231,8 @@ def train_ensemble_model(
     for key in loss_dict.keys():
         log_dict[f"train/{key}_loss"] = 0.0
 
-    model.train()
     for epoch in range(epochs):
+        model.train()
         metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
         metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(train_loader.dataset)).to(device)
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
