@@ -329,11 +329,12 @@ def evaluate_ensemble_model(
             inputs, targets = batch
             inputs, targets = inputs.to(device), targets.to(device)
 
-            outputs, aleatoric_unc, epistemic_unc = model(inputs)
+            prediction, aleatoric_unc, epistemic_unc = model(inputs)
             
             aleatoric_uncertainties.append(aleatoric_unc.mean(dim=0)) # avg aleatoric uncertainty across cells
             epistemic_uncertainties.append(epistemic_unc.mean(dim=0)) # avg epistemic uncertainty across cells
 
+            outputs = torch.stack([prediction, aleatoric_unc], dim=2) # shape (batch_size, output_dim, 2)
             composite_loss = torch.tensor(0.0, device=device)
             for key in loss_dict.keys():
                 loss = loss_dict[key](outputs, targets) * loss_lambda_dict[key]
@@ -341,8 +342,8 @@ def evaluate_ensemble_model(
                 composite_loss += loss
 
             log_dict[f"{mode}/loss"] += composite_loss.item()
-            metric_cells.update(outputs, targets)
-            metric_genes.update(outputs, targets)
+            metric_cells.update(prediction, targets)
+            metric_genes.update(prediction, targets)
 
     log_dict[f"{mode}/loss"] /= len(eval_loader)
     log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().mean().item()
