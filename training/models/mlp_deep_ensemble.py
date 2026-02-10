@@ -52,7 +52,7 @@ class MLPEnsemble(nn.Module):
             for model in self.models:
                 model.train()
                 means.append(model(x)[..., :self.output_dim])
-                vars.append(model(x)[..., self.output_dim:])
+                vars.append(model(x)[..., self.output_dim:]).clamp(min=1e-8) # avoid zero div
             return np.array(means), np.array(vars)
 
         else: # calculate aggregated predictions and uncertainties
