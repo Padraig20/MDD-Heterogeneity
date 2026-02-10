@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         "-m", "--model-name",
         type=str,
         default="mlp",
-        choices=["mlp", "deep_ensemble"],
+        choices=["mlp", "deep-ensemble"],
         help="Name of the model to train. List of available models will be expanded in the future."
     )
     parser.add_argument(
@@ -204,7 +204,7 @@ def main() -> None:
                              output_dim=output_dim,
                              n_layers=args.n_layers,
                              layer_norm=args.norm_layer).to(device)
-    elif args.model_name == 'deep_ensemble':
+    elif args.model_name == 'deep-ensemble':
         model = MLPEnsemble(n_models=5,
                             input_dim=input_dim,
                             output_dim=output_dim,
@@ -236,7 +236,7 @@ def main() -> None:
         loss_dict['pnll'] = PNLLLoss()
         loss_lambda_dict['pnll'] = args.pnll_lambda
     
-    if args.model_name == 'deep_ensemble':
+    if args.model_name == 'deep-ensemble':
         # for deep ensemble, we always add the Gaussian NLL loss for uncertainty estimation
         # we delete all other losses, since they don't work with the (mean, var) output format of the ensemble
         loss_dict = {}
@@ -259,7 +259,7 @@ def main() -> None:
 
     logging.info("Starting training...")
 
-    if args.model_name == 'deep_ensemble':
+    if args.model_name == 'deep-ensemble':
         train_ensemble_model(
             model=model,
             train_loader=train_loader,

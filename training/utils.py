@@ -8,8 +8,8 @@ import random
 
 from torch.optim.lr_scheduler import SequentialLR
 
-from training.metrics import MeanCellPearson, MeanGenePearson
-from training.wandb_logger import WandBLogger
+from metrics import MeanCellPearson, MeanGenePearson
+from wandb_logger import WandBLogger
 
 # taken from scPrediXcan tutorial
 # https://github.com/hakyimlab/scPrediXcan/blob/master/Scripts/ctPred/Tutorial.ipynb
