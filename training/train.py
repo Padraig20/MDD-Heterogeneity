@@ -218,7 +218,7 @@ def main() -> None:
     else:
         wb_logger = WandBLogger(enabled=False)
         
-    if args.cossim_lambda + args.mpc_lambda + args.mse_lambda + args.pnll_lambda <= 0.0:
+    if args.cossim_lambda + args.mpc_lambda + args.mse_lambda + args.pnll_lambda <= 0.0 and args.model_name != 'deep-ensemble':
         raise ValueError("I'm afraid you'll have to set at least one loss lambda to a positive value ;)")
     
     loss_dict = {}
