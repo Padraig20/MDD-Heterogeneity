@@ -2,6 +2,8 @@
 Custom Metrics to get the Pearson Correlation Coefficient per cell and per gene.
 Idea adapted from seq2cells:
 https://github.com/GSK-AI/seq2cells/blob/main/seq2cells/metrics_and_losses/metrics.py
+
+Furthermore, we keep track of the mean predicted uncertainty per cell and per gene.
 """
 
 import torch
@@ -112,3 +114,58 @@ class MeanGenePearson(Metric):
         assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
 
         return cov / (denom + 1e-12) # [n]; account for possible 0 division
+
+class MeanCellUncertainty(Metric):
+    """Mean predicted uncertainty per cell (correlate across genes), then mean over cells."""
+
+    is_differentiable = False
+    higher_is_better  = False
+    full_state_update = False
+
+    def __init__(self, n_cells: int, dist_sync_on_step: bool = False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+
+        zeros = torch.zeros(n_cells, dtype=torch.float32)
+        self.add_state("sum_uncertainty", default=zeros.clone(), dist_reduce_fx="sum")
+        self.add_state("n",               default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, pred_var: Tensor) -> None:
+        # pred_var: [B, n_cells]
+        self.sum_uncertainty += torch.sum(pred_var, dim=0)
+        self.n               += pred_var.shape[0]
+
+    def compute(self) -> Tensor:
+        assert self.n > 0.0, "No samples to compute metric!"
+        return self.sum_uncertainty / self.n
+    
+class MeanGeneUncertainty(Metric):
+    """Mean predicted uncertainty per gene (correlate across cells), then mean over genes."""
+
+    is_differentiable = False
+    higher_is_better  = False
+    full_state_update = False
+
+    def __init__(self, n_genes: int, n_cells: int, dist_sync_on_step: bool = False):
+        super().__init__(dist_sync_on_step=dist_sync_on_step)
+
+        self.n_cells = float(n_cells)
+        self.n_genes = n_genes
+
+        zeros = torch.zeros(n_genes, dtype=torch.float32)
+        self.add_state("sum_uncertainty", default=zeros.clone(), dist_reduce_fx="sum")
+        self.add_state("n",               default=torch.tensor(0.0), dist_reduce_fx="sum")
+
+    def update(self, pred_var: Tensor) -> None:
+        # pred_var: [B, n_cells]
+        B = pred_var.shape[0]
+
+        start = int(self.n.item())
+        end   = min(start + B, self.n_genes)
+
+        self.sum_uncertainty[start:end] += pred_var.sum(dim=1)
+        self.n += B
+
+    def compute(self) -> Tensor:
+        n = int(self.n.item())
+        assert n > 0, "No samples to compute metric!"
+        return self.sum_uncertainty[:n] / self.n_cells
