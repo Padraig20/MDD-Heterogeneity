@@ -9,7 +9,6 @@ import random
 from torch.optim.lr_scheduler import SequentialLR
 
 from metrics import MeanCellPearson, MeanGenePearson
-from metrics import MeanCellUncertainty, MeanGeneUncertainty
 from wandb_logger import WandBLogger
 
 # taken from scPrediXcan tutorial
@@ -313,10 +312,8 @@ def evaluate_ensemble_model(
         f"{mode}/pearson": 0.0,
         f"{mode}/total_uncertainty_cells": 0.0,
         f"{mode}/total_uncertainty_genes": 0.0,
-        f"{mode}/aleatoric_cells": 0.0, # should theoretically stay consistent
-        f"{mode}/aleatoric_genes": 0.0, # should theoretically stay consistent
-        f"{mode}/epistemic_cells": 0.0, # should theoretically go down with training
-        f"{mode}/epistemic_genes": 0.0  # should theoretically go down with training
+        f"{mode}/aleatoric": 0.0, # should theoretically stay consistent
+        f"{mode}/epistemic": 0.0  # should theoretically go down with training
     }
     
     for key in loss_dict.keys():
@@ -326,12 +323,8 @@ def evaluate_ensemble_model(
     metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
     metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
 
-    aleatoric_cells = MeanCellUncertainty(n_cells=model.output_dim).to(device)
-    aleatoric_genes = MeanGeneUncertainty(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
-    epistemic_cells = MeanCellUncertainty(n_cells=model.output_dim).to(device)
-    epistemic_genes = MeanGeneUncertainty(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
-    total_uncertainty_cells = MeanCellUncertainty(n_cells=model.output_dim).to(device)
-    total_uncertainty_genes = MeanGeneUncertainty(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
+    epistemic_uncertainties = []
+    aleatoric_uncertainties = []
 
     with torch.no_grad():
         for batch in tqdm(eval_loader, desc="Evaluating"):
@@ -340,14 +333,8 @@ def evaluate_ensemble_model(
 
             prediction, aleatoric_unc, epistemic_unc = model(inputs)
 
-            aleatoric_cells.update(aleatoric_unc)
-            aleatoric_genes.update(aleatoric_unc)
-            epistemic_cells.update(epistemic_unc)
-            epistemic_genes.update(epistemic_unc)
-            total_uncertainty_cells.update(aleatoric_unc + epistemic_unc)
-            total_uncertainty_genes.update(aleatoric_unc + epistemic_unc)
-            #aleatoric_uncertainties.append(aleatoric_unc.mean(dim=0)) # avg aleatoric uncertainty across cells
-            #epistemic_uncertainties.append(epistemic_unc.mean(dim=0)) # avg epistemic uncertainty across cells
+            aleatoric_uncertainties.append(aleatoric_unc.mean(dim=0)) # avg aleatoric uncertainty across cells
+            epistemic_uncertainties.append(epistemic_unc.mean(dim=0)) # avg epistemic uncertainty across cells
 
             outputs = torch.stack([prediction, aleatoric_unc], dim=2) # shape (batch_size, output_dim, 2)
             composite_loss = torch.tensor(0.0, device=device)
@@ -364,12 +351,8 @@ def evaluate_ensemble_model(
     log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().mean().item()
     log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().mean().item()
     log_dict[f"{mode}/pearson"] = (log_dict[f"{mode}/pearson_cells"] + log_dict[f"{mode}/pearson_genes"]) / 2.0
-    log_dict[f"{mode}/aleatoric_cells"] = aleatoric_cells.compute().mean().item()
-    log_dict[f"{mode}/aleatoric_genes"] = aleatoric_genes.compute().mean().item()
-    log_dict[f"{mode}/epistemic_cells"] = epistemic_cells.compute().mean().item()
-    log_dict[f"{mode}/epistemic_genes"] = epistemic_genes.compute().mean().item()
-    log_dict[f"{mode}/total_uncertainty_cells"] = total_uncertainty_cells.compute().mean().item()
-    log_dict[f"{mode}/total_uncertainty_genes"] = total_uncertainty_genes.compute().mean().item()
+    log_dict[f"{mode}/aleatoric"] = torch.mean(torch.stack(aleatoric_uncertainties)).item()
+    log_dict[f"{mode}/epistemic"] = torch.mean(torch.stack(epistemic_uncertainties)).item()
 
     for key in loss_dict.keys():
         log_dict[f"{mode}/{key}_loss"] /= len(eval_loader)
