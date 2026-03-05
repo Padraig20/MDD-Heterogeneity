@@ -315,7 +315,13 @@ def main() -> None:
     wb_logger.finish()
 
     if args.output is not None:
-        torch.save(model.state_dict(), args.output)
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "n_layers": args.n_layers,
+            "layer_norm": args.norm_layer,
+        }, args.output)
         logging.info(f"Model saved to {args.output}.")
 
     logging.info("Done.")
