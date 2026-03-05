@@ -313,7 +313,7 @@ def main() -> None:
         )
 
     if args.output is not None:
-        torch.save(model.state_dict(), args.output)
+        torch.save(model, args.output) # save whole model, including architecture (for simplicity)
         logging.info(f"Model saved to {args.output}.")
     
     wb_logger.finish()
