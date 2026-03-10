@@ -96,7 +96,7 @@ def main() -> None:
     else:
         wb_logger = WandBLogger(enabled=False)
 
-    all_chromosomes = [f"chr{c}" for c in range(1, 23)] + ["chrX", "chrY"]
+    all_chromosomes = [f"chr{c}" for c in range(1, 23)] # we only use autosomes
 
     bims    = {}
     idx2ind = {}
@@ -137,6 +137,7 @@ def main() -> None:
         logging.info(f"Processing cell type: {ct_name}")
 
         dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=os.path.join(args.targets,ct_file), bim_dir=args.observations)
+        dataset = dataset.split_by_chromosome(all_chromosomes) # filter to only autosomes
         model   = LR(max_iter=args.max_iter, n_alphas=args.alphas, seed=args.seed)
 
         model.fit_dataset(dataset, verbose=args.verbose > 0)
