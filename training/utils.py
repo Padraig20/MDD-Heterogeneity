@@ -1,15 +1,15 @@
 import logging
 
 from tqdm import tqdm
-from dataset import MddDataset
+from training.dataset import MddDataset
 from copy import deepcopy
 import torch
 import random
 
 from torch.optim.lr_scheduler import SequentialLR
 
-from metrics import MeanCellPearson, MeanGenePearson
-from wandb_logger import WandBLogger
+from training.metrics import MeanCellPearson, MeanGenePearson
+from training.wandb_logger import WandBLogger
 
 # taken from scPrediXcan tutorial
 # https://github.com/hakyimlab/scPrediXcan/blob/master/Scripts/ctPred/Tutorial.ipynb
