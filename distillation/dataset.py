@@ -25,7 +25,7 @@ and are nicely put into a dict with keys according to their chromosome (e.g. "ch
 
 class GenotypeDataset(Dataset):
     
-    def __init__(self, bims: dict[str], idx2ind: dict[np.ndarray], y: Path | pd.DataFrame, bim_dir: str = "", window_size=1_000_000):
+    def __init__(self, bims: dict[str], idx2ind: dict[np.ndarray], y: Path | pd.DataFrame, bim_dir: str = "", window_size=1_000_000, select_genes: Path | None = None):
         """
         Args:
             bims (dict[str]):             Dictionary of BIM files indexed by chromosome.
@@ -33,11 +33,13 @@ class GenotypeDataset(Dataset):
             y (Path | pd.DataFrame): Path to target labels file (csv) or a DataFrame.
             bim_dir (Path):               Directory containing the BIM files.
             window_size (int):            Size of the genomic window to consider around each TSS.
+            select_genes (Path | None):   Path to a file containing a list of genes to select. If None, use all genes.
         """
         self.bims        = bims
         self.bim_dir     = bim_dir
         self.idx2ind     = idx2ind
         self.window_size = window_size
+        self.select_genes = select_genes
         if isinstance(y, Path) or isinstance(y, str):
             self.y    = pd.read_csv(y)
         else:
@@ -52,12 +54,17 @@ class GenotypeDataset(Dataset):
         # get all different genes
         self.genes = self.y["gene"].unique()
     
+        if self.select_genes is not None:
+            selected_genes = set(pd.read_csv(self.select_genes, sep="\t")["ENSID"])
+            self.genes     = self.genes[np.isin(self.genes, selected_genes)]
+            self.y         = self.y[self.y["gene"].isin(selected_genes)].copy()
+
     def split_by_chromosome(self, chroms: list[str]) -> Dataset:
         # filter y and chroms to only include rows with chrom in chroms
         y_filtered       = self.y[self.y["chrom"].isin(chroms)].copy()
         bims_filtered    = {chrom: bim for chrom, bim in self.bims.items() if chrom in chroms}
         idx2ind_filtered = {chrom: idx2ind for chrom, idx2ind in self.idx2ind.items() if chrom in chroms}
-        return GenotypeDataset(bims_filtered, idx2ind_filtered, y_filtered, bim_dir=self.bim_dir, window_size=self.window_size)
+        return GenotypeDataset(bims_filtered, idx2ind_filtered, y_filtered, bim_dir=self.bim_dir, window_size=self.window_size, select_genes=self.select_genes)
     
     def __len__(self) -> int:
         return len(self.y)
@@ -149,7 +156,7 @@ if __name__ == "__main__":
     
     y_path  = Path("student-target/0.csv")
 
-    dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=y_path)
+    dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=y_path, select_genes=Path("data/mdd_genes.tsv"))
     print(f"Dataset size: {len(dataset)}")
 
     print("Splitting dataset by chromosomes 1...")

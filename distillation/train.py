@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
         help="Name of the WandB run. Leave empty to not use WandB logging."
     )
     parser.add_argument(
+        "-sg", "--select_genes",
+        type=Path,
+        default=None,
+        help="Path to a file containing a list of genes to select. Will only train on these genes."
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -136,7 +142,7 @@ def main() -> None:
         ct_name = ct_file[:-4] # remove .csv extension
         logging.info(f"Processing cell type: {ct_name}")
 
-        dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=os.path.join(args.targets,ct_file), bim_dir=args.observations)
+        dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=os.path.join(args.targets,ct_file), bim_dir=args.observations, select_genes=args.select_genes)
         dataset = dataset.split_by_chromosome(all_chromosomes) # filter to only autosomes
         model   = LR(max_iter=args.max_iter, n_alphas=args.alphas, seed=args.seed)
 
