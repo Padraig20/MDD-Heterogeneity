@@ -56,7 +56,7 @@ class GenotypeDataset(Dataset):
     
         if self.select_genes is not None:
             selected_genes = set(pd.read_csv(self.select_genes, sep="\t")["ENSID"])
-            self.genes     = self.genes[np.isin(self.genes, selected_genes)]
+            self.genes     = np.array([g for g in self.genes if g in selected_genes])
             self.y         = self.y[self.y["gene"].isin(selected_genes)].copy()
 
     def split_by_chromosome(self, chroms: list[str]) -> Dataset:

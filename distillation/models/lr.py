@@ -117,13 +117,10 @@ class LR:
     def fit_dataset(
         self,
         dataset: GenotypeDataset,
-        genes: Optional[Sequence[str]] = None,
         verbose: bool = True,
     ) -> Dict[str, LRStruct]:
-        if genes is None:
-            genes = dataset.genes
 
-        for i, gene in enumerate(genes, start=1):
+        for i, gene in enumerate(dataset.genes, start=1):
             try:
                 X, y, snp_ids = dataset.get_gene_matrix(gene)
 
@@ -133,14 +130,14 @@ class LR:
                     model = self.models_[gene]
                     nnz = int(np.sum(model.coef_ != 0))
                     print(
-                        f"[{i}/{len(genes)}] fit {gene}: "
+                        f"[{i}/{len(dataset.genes)}] fit {gene}: "
                         f"samples={X.shape[0]}, snps={X.shape[1]}, "
                         f"nonzero={nnz}, r2={model.train_r2_:.4f}"
                     )
 
             except Exception as e:
                 if verbose:
-                    print(f"[{i}/{len(genes)}] skip {gene}: {e}")
+                    print(f"[{i}/{len(dataset.genes)}] skip {gene}: {e}")
 
         return self.models_
 
