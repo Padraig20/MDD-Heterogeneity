@@ -5,6 +5,7 @@ from typing import Dict, Optional
 from sklearn.linear_model import ElasticNetCV
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import RidgeCV
 
 from distillation.dataset import GenotypeDataset
 
@@ -32,6 +33,7 @@ class LRStruct:
 class LR:
     def __init__(
         self,
+        model_name: str = "elasticnet",
         l1_ratio: float = 0.1,  # scPrediXcan has 0.5
         cv: int         = 3,
         alphas: int     = 100,
@@ -46,15 +48,26 @@ class LR:
         self.models_: Dict[str, LRStruct] = {}
 
     def _make_model(self) -> ElasticNetCV:
-        return ElasticNetCV(
-            l1_ratio=self.l1_ratio,
-            cv=self.cv,
-            alphas=self.alphas,
-            max_iter=self.max_iter,
-            fit_intercept=True,
-            random_state=self.seed,
-            n_jobs=-1,
-        )
+        if self.model_name == "ridge":
+            return RidgeCV(
+                cv=self.cv,
+                alphas=np.logspace(-6, 6, self.alphas),
+                fit_intercept=True,
+                scoring="r2",
+                gcv_mode="auto",
+            )
+        elif self.model_name == "elasticnet":
+            return ElasticNetCV(
+                l1_ratio=self.l1_ratio,
+                cv=self.cv,
+                alphas=self.alphas,
+                max_iter=self.max_iter,
+                fit_intercept=True,
+                random_state=self.seed,
+                n_jobs=-1,
+            )
+        else:
+            raise ValueError(f"Unknown model name: {self.model_name}")
 
     def fit_gene_matrix(
         self,
