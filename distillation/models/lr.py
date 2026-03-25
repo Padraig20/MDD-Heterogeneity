@@ -40,11 +40,12 @@ class LR:
         max_iter: int   = 10000,
         seed: int       = 42,
     ):
-        self.l1_ratio = l1_ratio
-        self.cv       = cv
-        self.alphas   = alphas
-        self.max_iter = max_iter
-        self.seed     = seed
+        self.l1_ratio   = l1_ratio
+        self.cv         = cv
+        self.alphas     = alphas
+        self.max_iter   = max_iter
+        self.seed       = seed
+        self.model_name = model_name
         self.models_: Dict[str, LRStruct] = {}
 
     def _make_model(self) -> ElasticNetCV:

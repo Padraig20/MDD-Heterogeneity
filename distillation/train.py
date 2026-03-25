@@ -144,7 +144,7 @@ def main() -> None:
 
         dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=os.path.join(args.targets,ct_file), bim_dir=args.observations, select_genes=args.select_genes)
         dataset = dataset.split_by_chromosome(all_chromosomes) # filter to only autosomes
-        model   = LR(model_name=args.model_name, max_iter=args.max_iter, n_alphas=args.alphas, seed=args.seed)
+        model   = LR(model_name=args.model_name, max_iter=args.max_iter, alphas=args.alphas, seed=args.seed)
 
         model.fit_dataset(dataset, verbose=args.verbose > 0)
 
