@@ -55,9 +55,18 @@ class GenotypeDataset(Dataset):
         self.genes = self.y["gene"].unique()
     
         if self.select_genes is not None:
-            selected_genes = set(pd.read_csv(self.select_genes, sep="\t")["ENSID"])
-            self.genes     = np.array([g for g in self.genes if g in selected_genes])
-            self.y         = self.y[self.y["gene"].isin(selected_genes)].copy()
+            if self.select_genes == Path("random"):
+                # select 227 genes at random (same number as in MDD gene list) for quick testing
+                np.random.seed(42)
+                if len(self.genes) < 227:
+                    selected_genes = self.genes
+                else:
+                    selected_genes = np.random.choice(self.genes, size=227, replace=False)
+            else:
+                selected_genes = set(pd.read_csv(self.select_genes, sep="\t")["ENSID"])
+            self.genes = np.array([g for g in self.genes if g in selected_genes])
+            self.y     = self.y[self.y["gene"].isin(selected_genes)].copy()
+
 
     def split_by_chromosome(self, chroms: list[str]) -> Dataset:
         # filter y and chroms to only include rows with chrom in chroms
