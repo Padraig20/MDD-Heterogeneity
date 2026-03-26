@@ -8,6 +8,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import RidgeCV
 
 from distillation.dataset import GenotypeDataset
+from distillation.utils import ld_prune
 
 
 @dataclass
@@ -62,7 +63,7 @@ class LR:
             return ElasticNetCV(
                 l1_ratio=self.l1_ratio,
                 cv=self.cv,
-                alphas=self.alphas,
+                alphas=np.logspace(-6, 6, self.alphas),
                 max_iter=self.max_iter,
                 fit_intercept=True,
                 random_state=self.seed,
@@ -80,6 +81,10 @@ class LR:
     ) -> LRStruct:
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
+
+        if self.model_name == "ridge":
+            # perform LD pruning
+            X, snp_ids = ld_prune(X, snp_ids)
 
         x_scaler = StandardScaler()
         X_scaled = x_scaler.fit_transform(X)
