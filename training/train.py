@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import logging
+import pandas as pd
 from pathlib import Path
 
 import torch
@@ -147,6 +148,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log-transform target labels."
     )
+    parser.add_argument(
+        "-sg", "--select_genes",
+        type=Path,
+        default=None,
+        help="Path to a file containing a list of genes to select. Will perform separate evaluation on the selected genes if provided."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -171,6 +178,12 @@ def main() -> None:
         y=args.targets,
         normalize=args.norm_targets,
     )
+
+    if args.select_genes is not None:
+        selected_genes = set(pd.read_csv(args.select_genes, sep="\t")["ENSID"])
+        logging.debug(f"Selecting {len(selected_genes)} genes for separate evaluation: {selected_genes}")
+        selected_dataset = dataset.select_genes(selected_genes)
+        logging.debug(f"Selected dataset size: {len(selected_dataset)}")
 
     train_dataset, eval_dataset, test_dataset = get_train_test_dataset(dataset, seed=args.seed)
 
@@ -285,6 +298,18 @@ def main() -> None:
             wb_logger=wb_logger,
             mode="test"
         )
+
+        if args.select_genes is not None:
+            logging.info(f"Starting separate evaluation on selected genes...")
+            evaluate_ensemble_model(
+                model=model,
+                eval_loader=torch.utils.data.DataLoader(selected_dataset, batch_size=args.batch_size, shuffle=False),
+                loss_dict=loss_dict,
+                loss_lambda_dict=loss_lambda_dict,
+                device=device,
+                wb_logger=wb_logger,
+                mode="test_selected_genes"
+            )
     else:
         train_single_model(
             model=model,
@@ -311,6 +336,18 @@ def main() -> None:
             wb_logger=wb_logger,
             mode="test"
         )
+
+        if args.select_genes is not None:
+            logging.info(f"Starting separate evaluation on selected genes...")
+            evaluate_single_model(
+                model=model,
+                eval_loader=torch.utils.data.DataLoader(selected_dataset, batch_size=args.batch_size, shuffle=False),
+                loss_dict=loss_dict,
+                loss_lambda_dict=loss_lambda_dict,
+                device=device,
+                wb_logger=wb_logger,
+                mode="test_selected_genes"
+            )
 
     wb_logger.finish()
 

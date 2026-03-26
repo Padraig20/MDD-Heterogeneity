@@ -44,6 +44,14 @@ class MddDataset(Dataset):
         X_ensids_chrom = self.X_ensids[mask]
         X_chroms_chrom = self.X_chroms[mask]
         return MddDataset(X_feats_chrom, X_ensids_chrom, X_chroms_chrom, self.y, normalize=self.normalize)
+    
+    def select_genes(self, gene_set: set[str]) -> Dataset:
+        """Return a new MddDataset containing only data from the specified set of genes."""
+        mask = np.isin(self.X_ensids, list(gene_set))
+        X_feats_sel  = self.X_feats[mask]
+        X_ensids_sel = self.X_ensids[mask]
+        X_chroms_sel = self.X_chroms[mask]
+        return MddDataset(X_feats_sel, X_ensids_sel, X_chroms_sel, self.y, normalize=self.normalize)
 
     def apply_feature_log_transform(self, threshold=1.0) -> None:
         """Apply log-transform to input features."""
