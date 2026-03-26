@@ -12,14 +12,15 @@ from distillation.dataset import GenotypeDataset
 
 @dataclass
 class LRStruct:
-    gene:    str
-    snp_ids: np.ndarray
+    model_name: str
+    gene:       str
+    snp_ids:    np.ndarray
 
     # model learned in standardized X / standardized y space
     coef_:      np.ndarray
     intercept_: float
     alpha_:     float
-    l1_ratio_:  float
+    l1_ratio_: Optional[float]
 
     # scalers needed for inference + inverse transform
     x_mean_:  np.ndarray
@@ -48,7 +49,7 @@ class LR:
         self.model_name = model_name
         self.models_: Dict[str, LRStruct] = {}
 
-    def _make_model(self) -> ElasticNetCV:
+    def _make_model(self):
         if self.model_name == "ridge":
             return RidgeCV(
                 cv=self.cv,
@@ -95,12 +96,13 @@ class LR:
         train_r2     = r2_score(y, y_hat)
 
         model = LRStruct(
+            model_name=self.model_name,
             gene=gene,
             snp_ids=np.asarray(snp_ids),
             coef_=enet.coef_.copy(),
             intercept_=enet.intercept_,
             alpha_=enet.alpha_,
-            l1_ratio_=enet.l1_ratio_,
+            l1_ratio_=getattr(enet, "l1_ratio_", None),
             x_mean_=x_scaler.mean_.copy(),
             x_scale_=x_scaler.scale_.copy(),
             y_mean_=y_scaler.mean_[0],

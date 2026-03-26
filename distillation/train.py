@@ -53,8 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-a", "--alphas",
         type=int,
-        default=100,
-        help="Number of alpha values to try for ElasticNetCV."
+        default=5,
+        help="Number of alpha values to try for CV."
     )
     parser.add_argument(
         "-v", "--verbose",
