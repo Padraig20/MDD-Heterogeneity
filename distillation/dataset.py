@@ -137,8 +137,8 @@ class GenotypeDataset(Dataset):
         # which individuals do we keep?
         keep_mask = np.array([ind in ind_to_idx for ind in row_individuals], dtype=bool)
         if not np.all(keep_mask):
-            rows = rows.loc[keep_mask].copy()
-            row_individuals = rows["individual"].astype(str).to_numpy()
+            gene_data = gene_data.loc[keep_mask].copy()
+            row_individuals = gene_data["individual"].astype(str).to_numpy()
         individual_idx = np.array([ind_to_idx[ind] for ind in row_individuals], dtype=int)
 
         with open_bed(os.path.join(self.bim_dir, f"{chrom}.bed")) as bed:
