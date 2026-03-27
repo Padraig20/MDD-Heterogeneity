@@ -52,7 +52,7 @@ class MeanCellPearson(Metric):
 
         assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
 
-        return cov / (denom + 1e-12)  # [n]; account for possible 0 division
+        return cov / denom  # [n]
 
 class MeanGenePearson(Metric):
     """Pearson per gene (across cells), then mean over genes."""
@@ -113,7 +113,7 @@ class MeanGenePearson(Metric):
 
         assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
 
-        return cov / (denom + 1e-12) # [n]; account for possible 0 division
+        return cov / denom # [n]
 
 class MeanCellUncertainty(Metric):
     """Mean predicted uncertainty per cell (correlate across genes), then mean over cells."""

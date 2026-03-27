@@ -117,8 +117,8 @@ def train_single_model(
 
         log_dict["train/epoch"] = epoch
         log_dict["train/loss"] /= len(train_loader)
-        log_dict["train/pearson_cells"] = metric_cells.compute().mean().item()
-        log_dict["train/pearson_genes"] = metric_genes.compute().mean().item()
+        log_dict["train/pearson_cells"] = metric_cells.compute().nanmean().item()
+        log_dict["train/pearson_genes"] = metric_genes.compute().nanmean().item()
         log_dict["train/pearson"] = (log_dict["train/pearson_cells"] + log_dict["train/pearson_genes"]) / 2.0
 
         for key in loss_dict.keys():
@@ -188,14 +188,14 @@ def evaluate_single_model(
             metric_genes.update(outputs, targets)
 
     log_dict[f"{mode}/loss"] /= len(eval_loader)
-    log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().mean().item()
-    log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().mean().item()
+    log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().nanmean().item()
+    log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().nanmean().item()
     log_dict[f"{mode}/pearson"] = (log_dict[f"{mode}/pearson_cells"] + log_dict[f"{mode}/pearson_genes"]) / 2.0
 
     for key in loss_dict.keys():
         log_dict[f"{mode}/{key}_loss"] /= len(eval_loader)
     
-    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
+    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().nanmean():.4f}, PC Genes: {metric_genes.compute().nanmean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
     
     wb_logger.log(log_dict)
 
@@ -264,8 +264,8 @@ def train_ensemble_model(
 
         log_dict["train/epoch"] = epoch
         log_dict["train/loss"] /= len(train_loader)
-        log_dict["train/pearson_cells"] = metric_cells.compute().mean().item()
-        log_dict["train/pearson_genes"] = metric_genes.compute().mean().item()
+        log_dict["train/pearson_cells"] = metric_cells.compute().nanmean().item()
+        log_dict["train/pearson_genes"] = metric_genes.compute().nanmean().item()
         log_dict["train/pearson"] = (log_dict["train/pearson_cells"] + log_dict["train/pearson_genes"]) / 2.0
 
         for key in loss_dict.keys():
@@ -348,8 +348,8 @@ def evaluate_ensemble_model(
             metric_genes.update(prediction, targets)
 
     log_dict[f"{mode}/loss"] /= len(eval_loader)
-    log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().mean().item()
-    log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().mean().item()
+    log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().nanmean().item()
+    log_dict[f"{mode}/pearson_genes"] = metric_genes.compute().nanmean().item()
     log_dict[f"{mode}/pearson"] = (log_dict[f"{mode}/pearson_cells"] + log_dict[f"{mode}/pearson_genes"]) / 2.0
     log_dict[f"{mode}/aleatoric"] = torch.mean(torch.stack(aleatoric_uncertainties)).item()
     log_dict[f"{mode}/epistemic"] = torch.mean(torch.stack(epistemic_uncertainties)).item()
@@ -357,7 +357,7 @@ def evaluate_ensemble_model(
     for key in loss_dict.keys():
         log_dict[f"{mode}/{key}_loss"] /= len(eval_loader)
     
-    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().mean():.4f}, PC Genes: {metric_genes.compute().mean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
+    logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().nanmean():.4f}, PC Genes: {metric_genes.compute().nanmean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
     
     wb_logger.log(log_dict)
 
