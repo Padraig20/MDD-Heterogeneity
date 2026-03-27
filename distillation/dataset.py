@@ -9,6 +9,8 @@ from pathlib import Path
 
 from bed_reader import open_bed
 
+from scipy.stats import rankdata
+
 """
 Quick reminder: Make sure to convert the VCF files to BED/BIM/FAM via plink2.
 
@@ -25,7 +27,7 @@ and are nicely put into a dict with keys according to their chromosome (e.g. "ch
 
 class GenotypeDataset(Dataset):
     
-    def __init__(self, bims: dict[str], idx2ind: dict[np.ndarray], y: Path | pd.DataFrame, bim_dir: str = "", window_size=1_000_000, select_genes: Path | None = None):
+    def __init__(self, bims: dict[str], idx2ind: dict[np.ndarray], y: Path | pd.DataFrame, bim_dir: str = "", window_size=1_000_000, select_genes: Path | None = None, normalize: str = "log"):
         """
         Args:
             bims (dict[str]):             Dictionary of BIM files indexed by chromosome.
@@ -34,12 +36,14 @@ class GenotypeDataset(Dataset):
             bim_dir (Path):               Directory containing the BIM files.
             window_size (int):            Size of the genomic window to consider around each TSS.
             select_genes (Path | None):   Path to a file containing a list of genes to select. If None, use all genes.
+            normalize (str):              Normalization method for expression values. Options are "log" or "percentiles".
         """
-        self.bims        = bims
-        self.bim_dir     = bim_dir
-        self.idx2ind     = idx2ind
-        self.window_size = window_size
+        self.bims         = bims
+        self.bim_dir      = bim_dir
+        self.idx2ind      = idx2ind
+        self.window_size  = window_size
         self.select_genes = select_genes
+        self.normalize    = normalize
         if isinstance(y, Path) or isinstance(y, str):
             self.y    = pd.read_csv(y)
         else:
@@ -50,6 +54,12 @@ class GenotypeDataset(Dataset):
         # with columns: gene, chrom, tss, individual, expression
         if "individual" not in self.y.columns:
             self.y = self.y.melt(id_vars=["gene", "chrom", "tss"], var_name="individual", value_name="expression")
+            if self.normalize == "percentiles":
+                self.y = self.to_percentiles(self.y)
+            elif self.normalize == "log":
+                self.y["expression"] = np.log1p(self.y["expression"])
+            else:
+                raise ValueError(f"Invalid normalization method: {self.normalize}")
         
         # get all different genes
         self.genes = self.y["gene"].unique()
@@ -67,6 +77,16 @@ class GenotypeDataset(Dataset):
             self.genes = np.array([g for g in self.genes if g in selected_genes])
             self.y     = self.y[self.y["gene"].isin(selected_genes)].copy()
 
+    @staticmethod
+    def to_percentiles(y_df: pd.DataFrame) -> pd.DataFrame:
+        """Convert expression values to percentiles separately for each gene, ranking across individuals."""
+        y_df = y_df.copy()
+        y_df["expression"] = (
+            y_df.groupby("gene")["expression"]
+            .transform(lambda col: rankdata(col.to_numpy(), method="average") / len(col))
+            .astype(float)
+        )
+        return y_df
 
     def split_by_chromosome(self, chroms: list[str]) -> Dataset:
         # filter y and chroms to only include rows with chrom in chroms
@@ -165,7 +185,7 @@ if __name__ == "__main__":
     
     y_path  = Path("student-target/0.csv")
 
-    dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=y_path, select_genes=Path("data/mdd_genes.tsv"))
+    dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=y_path, normalize="percentiles")
     print(f"Dataset size: {len(dataset)}")
 
     print("Splitting dataset by chromosomes 1...")

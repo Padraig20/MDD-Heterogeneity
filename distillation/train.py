@@ -75,6 +75,13 @@ def parse_args() -> argparse.Namespace:
         help="Path to a file containing a list of genes to select. Will only train on these genes."
     )
     parser.add_argument(
+        "-nt", "--norm-targets",
+        type=str,
+        default="log",
+        choices=["log", "percentiles"],
+        help="Normalization method for target labels."
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -142,7 +149,7 @@ def main() -> None:
         ct_name = ct_file[:-4] # remove .csv extension
         logging.info(f"Processing cell type: {ct_name}")
 
-        dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=os.path.join(args.targets,ct_file), bim_dir=args.observations, select_genes=args.select_genes)
+        dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=os.path.join(args.targets,ct_file), bim_dir=args.observations, select_genes=args.select_genes, normalize=args.norm_targets)
         dataset = dataset.split_by_chromosome(all_chromosomes) # filter to only autosomes
         model   = LR(model_name=args.model_name, max_iter=args.max_iter, alphas=args.alphas, seed=args.seed)
 
