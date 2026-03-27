@@ -52,7 +52,10 @@ class MeanCellPearson(Metric):
 
         assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
 
-        return cov / denom  # [n]
+        ret = cov / (denom + 1e-12) # [n]; account for possible 0 division
+        ret = torch.where((ret < -1.0) | (ret > 1.0), torch.nan, ret)
+
+        return ret
 
 class MeanGenePearson(Metric):
     """Pearson per gene (across cells), then mean over genes."""
@@ -113,7 +116,10 @@ class MeanGenePearson(Metric):
 
         assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
 
-        return cov / denom # [n]
+        ret = cov / (denom + 1e-12) # [n]; account for possible 0 division
+        ret = torch.where((ret < -1.0) | (ret > 1.0), torch.nan, ret)
+
+        return ret
 
 class MeanCellUncertainty(Metric):
     """Mean predicted uncertainty per cell (correlate across genes), then mean over cells."""
