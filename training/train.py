@@ -144,9 +144,11 @@ def parse_args() -> argparse.Namespace:
         help="Enable layer normalization on inputs."
     )
     parser.add_argument(
-        "--norm-targets",
-        action="store_true",
-        help="Log-transform target labels."
+        "-nt", "--norm-targets",
+        type=str,
+        default="log",
+        choices=["log", "percentiles"],
+        help="Normalization method for target labels."
     )
     parser.add_argument(
         "-sg", "--select_genes",
@@ -176,7 +178,7 @@ def main() -> None:
         X_ensids=args.observations.with_suffix(".ensids.npy"),
         X_chroms=args.observations.with_suffix(".chroms.npy"),
         y=args.targets,
-        normalize=args.norm_targets,
+        normalize=args.norm_targets
     )
 
     if args.select_genes is not None:

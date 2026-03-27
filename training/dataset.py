@@ -6,10 +6,11 @@ import pandas as pd
 from pathlib import Path
 
 from scipy.stats import skew
+from scipy.stats import rankdata
 
 class MddDataset(Dataset):
     
-    def __init__(self, X_feats: Path|np.ndarray, X_ensids: Path|np.ndarray, X_chroms: Path|np.ndarray, y: Path|pd.DataFrame, normalize: bool = False):
+    def __init__(self, X_feats: Path|np.ndarray, X_ensids: Path|np.ndarray, X_chroms: Path|np.ndarray, y: Path|pd.DataFrame, normalize: str = "log"):
         """
         Args:
             X_feats (Path|np.ndarray):  Path to input features file (npy) or numpy array:
@@ -20,7 +21,7 @@ class MddDataset(Dataset):
                                         Contains the chromosomes corresponding to the rows in X_feats.
             y (Path|pd.DataFrame):      Path to target labels file (csv) or pandas DataFrame:
                                         2d array; (rows: cell-types, columns: ensid)
-            normalize (bool):           Whether to log-transform the target labels.
+            normalize (str):            Whether to transform the target labels to log-scale or percentiles.
         """
         if isinstance(X_feats, Path) and isinstance(X_ensids, Path) and \
            isinstance(X_chroms, Path) and isinstance(y, Path):
@@ -28,13 +29,15 @@ class MddDataset(Dataset):
             self.X_ensids = np.load(X_ensids, allow_pickle=True)
             self.X_chroms = np.load(X_chroms, allow_pickle=True).astype(str)
             self.y        = pd.read_csv(y, index_col=0)
+            if normalize == "percentiles":
+                self.y = self.to_percentiles(self.y)
         else:
             self.X_feats  = X_feats
             self.X_ensids = X_ensids
             self.X_chroms = X_chroms
             self.y        = y
 
-        self.normalize = normalize
+        self.normalize     = normalize
         self.norm_features = None
     
     def split_by_chromosome(self, chrom: list[str]) -> Dataset:
@@ -61,6 +64,16 @@ class MddDataset(Dataset):
             # if all values are non-negative and skewed, apply log-transform
             if np.all(col >= 0) and skew(col) > threshold:
                 self.norm_features[i] = 1.0
+
+    @staticmethod
+    def to_percentiles(y_df: pd.DataFrame) -> pd.DataFrame:
+        """Convert each gene column to percentiles across rows, same as scPrediXcan."""
+        y_pct = pd.DataFrame(index=y_df.index, columns=y_df.columns, dtype=float)
+        for gene in y_df.columns:
+            values      = y_df[gene].to_numpy()
+            ranks       = rankdata(values, method="average")
+            y_pct[gene] = ranks / len(ranks)
+        return y_pct
     
     def __len__(self) -> int:
         return self.X_ensids.shape[0]
@@ -74,13 +87,13 @@ class MddDataset(Dataset):
         if self.norm_features is not None:
             x = x.clone()
             x[self.norm_features == 1.0] = torch.log(1 + x[self.norm_features == 1.0])
-        if self.normalize:
+        if self.normalize == "log":
             y = torch.log(1 + y)
         return x, y
 
 if __name__ == "__main__":
     # example usage
-    dataset = MddDataset(X_feats=Path("X_sub.features.npy"), X_ensids=Path("X_sub.ensids.npy"), X_chroms=Path("X_sub.chroms.npy"), y=Path("y_sub.csv"))
+    dataset = MddDataset(X_feats=Path("X_sub.features.npy"), X_ensids=Path("X_sub.ensids.npy"), X_chroms=Path("X_sub.chroms.npy"), y=Path("y_sub.csv"), normalize="percentiles")
     print(f"Dataset size: {len(dataset)}")
     for i in range(len(dataset)):
         input_data, label = dataset[i]
