@@ -166,7 +166,7 @@ class GenotypeDataset(Dataset):
 
         y = gene_data.sort_values("individual")["expression"].to_numpy()
 
-        return X, y, snp_ids
+        return X, y, snp_ids, int(chrom[3:])
 
 if __name__ == "__main__":
     # example usage
@@ -199,7 +199,7 @@ if __name__ == "__main__":
 
     for i in range(min(5, len(new_dataset.genes))):
         gene = new_dataset.genes[i]
-        X, y, snp_ids = new_dataset.get_gene_matrix(new_dataset.genes[i])
-        print(f"Design matrix shape for gene {gene}: {X.shape}, y shape: {y.shape}, snp_ids shape: {snp_ids.shape}")
+        X, y, snp_ids, chr = new_dataset.get_gene_matrix(new_dataset.genes[i])
+        print(f"Design matrix shape for gene {gene}: {X.shape}, y shape: {y.shape}, snp_ids shape: {snp_ids.shape}, chromosome: {chr}")
     
     print(new_dataset.y.head())

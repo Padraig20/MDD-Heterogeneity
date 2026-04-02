@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to target directory; should contain a CSV file for each cell-type."
     )
     parser.add_argument(
+        "-o", "--output-dir",
+        type=Path,
+        default=Path("output"),
+        help="Directory to save the trained models. Creates one JSON file per cell type with non-zero coefficients for each gene."
+    )
+    parser.add_argument(
         "-m", "--model-name",
         type=str,
         default="elasticnet",
@@ -145,6 +151,8 @@ def main() -> None:
     cell_type_files = os.listdir(args.targets)
     logging.info(f"Found {len(cell_type_files)} cell types!")
 
+    os.makedirs(args.output_dir, exist_ok=True)
+
     for ct_file in tqdm(cell_type_files, desc="Processing cell types"):
         ct_name = ct_file[:-4] # remove .csv extension
         logging.info(f"Processing cell type: {ct_name}")
@@ -154,6 +162,10 @@ def main() -> None:
         model   = LR(model_name=args.model_name, max_iter=args.max_iter, alphas=args.alphas, seed=args.seed)
 
         model.fit_dataset(dataset, verbose=args.verbose > 0)
+
+        ct_path = ct_name.replace(" ", "_")
+        path    = os.path.join(args.output_dir, f"{ct_path}.json")
+        model.save_coefficients(path)
 
         df = model.summarize_models()
         wb_logger.log_celltype_diagnostics(df, cell_type=ct_name)

@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from src.distillation.utils import ld_prune
 class LRStruct:
     model_name: str
     gene:       str
+    chr:        int
     snp_ids:    np.ndarray
 
     # model learned in standardized X / standardized y space
@@ -78,6 +80,7 @@ class LR:
         X: np.ndarray,
         y: np.ndarray,
         snp_ids: np.ndarray,
+        chr: int,
     ) -> LRStruct:
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
@@ -103,6 +106,7 @@ class LR:
         model = LRStruct(
             model_name=self.model_name,
             gene=gene,
+            chr=chr,
             snp_ids=np.asarray(snp_ids),
             coef_=enet.coef_.copy(),
             intercept_=enet.intercept_,
@@ -118,8 +122,8 @@ class LR:
         return model
 
     def fit_gene_from_dataset(self, dataset: GenotypeDataset, gene: str) -> LRStruct:
-        X, y, snp_ids = dataset.get_gene_matrix(gene)
-        return self.fit_gene_matrix(gene, X, y, snp_ids)
+        X, y, snp_ids, chr = dataset.get_gene_matrix(gene)
+        return self.fit_gene_matrix(gene, X, y, snp_ids, chr)
 
     def fit_dataset(
         self,
@@ -171,7 +175,22 @@ class LR:
         df = df.sort_values("r2", ascending=True).reset_index(drop=True)
         df["rank"] = np.arange(1, len(df) + 1)
         return df
+    
+    def save_coefficients(self, output_path: str) -> None:
+        """Save the non-zero coefficients of each gene's model to a JSON file."""
+        output = {}
+        for gene, model in self.models_.items():
+            snp_ids_nonzero = model.snp_ids[model.coef_ != 0]
+            coefs_nonzero   = model.coef_[model.coef_ != 0]
 
+            output[gene] = {}
+            output[gene]["snp_ids"]   = snp_ids_nonzero.tolist()
+            output[gene]["coefs"]     = coefs_nonzero.tolist()
+            output[gene]["chr"]       = model.chr
+            output[gene]["intercept"] = model.intercept_
+        
+        with open(output_path, "w") as f:
+            json.dump(output, f, indent=4)
 
 if __name__ == "__main__":
     # example usage
