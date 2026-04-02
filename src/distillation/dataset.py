@@ -164,7 +164,7 @@ class GenotypeDataset(Dataset):
         with open_bed(os.path.join(self.bim_dir, f"{chrom}.bed")) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
 
-        y = gene_data.sort_values("individual")["expression"].to_numpy()
+        y = gene_data["expression"].to_numpy()
 
         return X, y, snp_ids, int(chrom[3:])
 
