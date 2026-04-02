@@ -184,10 +184,10 @@ class LR:
             coefs_nonzero   = model.coef_[model.coef_ != 0]
 
             output[gene] = {}
-            output[gene]["snp_ids"]   = snp_ids_nonzero.tolist()
-            output[gene]["coefs"]     = coefs_nonzero.tolist()
-            output[gene]["chr"]       = model.chr
-            output[gene]["intercept"] = model.intercept_
+            output[gene]["snp_ids"]   = [str(snp) for snp in snp_ids_nonzero]
+            output[gene]["coefs"]     = [float(c) for c in coefs_nonzero]
+            output[gene]["chr"]       = int(model.chr)
+            output[gene]["intercept"] = float(model.intercept_)
         
         with open(output_path, "w") as f:
             json.dump(output, f, indent=4)
