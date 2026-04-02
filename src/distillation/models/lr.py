@@ -7,8 +7,8 @@ from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import RidgeCV
 
-from distillation.dataset import GenotypeDataset
-from distillation.utils import ld_prune
+from src.distillation.dataset import GenotypeDataset
+from src.distillation.utils import ld_prune
 
 
 @dataclass
@@ -21,7 +21,7 @@ class LRStruct:
     coef_:      np.ndarray
     intercept_: float
     alpha_:     float
-    l1_ratio_: Optional[float]
+    l1_ratio_:  Optional[float]
 
     # scalers needed for inference + inverse transform
     x_mean_:  np.ndarray

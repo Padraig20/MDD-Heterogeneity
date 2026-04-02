@@ -6,22 +6,22 @@ from pathlib import Path
 
 import torch
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from training.dataset import MddDataset
-from training.utils import get_train_test_dataset, EarlyStopping
+from src.training.dataset import MddDataset
+from src.training.utils import get_train_test_dataset, EarlyStopping
 
-from training.models.mlp import MLPPredictor
-from training.models.mlp_deep_ensemble import MLPEnsemble
+from src.training.models.mlp import MLPPredictor
+from src.training.models.mlp_deep_ensemble import MLPEnsemble
 
-from training.utils import train_single_model, evaluate_single_model
-from training.utils import train_ensemble_model, evaluate_ensemble_model
+from src.training.utils import train_single_model, evaluate_single_model
+from src.training.utils import train_ensemble_model, evaluate_ensemble_model
 
-from training.loss.cossim_loss import CosineSimilarityLoss
-from training.loss.mpc_loss import MPCLoss
-from training.loss.mse_loss import MSELoss
-from training.loss.pnll_loss import PNLLLoss
-from training.loss.gnll_loss import GaussianNLLLoss
+from src.training.loss.cossim_loss import CosineSimilarityLoss
+from src.training.loss.mpc_loss import MPCLoss
+from src.training.loss.mse_loss import MSELoss
+from src.training.loss.pnll_loss import PNLLLoss
+from src.training.loss.gnll_loss import GaussianNLLLoss
 
-from training.wandb_logger import WandBLogger
+from src.training.wandb_logger import WandBLogger
 
 """
 train.py

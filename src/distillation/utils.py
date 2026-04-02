@@ -1,7 +1,7 @@
 import random
 import numpy as np
 
-from distillation.dataset import GenotypeDataset
+from src.distillation.dataset import GenotypeDataset
 
 # taken from scPrediXcan tutorial
 # https://github.com/hakyimlab/scPrediXcan/blob/master/Scripts/ctPred/Tutorial.ipynb

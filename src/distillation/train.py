@@ -9,9 +9,9 @@ import pandas as pd
 import tqdm
 from tqdm import tqdm
 
-from distillation.models.lr import LR
-from distillation.dataset import GenotypeDataset
-from distillation.wandb_logger import WandBLogger
+from src.distillation.models.lr import LR
+from src.distillation.dataset import GenotypeDataset
+from src.distillation.wandb_logger import WandBLogger
 
 """
 train.py

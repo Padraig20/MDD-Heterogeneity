@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 
-from training.models.mlp import MLPPredictor
+from src.training.models.mlp import MLPPredictor
 
 """
 get_student_data.py
