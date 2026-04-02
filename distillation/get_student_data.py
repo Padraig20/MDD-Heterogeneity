@@ -30,6 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-t", "--teacher-model", type=Path, required=True)
     parser.add_argument("-c", "--ct-mapping",    type=Path, required=True)
     parser.add_argument("-b", "--batch-size",    type=int, default=1)
+    parser.add_argument("-nt", "--norm-targets", 
+                        type=str, default="none", 
+                        choices=["none", "log", "percentiles"], 
+                        help="Normalization method used for target labels. Will undo normalization.")
     return parser.parse_args()
 
 
@@ -62,7 +66,7 @@ def main() -> None:
     args = parse_args()
 
     # load some data first...
-    idx2ct  = np.load(args.ct_mapping)
+    idx2ct  = np.load(args.ct_mapping, allow_pickle=True)
     model   = load_model(args.teacher_model)
     persons = os.listdir(args.input_dir)
 
@@ -121,6 +125,12 @@ def main() -> None:
             row = key_to_row.get(k)
             for ct_idx, ct in enumerate(idx2ct): # fill all cell-types for this gene and person
                 ct_to_matrix[ct][row, person_idx] = preds[i, ct_idx]
+        
+    if args.norm_targets == "log":
+        # undo log normalization
+        ct_to_matrix = {ct: np.expm1(M) for ct, M in ct_to_matrix.items()}
+    elif args.norm_targets == "percentiles":
+        raise NotImplementedError("Undoing percentile normalization is not supported, since it is not a bijective transformation. Please set --norm-targets to 'none' or 'log' when running this script.")
 
     # now write one CSV per cell-type
     print(f"Writing output CSVs to {args.output_dir}...")
