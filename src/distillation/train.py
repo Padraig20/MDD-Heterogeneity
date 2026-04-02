@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o", "--output-dir",
         type=Path,
-        default=Path("output"),
+        default=None,
         help="Directory to save the trained models. Creates one JSON file per cell type with non-zero coefficients for each gene."
     )
     parser.add_argument(
@@ -151,7 +151,8 @@ def main() -> None:
     cell_type_files = os.listdir(args.targets)
     logging.info(f"Found {len(cell_type_files)} cell types!")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     for ct_file in tqdm(cell_type_files, desc="Processing cell types"):
         ct_name = ct_file[:-4] # remove .csv extension
@@ -163,9 +164,10 @@ def main() -> None:
 
         model.fit_dataset(dataset, verbose=args.verbose > 0)
 
-        ct_path = ct_name.replace(" ", "_")
-        path    = os.path.join(args.output_dir, f"{ct_path}.json")
-        model.save_coefficients(path)
+        if args.output_dir is not None:
+            ct_path = ct_name.replace(" ", "_")
+            path    = os.path.join(args.output_dir, f"{ct_path}.json")
+            model.save_coefficients(path)
 
         df = model.summarize_models()
         wb_logger.log_celltype_diagnostics(df, cell_type=ct_name)
