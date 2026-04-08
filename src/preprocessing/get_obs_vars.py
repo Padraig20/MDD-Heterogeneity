@@ -83,7 +83,7 @@ def get_gene_tss(ensids: list[str], gtf_path: Path) -> pd.DataFrame:
     """Get TSS locations for given ENSEMBL IDs using the GTF file."""
     logging.info("Getting TSS locations for %d genes", len(ensids))
 
-    cmd = ["./preprocessing/get_gene_tss.sh", str(gtf_path), *ensids]
+    cmd = ["./src/preprocessing/get_gene_tss.sh", str(gtf_path), *ensids]
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
@@ -126,7 +126,7 @@ def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Seque
         # idea from seq2cells: if TSS cannot be centered without padding
         # the sequence, shift the window to avoid padding as much as possible
         window_size = tss_end - tss_start
-        seq_len = len(seq.seq)
+        seq_len     = len(seq.seq)
         
         if tss_start < 0:
             actual_start = 0
@@ -150,8 +150,10 @@ def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Seque
 
         assert len(gene_seq) == (tss_end - tss_start), "Sequence length mismatch"
 
-        # save sequence back to dataframe
-        tss_df.loc[tss_df['ensid'] == ensid, 'sequence'] = gene_seq
+        # save sequence and actual boundaries back to dataframe
+        tss_df.loc[tss_df['ensid'] == ensid, 'sequence']     = gene_seq
+        tss_df.loc[tss_df['ensid'] == ensid, 'actual_start'] = int(actual_start)
+        tss_df.loc[tss_df['ensid'] == ensid, 'actual_end']   = int(actual_end)
 
     return tss_df
 
