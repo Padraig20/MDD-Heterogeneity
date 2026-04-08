@@ -38,7 +38,7 @@ class LR:
     def __init__(
         self,
         model_name: str = "elasticnet",
-        l1_ratio: float = 0.1,  # scPrediXcan has 0.5
+        l1_ratio: float = 0.5,  # scPrediXcan has 0.5
         cv: int         = 3,
         alphas: int     = 100,
         max_iter: int   = 10000,
