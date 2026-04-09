@@ -148,7 +148,7 @@ def batched_rows(rows: Iterator[Dict[str, Any]], batch_size: int) -> Iterator[Li
 
 def dna_seq_to_array(seq: str) -> np.ndarray:
     """Convert a DNA sequence string to an integer-encoded NumPy array (1D)."""
-    return np.fromiter((mapping[nuc] for nuc in seq), dtype=np.int8)
+    return np.fromiter((mapping[nuc] for nuc in seq), dtype=np.uint8)
 
 
 def dna_seq_to_tensor(seq: np.ndarray) -> torch.Tensor:
@@ -254,7 +254,7 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
         start0  = int(row["actual_start"][:-2])  # removes .X suffix
         end0    = int(row["actual_end"][:-2])
 
-        if not str(chrom).isdigit():
+        if not str(chrom).isdigit(): # skip non-autosomal chromosomes
             continue
 
         chrom = f"chr{chrom}" if not chrom.startswith("chr") else chrom
