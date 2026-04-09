@@ -146,10 +146,14 @@ def batched_rows(rows: Iterator[Dict[str, Any]], batch_size: int) -> Iterator[Li
         yield batch
 
 
-def dna_seq_to_tensor(seq: str) -> torch.Tensor:
-    """Convert a DNA sequence string to an integer-encoded tensor (1D)."""
-    ids = [mapping[nuc] for nuc in seq]
-    return torch.tensor(ids, dtype=torch.long, device=device)  # (L,)
+def dna_seq_to_array(seq: str) -> np.ndarray:
+    """Convert a DNA sequence string to an integer-encoded NumPy array (1D)."""
+    return np.fromiter((mapping[nuc] for nuc in seq), dtype=np.int8)
+
+
+def dna_seq_to_tensor(seq: np.ndarray) -> torch.Tensor:
+    """Convert an integer-encoded NumPy array to a tensor (1D)."""
+    return torch.as_tensor(seq, dtype=torch.long, device=device)
 
 
 def open_variant_files(vcf_dir: Path) -> Dict[str, "pysam.VariantFile"]:
@@ -179,50 +183,41 @@ def sample_individual_ids(chrom_to_vcf: Dict[str, "pysam.VariantFile"], num_indi
     return chosen
 
 
-def collect_window_alt_edits(vcf: "pysam.VariantFile", chrom: str, start0: int, end0: int, sampled_ids: List[str], ref_seq: str) -> List[List[tuple[int, str]]]:
-    """Collect per-individual ALT substitutions for biallelic SNPs overlapping the window."""
-    edits_per_individual: List[List[tuple[int, str]]] = [[] for _ in sampled_ids]
+def collect_window_alt_edits(vcf: "pysam.VariantFile", chrom: str, start0: int, end0: int, sampled_ids: List[str], ref_seq: np.ndarray) -> List[List[tuple[int, int]]]:
+    edits_per_individual = [[] for _ in sampled_ids]
+    fetch_chrom          = chrom[3:]
 
-    for rec in vcf.fetch(chrom[3:], start0, end0):
-        if len(rec.ref) != 1:
-            continue
-        if rec.alts is None or len(rec.alts) != 1:
-            continue
-        if len(rec.alts[0]) != 1:
-            continue
+    for rec in vcf.fetch(fetch_chrom, start0, end0):
+        ref  = rec.ref
+        alts = rec.alts
 
-        pos0 = rec.pos - 1
-        if not (start0 <= pos0 < end0):
+        if len(ref) != 1 or alts is None or len(alts) != 1 or len(alts[0]) != 1:
             continue
 
+        pos0    = rec.pos - 1
         rel_pos = pos0 - start0
-        ref = rec.ref.upper()
-        alt = rec.alts[0].upper()
-
         if rel_pos < 0 or rel_pos >= len(ref_seq):
             continue
 
-        seq_base = ref_seq[rel_pos].upper()
-        if seq_base not in {"A", "C", "G", "T", "N"}:
-            continue
+        seq_base = int(ref_seq[rel_pos])
 
-        if seq_base != ref and seq_base != "N":
+        ref = ref.upper()
+        alt = alts[0].upper()
+
+        ref_code = mapping[ref]
+        alt_code = mapping[alt]
+
+        if seq_base != ref_code:
             logging.debug(
                 "Reference mismatch at %s:%d for ENSID window base. Sequence has %s, VCF REF has %s",
                 chrom, rec.pos, seq_base, ref
             )
 
+        rec_samples = rec.samples
         for i, sid in enumerate(sampled_ids):
-            gt = rec.samples[sid].get("GT")
-            if gt is None:
-                continue
-
-            called_alleles = [a for a in gt if a is not None]
-            if not called_alleles:
-                continue
-
-            if any(a > 0 for a in called_alleles):
-                edits_per_individual[i].append((rel_pos, alt))
+            gt = rec_samples[sid]["GT"]
+            if gt and any(a is not None and a > 0 for a in gt):
+                edits_per_individual[i].append((rel_pos, alt_code))
 
     return edits_per_individual
 
@@ -254,7 +249,7 @@ def apply_variants_to_sequence(ref_seq: str, variants, individual_idx: int) -> s
 def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.VariantFile"], sampled_ids: List[str]) -> Iterator[Dict[str, Any]]:
     """Expand each input row into gene x sampled-individual rows with SNP-personalized sequences."""
     for row in iter_rows_csv(input_path):
-        ref_seq = row["sequence"]
+        ref_seq = dna_seq_to_array(row["sequence"].upper())
         chrom   = row["chrom"]
         start0  = int(row["actual_start"][:-2])  # removes .X suffix
         end0    = int(row["actual_end"][:-2])
@@ -273,17 +268,17 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
             ref_seq=ref_seq,
         )
 
-        ref_chars = list(ref_seq)
-
         for i, sample_id in enumerate(sampled_ids):
-            seq_chars = ref_chars.copy()
-            for rel_pos, alt in edits_per_individual[i]:
-                seq_chars[rel_pos] = alt
+            seq_arr = ref_seq.copy()
+            for rel_pos, alt_code in edits_per_individual[i]:
+                seq_arr[rel_pos] = alt_code
 
-            new_row = dict(row)
-            new_row["sequence"] = "".join(seq_chars)
-            new_row["sample_id"] = sample_id
-            yield new_row
+            yield {
+                "sequence_array": seq_arr,
+                "ensid": row["ensid"],
+                "chrom": row["chrom"],
+                "sample_id": sample_id,
+            }
 
 
 def get_total_output_rows(input_path: Path, personalized: bool, num_individuals: int) -> int:
@@ -348,16 +343,17 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
             num_batches = (total_rows + batch_size - 1) // batch_size
 
             for batch in tqdm(batched_rows(row_iter, batch_size), total=num_batches, desc="Extracting features", unit="batch"):
-                seqs_b   = [b["sequence"] for b in batch]
+                if personalized:
+                    seqs_b       = [b["sequence_array"] for b in batch]
+                    sample_ids_b = [b["sample_id"] for b in batch]
+                else:
+                    seqs_b = [dna_seq_to_array(b["sequence"].upper()) for b in batch]
+
                 ensids_b = [b["ensid"] for b in batch]
                 chroms_b = [b["chrom"] for b in batch]
 
-                if personalized:
-                    sample_ids_b = [b["sample_id"] for b in batch]
-
-                batch_seqs   = [dna_seq_to_tensor(seq) for seq in seqs_b]
-                batch_tensor = torch.stack(batch_seqs, dim=0)  # (B, L)
-                batch_tensor = batch_tensor.to(device)
+                batch_np     = np.stack(seqs_b, axis=0)
+                batch_tensor = torch.as_tensor(batch_np, dtype=torch.long, device=device)
 
                 with torch.no_grad():
                     output = model(batch_tensor)["human"]  # (B, 896, 5313)
