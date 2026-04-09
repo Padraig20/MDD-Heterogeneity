@@ -39,8 +39,8 @@ $3 == "gene" {
     gene_id = substr(gene_id_substr, 1, gene_id_end - 1)
     
     if (gene_id in ids) {
-      start = tss - window
-      end   = tss + window
+      start = tss - window - 1
+      end   = tss + window - 1
       print $1, gene_id, start, end
     }
   }
