@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to write output file (*.csv)."
     )
     parser.add_argument(
+        "-oc", "--only-coding",
+        action="store_true",
+        help="Only consider protein-coding genes."
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="count",
         default=0,
@@ -79,11 +84,11 @@ def load_data(input_path: Path) -> list[str] | dict[str, fastapy.Sequence]:
     else: # we don't read the gtf file here, is done by bash script
         raise ValueError("Input file must be an .csv or .fa file")
 
-def get_gene_tss(ensids: list[str], gtf_path: Path) -> pd.DataFrame:
+def get_gene_tss(ensids: list[str], gtf_path: Path, only_coding: bool) -> pd.DataFrame:
     """Get TSS locations for given ENSEMBL IDs using the GTF file."""
     logging.info("Getting TSS locations for %d genes", len(ensids))
 
-    cmd = ["./src/preprocessing/get_gene_tss.sh", str(gtf_path), *ensids]
+    cmd = ["./src/preprocessing/get_gene_tss.sh", "--protein-coding" if only_coding else "", str(gtf_path), *ensids]
     try:
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
@@ -169,7 +174,7 @@ def main() -> None:
     logging.debug("Arguments: %s", args)
 
     ensids = load_data(args.input_csv)
-    tss_df = get_gene_tss(ensids, args.input_gtf)
+    tss_df = get_gene_tss(ensids, args.input_gtf, args.only_coding)
     logging.debug("\n%s", tss_df.head())
 
     hg38sq = load_data(args.input_fasta)
