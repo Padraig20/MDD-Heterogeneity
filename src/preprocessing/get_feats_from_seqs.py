@@ -18,9 +18,6 @@ import pysam
 # we have very long sequences...
 csv.field_size_limit(sys.maxsize)
 
-# required for some GPUs (remove if not needed)
-torch.backends.cudnn.enabled = False
-
 """
 get_feats_from_seqs.py
 
@@ -182,10 +179,10 @@ def sample_individual_ids(chrom_to_vcf: Dict[str, "pysam.VariantFile"], num_indi
     return chosen
 
 
-def collect_window_variants(vcf: "pysam.VariantFile", chrom: str, start0: int, end0: int, sampled_ids: List[str], ref_seq: str):
-    """Collect biallelic SNPs overlapping the window."""
+def collect_window_alt_edits(vcf: "pysam.VariantFile", chrom: str, start0: int, end0: int, sampled_ids: List[str], ref_seq: str) -> List[List[tuple[int, str]]]:
+    """Collect per-individual ALT substitutions for biallelic SNPs overlapping the window."""
+    edits_per_individual: List[List[tuple[int, str]]] = [[] for _ in sampled_ids]
 
-    variants = []
     for rec in vcf.fetch(chrom[3:], start0, end0):
         if len(rec.ref) != 1:
             continue
@@ -209,23 +206,25 @@ def collect_window_variants(vcf: "pysam.VariantFile", chrom: str, start0: int, e
         if seq_base not in {"A", "C", "G", "T", "N"}:
             continue
 
-        # Warn on mismatches but do not fail: input sequence may not be directly
-        # synced to the same reference build or representation.
         if seq_base != ref and seq_base != "N":
             logging.debug(
                 "Reference mismatch at %s:%d for ENSID window base. Sequence has %s, VCF REF has %s",
                 chrom, rec.pos, seq_base, ref
             )
 
-        gts = []
-        for sid in sampled_ids:
-            sample_data = rec.samples[sid]
-            gt = sample_data.get("GT")
-            gts.append(gt)
+        for i, sid in enumerate(sampled_ids):
+            gt = rec.samples[sid].get("GT")
+            if gt is None:
+                continue
 
-        variants.append((rel_pos, ref, alt, gts))
+            called_alleles = [a for a in gt if a is not None]
+            if not called_alleles:
+                continue
 
-    return variants
+            if any(a > 0 for a in called_alleles):
+                edits_per_individual[i].append((rel_pos, alt))
+
+    return edits_per_individual
 
 
 def apply_variants_to_sequence(ref_seq: str, variants, individual_idx: int) -> str:
@@ -255,19 +254,17 @@ def apply_variants_to_sequence(ref_seq: str, variants, individual_idx: int) -> s
 def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.VariantFile"], sampled_ids: List[str]) -> Iterator[Dict[str, Any]]:
     """Expand each input row into gene x sampled-individual rows with SNP-personalized sequences."""
     for row in iter_rows_csv(input_path):
-
         ref_seq = row["sequence"]
         chrom   = row["chrom"]
-        start0  = int(row["actual_start"][:-2]) # removes .X suffix
+        start0  = int(row["actual_start"][:-2])  # removes .X suffix
         end0    = int(row["actual_end"][:-2])
 
         if not str(chrom).isdigit():
-            logging.warning("Skipping non-autosomal chromosome: %s", chrom)
             continue
 
         chrom = f"chr{chrom}" if not chrom.startswith("chr") else chrom
 
-        variants = collect_window_variants(
+        edits_per_individual = collect_window_alt_edits(
             vcf=chrom_to_vcf[chrom],
             chrom=chrom,
             start0=start0,
@@ -276,9 +273,15 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
             ref_seq=ref_seq,
         )
 
+        ref_chars = list(ref_seq)
+
         for i, sample_id in enumerate(sampled_ids):
+            seq_chars = ref_chars.copy()
+            for rel_pos, alt in edits_per_individual[i]:
+                seq_chars[rel_pos] = alt
+
             new_row = dict(row)
-            new_row["sequence"]  = apply_variants_to_sequence(ref_seq, variants, i)
+            new_row["sequence"] = "".join(seq_chars)
             new_row["sample_id"] = sample_id
             yield new_row
 
