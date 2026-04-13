@@ -276,6 +276,7 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
     for row in iter_rows_csv(input_path):
         ref_seq = dna_seq_to_array(row["sequence"].upper())
         chrom   = row["chrom"]
+        tss     = int(row["tss"])
         start0  = int(row["actual_start"])
         end0    = int(row["actual_end"])
 
@@ -302,6 +303,7 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
                 "sequence_array": seq_arr,
                 "ensid": row["ensid"],
                 "chrom": row["chrom"],
+                "tss": row["tss"],
                 "sample_id": sample_id,
             }
 
