@@ -103,24 +103,25 @@ def get_gene_tss(ensids: list[str], gtf_path: Path, only_coding: bool) -> pd.Dat
         line = line.strip()
         # try common delimiters (tab, space, comma)
         parts = line.split("\t")
-        assert(len(parts) == 4)
+        assert(len(parts) == 5)
 
-        chrom, ens, start, end = parts[0], parts[1], int(parts[2]), int(parts[3])
-        rows.append((chrom, ens, start, end))
+        chrom, ens, tss, start, end = parts[0], parts[1], int(parts[2]), int(parts[3]), int(parts[4])
+        rows.append((chrom, ens, tss, start, end))
 
     logging.info("Retrieved TSS for %d of %d genes", len(rows), len(ensids))
 
-    df = pd.DataFrame(rows, columns=["chrom", "ensid", "tss_start", "tss_end"])
+    df = pd.DataFrame(rows, columns=["chrom", "ensid", "tss", "start", "end"])
     return df
 
 def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Sequence]) -> pd.DataFrame:
     kept_rows = []
 
     for _, row in tss_df.iterrows():
-        chrom     = row["chrom"]
-        ensid     = row["ensid"]
-        tss_start = row["tss_start"]
-        tss_end   = row["tss_end"]
+        chrom = row["chrom"]
+        ensid = row["ensid"]
+        tss   = row["tss"]
+        start = row["start"]
+        end   = row["end"]
 
         # get chromosome sequence
         seq = fasta_dict.get(chrom)
@@ -129,18 +130,18 @@ def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Seque
             continue
 
         # extract subsequence around the TSS
-        window_size = tss_end - tss_start
+        window_size = end - start
         seq_len = len(seq.seq)
 
-        if tss_start < 0:
+        if start < 0:
             actual_start = 0
             actual_end   = min(window_size, seq_len)
-        elif tss_end > seq_len:
+        elif end > seq_len:
             actual_end   = seq_len
             actual_start = max(0, seq_len - window_size)
         else:
-            actual_start = tss_start
-            actual_end   = tss_end
+            actual_start = start
+            actual_end   = end
 
         gene_seq = seq.seq[actual_start:actual_end]
 
@@ -156,8 +157,9 @@ def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Seque
         kept_rows.append({
             "chrom": chrom,
             "ensid": ensid,
-            "tss_start": tss_start,
-            "tss_end": tss_end,
+            "tss": tss,
+            "start": start,
+            "end": end,
             "sequence": gene_seq,
             "actual_start": actual_start,
             "actual_end": actual_end,

@@ -53,7 +53,7 @@ $3 == "gene" {
     if (gene_id in ids) {
       start = tss - window - 1
       end   = tss + window - 1
-      print $1, gene_id, start, end
+      print $1, gene_id, tss, start, end
     }
   }
 }
