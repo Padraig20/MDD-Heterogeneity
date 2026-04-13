@@ -114,25 +114,24 @@ def get_gene_tss(ensids: list[str], gtf_path: Path, only_coding: bool) -> pd.Dat
     return df
 
 def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Sequence]) -> pd.DataFrame:
+    kept_rows = []
 
     for _, row in tss_df.iterrows():
-        chrom     = row['chrom']
-        ensid     = row['ensid']
-        tss_start = row['tss_start']
-        tss_end   = row['tss_end']
+        chrom     = row["chrom"]
+        ensid     = row["ensid"]
+        tss_start = row["tss_start"]
+        tss_end   = row["tss_end"]
 
         # get chromosome sequence
         seq = fasta_dict.get(chrom)
         if seq is None:
-            logging.warning("Chromosome %s not found in FASTA", chrom)
+            logging.warning("Chromosome %s not found in FASTA for %s; dropping row", chrom, ensid)
             continue
 
-        # now we want to exctract the sub-sequence around the TSS
-        # idea from seq2cells: if TSS cannot be centered without padding
-        # the sequence, shift the window to avoid padding as much as possible
+        # extract subsequence around the TSS
         window_size = tss_end - tss_start
-        seq_len     = len(seq.seq)
-        
+        seq_len = len(seq.seq)
+
         if tss_start < 0:
             actual_start = 0
             actual_end   = min(window_size, seq_len)
@@ -142,25 +141,31 @@ def get_gene_sequences(tss_df: pd.DataFrame, fasta_dict: dict[str, fastapy.Seque
         else:
             actual_start = tss_start
             actual_end   = tss_end
-        
-        # extract sequence
+
         gene_seq = seq.seq[actual_start:actual_end]
-        # if new end exceeds original end, we pad with Ns
+
         if len(gene_seq) < window_size:
             padding_needed = window_size - len(gene_seq)
-            if actual_start == 0: # pad at beginning
+            if actual_start == 0:
                 gene_seq = "N" * padding_needed + gene_seq
-            else: # pad at end
+            else:
                 gene_seq = gene_seq + "N" * padding_needed
 
-        assert len(gene_seq) == (tss_end - tss_start), "Sequence length mismatch"
+        assert len(gene_seq) == window_size, "Sequence length mismatch"
 
-        # save sequence and actual boundaries back to dataframe
-        tss_df.loc[tss_df['ensid'] == ensid, 'sequence']     = gene_seq
-        tss_df.loc[tss_df['ensid'] == ensid, 'actual_start'] = int(actual_start)
-        tss_df.loc[tss_df['ensid'] == ensid, 'actual_end']   = int(actual_end)
+        kept_rows.append({
+            "chrom": chrom,
+            "ensid": ensid,
+            "tss_start": tss_start,
+            "tss_end": tss_end,
+            "sequence": gene_seq,
+            "actual_start": actual_start,
+            "actual_end": actual_end,
+        })
 
-    return tss_df
+    out_df = pd.DataFrame(kept_rows)
+    logging.info("Kept %d of %d rows", len(out_df), len(tss_df))
+    return out_df
 
 def save_output(data: pd.DataFrame, output_path: Path) -> None:
     """Save processed data to `output_path`."""
