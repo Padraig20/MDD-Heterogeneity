@@ -133,9 +133,10 @@ def setup_logging(verbosity: int) -> None:
     )
 
 
-def save_checkpoint(checkpoint_path: Path, idx: int, ensids: np.ndarray, chroms: np.ndarray, sample_ids_arr: np.ndarray, output_path: Path):
+def save_checkpoint(checkpoint_path: Path, idx: int, ensids: np.ndarray, chroms: np.ndarray, tss: np.ndarray, sample_ids_arr: np.ndarray, output_path: Path):
     np.save(output_path.with_suffix(".ensids.npy"), ensids[:idx])
     np.save(output_path.with_suffix(".chroms.npy"), chroms[:idx])
+    np.save(output_path.with_suffix(".tss.npy"), tss[:idx])
     if sample_ids_arr is not None:
         np.save(output_path.with_suffix(".sample_ids.npy"), sample_ids_arr[:idx])
 
@@ -351,6 +352,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
 
             ensids         = np.empty(total_rows, dtype=object)
             chroms         = np.empty(total_rows, dtype=object)
+            tss            = np.empty(total_rows, dtype=object)
             sample_ids_arr = np.empty(total_rows, dtype=object) if personalized else None
 
             row_iter: Iterator[Dict[str, Any]]
@@ -378,6 +380,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
 
                 ensids_b = [b["ensid"] for b in batch]
                 chroms_b = [b["chrom"] for b in batch]
+                tss_b    = [b["tss"] for b in batch]
 
                 batch_np     = np.stack(seqs_b, axis=0)
                 batch_tensor = torch.as_tensor(batch_np, dtype=torch.long, device=device)
@@ -398,7 +401,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
                 feats_mm[idx: idx + actual_bsz, :] = features
                 ensids[idx: idx + actual_bsz]      = ensids_b
                 chroms[idx: idx + actual_bsz]      = chroms_b
-                
+                tss[idx: idx + actual_bsz]         = tss_b
                 if personalized and sample_ids_arr is not None:
                     sample_ids_arr[idx: idx + actual_bsz] = sample_ids_b
 
@@ -412,6 +415,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
                         idx=idx,
                         ensids=ensids,
                         chroms=chroms,
+                        tss=tss,
                         sample_ids_arr=sample_ids_arr,
                         output_path=output_path,
                     )
