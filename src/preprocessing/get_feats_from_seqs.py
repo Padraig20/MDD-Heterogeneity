@@ -275,8 +275,8 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
     for row in iter_rows_csv(input_path):
         ref_seq = dna_seq_to_array(row["sequence"].upper())
         chrom   = row["chrom"]
-        start0  = row["actual_start"]
-        end0    = row["actual_end"]
+        start0  = int(row["actual_start"])
+        end0    = int(row["actual_end"])
 
         if not str(chrom).isdigit(): # skip non-autosomal chromosomes
             continue
