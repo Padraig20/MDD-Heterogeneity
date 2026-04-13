@@ -13,6 +13,9 @@ from enformer_pytorch import Enformer
 from numpy.lib.format import open_memmap
 from tqdm import tqdm
 
+import json
+import os
+
 import pysam
 
 # we have very long sequences...
@@ -110,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Increase verbosity."
     )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=20000,
+        help="Flush and checkpoint every N batches."
+    )
     return parser.parse_args()
 
 
@@ -122,6 +131,21 @@ def setup_logging(verbosity: int) -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+
+def save_checkpoint(checkpoint_path: Path, idx: int, ensids: np.ndarray, chroms: np.ndarray, sample_ids_arr: np.ndarray, output_path: Path):
+    np.save(output_path.with_suffix(".ensids.npy"), ensids[:idx])
+    np.save(output_path.with_suffix(".chroms.npy"), chroms[:idx])
+    if sample_ids_arr is not None:
+        np.save(output_path.with_suffix(".sample_ids.npy"), sample_ids_arr[:idx])
+
+    # progress file for tracking checkpointing progress
+    tmp_ckpt = checkpoint_path.with_suffix(".tmp")
+    with tmp_ckpt.open("w", encoding="utf-8") as f:
+        json.dump({"idx": idx}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp_ckpt.replace(checkpoint_path)
 
 
 def count_rows_csv(input_path: Path) -> int:
@@ -251,8 +275,8 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
     for row in iter_rows_csv(input_path):
         ref_seq = dna_seq_to_array(row["sequence"].upper())
         chrom   = row["chrom"]
-        start0  = int(row["actual_start"][:-2])  # removes .X suffix
-        end0    = int(row["actual_end"][:-2])
+        start0  = row["actual_start"]
+        end0    = row["actual_end"]
 
         if not str(chrom).isdigit(): # skip non-autosomal chromosomes
             continue
@@ -288,7 +312,7 @@ def get_total_output_rows(input_path: Path, personalized: bool, num_individuals:
     return num_rows * num_individuals
 
 
-def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: int = 0, sample_seed: int = 42) -> None:
+def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: int = 0, sample_seed: int = 42, checkpoint_every: int = 1000) -> None:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
 
@@ -339,8 +363,11 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
             else:
                 row_iter = iter_rows_csv(data_path)
 
-            idx = 0
+            idx  = 0
+            bidx = 0
             num_batches = (total_rows + batch_size - 1) // batch_size
+
+            checkpoint_path = output_path.with_suffix(".checkpoint.json")
 
             for batch in tqdm(batched_rows(row_iter, batch_size), total=num_batches, desc="Extracting features", unit="batch"):
                 if personalized:
@@ -375,7 +402,21 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
                 if personalized and sample_ids_arr is not None:
                     sample_ids_arr[idx: idx + actual_bsz] = sample_ids_b
 
-                idx += actual_bsz
+                idx  += actual_bsz
+                bidx += 1
+
+                if bidx % checkpoint_every == 0:
+                    feats_mm.flush()
+                    save_checkpoint(
+                        checkpoint_path=checkpoint_path,
+                        idx=idx,
+                        ensids=ensids,
+                        chroms=chroms,
+                        sample_ids_arr=sample_ids_arr,
+                        output_path=output_path,
+                    )
+        
+            logging.info("Checkpoint saved at row %d", idx)
 
             logging.info("Features successfully extracted.")
             logging.debug("Sample of extracted features:\n%s", feats_mm[0])
@@ -410,6 +451,7 @@ def main() -> None:
         vcf_dir=args.vcf_dir,
         num_individuals=args.num_individuals,
         sample_seed=args.sample_seed,
+        checkpoint_every=args.checkpoint_every,
     )
 
     logging.info("Done.")
