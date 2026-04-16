@@ -76,9 +76,9 @@ def main() -> None:
 
     for person in tqdm(persons, desc="Indexing genes (metadata)"):
         pdir   = args.input_dir / person
-        chroms = np.load(pdir / "chroms.npy")
-        ensids = np.load(pdir / "ensids.npy")
-        tss    = np.load(pdir / "tss.npy")
+        chroms = np.load(pdir / "chroms.npy", allow_pickle=True)
+        ensids = np.load(pdir / "ensids.npy", allow_pickle=True)
+        tss    = np.load(pdir / "tss.npy", allow_pickle=True)
 
         keys = make_keys(ensids, chroms, tss)
         for k in keys:
@@ -103,10 +103,10 @@ def main() -> None:
     # now perform inference for each person, place into correct row in each matrix based on key
     for person_idx, person in enumerate(persons):
         pdir   = args.input_dir / person
-        chroms = np.load(pdir / "chroms.npy")
-        ensids = np.load(pdir / "ensids.npy")
-        tss    = np.load(pdir / "tss.npy")
-        feats  = np.load(pdir / "features.npy")  # (n_person_genes, D)
+        chroms = np.load(pdir / "chroms.npy", allow_pickle=True)
+        ensids = np.load(pdir / "ensids.npy", allow_pickle=True)
+        tss    = np.load(pdir / "tss.npy", allow_pickle=True)
+        feats  = np.load(pdir / "features.npy", allow_pickle=True)  # (n_person_genes, D)
 
         keys = make_keys(ensids, chroms, tss)
         n_person_genes = feats.shape[0]
