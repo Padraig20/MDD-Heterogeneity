@@ -90,7 +90,7 @@ class GenotypeDataset(Dataset):
 
     def split_by_chromosome(self, chroms: list[str]) -> Dataset:
         # filter y and chroms to only include rows with chrom in chroms
-        y_filtered       = self.y[self.y["chrom"].isin(chroms)].copy()
+        y_filtered       = self.y[self.y["chrom"].astype(str).isin(chroms)].copy()
         bims_filtered    = {chrom: bim for chrom, bim in self.bims.items() if chrom in chroms}
         idx2ind_filtered = {chrom: idx2ind for chrom, idx2ind in self.idx2ind.items() if chrom in chroms}
         return GenotypeDataset(bims_filtered, idx2ind_filtered, y_filtered, bim_dir=self.bim_dir, window_size=self.window_size, select_genes=self.select_genes)
@@ -101,7 +101,7 @@ class GenotypeDataset(Dataset):
     def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor]:
         row        = self.y.iloc[idx]
         ensid      = row["gene"]
-        chrom      = row["chrom"]
+        chrom      = str(row["chrom"])
         tss        = row["tss"]
         individual = row["individual"]
         expression = row["expression"]
@@ -113,10 +113,10 @@ class GenotypeDataset(Dataset):
         idx2ind        = self.idx2ind[chrom]
         individual_idx = np.where(idx2ind == individual)[0][0]
 
-        mask = (bim["chrom"] == chrom[3:]) & (bim["bp"] >= start) & (bim["bp"] <= end)
+        mask = (bim["chrom"] == chrom) & (bim["bp"] >= start) & (bim["bp"] <= end)
         var_idx = np.flatnonzero(mask.to_numpy())
 
-        with open_bed(os.path.join(self.bim_dir, f"{chrom}.bed")) as bed:
+        with open_bed(os.path.join(self.bim_dir, f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic.bed")) as bed:
             x = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
 
         x = torch.from_numpy(x).flatten().float() # convert to float for training
@@ -138,7 +138,7 @@ class GenotypeDataset(Dataset):
         gene_data  = self.y[self.y["gene"] == gene]
         if len(gene_data) == 0:
             raise ValueError(f"No data found for gene {gene}")
-        chrom      = gene_data["chrom"].iloc[0]
+        chrom      = str(gene_data["chrom"].iloc[0])
         tss        = gene_data["tss"].iloc[0]
 
         # find window in BIM file for this chrom that contains tss
@@ -146,7 +146,7 @@ class GenotypeDataset(Dataset):
         start   = tss - self.window_size
         end     = tss + self.window_size
 
-        mask    = (bim["chrom"] == chrom[3:]) & (bim["bp"] >= start) & (bim["bp"] <= end)
+        mask    = (bim["chrom"] == chrom) & (bim["bp"] >= start) & (bim["bp"] <= end)
         var_idx = np.flatnonzero(mask.to_numpy())
         snp_ids = bim.loc[mask, "snp"].astype(str).to_numpy()
 
@@ -161,12 +161,12 @@ class GenotypeDataset(Dataset):
             row_individuals = gene_data["individual"].astype(str).to_numpy()
         individual_idx = np.array([ind_to_idx[ind] for ind in row_individuals], dtype=int)
 
-        with open_bed(os.path.join(self.bim_dir, f"{chrom}.bed")) as bed:
+        with open_bed(os.path.join(self.bim_dir, f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic.bed")) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
 
         y = gene_data["expression"].to_numpy()
 
-        return X, y, snp_ids, int(chrom[3:])
+        return X, y, snp_ids, chrom
 
 if __name__ == "__main__":
     # example usage

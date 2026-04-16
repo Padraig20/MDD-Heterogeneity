@@ -115,19 +115,20 @@ def main() -> None:
     else:
         wb_logger = WandBLogger(enabled=False)
 
-    all_chromosomes = [f"chr{c}" for c in range(1, 23)] # we only use autosomes
+    all_chromosomes = [str(c) for c in range(1, 23)]
 
     bims    = {}
     idx2ind = {}
 
     for chrom in all_chromosomes:
-        if not os.path.exists(os.path.join(args.observations, f"{chrom}.bim")) or \
-           not os.path.exists(os.path.join(args.observations, f"{chrom}.fam")):
+        chrom_name = f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
+        if not os.path.exists(os.path.join(args.observations, f"{chrom_name}.bim")) or \
+           not os.path.exists(os.path.join(args.observations, f"{chrom_name}.fam")):
             logging.warning(f"Missing genotype data for {chrom}. Aborting! :(")
             raise FileNotFoundError(f"Missing genotype data for {chrom} in {args.observations}")
 
         bim = pd.read_csv(
-            os.path.join(args.observations, f"{chrom}.bim"),
+            os.path.join(args.observations, f"{chrom_name}.bim"),
             sep=r"\s+",
             header=None,
             names=["chrom", "snp", "cm", "bp", "a1", "a2"],
@@ -135,18 +136,19 @@ def main() -> None:
         )
         
         idx2ind_arr = pd.read_csv(
-            os.path.join(args.observations, f"{chrom}.fam"),
+            os.path.join(args.observations, f"{chrom_name}.fam"),
             sep=r"\s+",
             header=None,
             usecols=[0, 1],
             names=["family_id", "individual_id"]
         )
         idx2ind_arr = idx2ind_arr["individual_id"].to_numpy()
+        idx2ind_arr = np.array([f"{ind}_{ind}" for ind in idx2ind_arr])
 
         bims[chrom]    = bim
         idx2ind[chrom] = idx2ind_arr
 
-        logging.info(f"Loaded genotype data for {chrom}.")
+        logging.info(f"Loaded genotype data for '{chrom_name}'.")
 
     cell_type_files = os.listdir(args.targets)
     logging.info(f"Found {len(cell_type_files)} cell types!")
