@@ -1,31 +1,19 @@
 import os
-import h5py
 import argparse
 import numpy as np
-import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 
-"""
-preprocess_teacher_data.py
-
-We are taking Geuvadis Enformer embeddings prodived by scPrediXcan. We process
-these embeddings to get them in a format suitable for our pipeline to generate
-a dataset for the student model. The original data can be found here:
-
-https://github.com/hakyimlab/scPrediXcan/blob/master/Scripts/Enformer_epigenomic_features/Geuvadis_individuals_epigenome.txt
-"""
 
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
     parser = argparse.ArgumentParser(
-        description="Prepare target variables for downstream analysis."
+        description="Prepare per-sample teacher-model input files."
     )
     parser.add_argument(
-        "-i", "--input-dir",
+        "-i", "--input-prefix",
         type=Path,
         required=True,
-        help="Path to input directory."
+        help="Prefix of input files, i.e. X.chroms.npy, X.ensids.npy, etc."
     )
     parser.add_argument(
         "-o", "--output-dir",
@@ -35,51 +23,57 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-def preprocess(input_dir, person_name, md, output_dir):
-    target_dir = os.path.join(output_dir, person_name)
-    # already exists? skip
-    if os.path.exists(target_dir):
-        print(f"Directory {target_dir} already exists, skipping {person_name}...")
-        return
 
-    os.makedirs(target_dir, exist_ok=True)
+def preprocess(chroms, ensids, tss, sample_ids, features, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    with h5py.File(os.path.join(input_dir, f"{person_name}.h5"), "r") as f:
-        # for one person large enough to fit in memory
-        ensids   = []
-        chroms   = []
-        features = []
-        tss      = []
-        for key in tqdm(f.keys(), total=len(f.keys()), desc=f"{person_name}", unit="row"):
-            chr = key.split("_")[0]
-            # we could have multiple TSSs for the same gene!
-            ensid_list = md["ensembl_gene_id"][md["TSS_enformer_input"] == key[:-len("_predictions")]]
-            tss_list = md["transcription_start_site"][md["TSS_enformer_input"] == key[:-len("_predictions")]]
-            feat = f[key][:]          # (4, 5313) -> (5313,)
-            feat = feat.mean(axis=0)  # average over 4 bins
+    # Sort rows by sample_id so rows for the same sample become contiguous
+    order = np.argsort(sample_ids, kind="stable")
+    sorted_sample_ids = sample_ids[order]
 
-            for idx, ensid in enumerate(ensid_list):
-                ensids.append(ensid)
-                chroms.append(chr)
-                features.append(feat)
-                tss.append(tss_list.iloc[idx])
+    # Find boundaries between groups
+    unique_sample_ids, start_idx, counts = np.unique(
+        sorted_sample_ids, return_index=True, return_counts=True
+    )
 
-        np.save(os.path.join(target_dir, "features.npy"), features)
-        np.save(os.path.join(target_dir, "ensids.npy"), ensids)
-        np.save(os.path.join(target_dir, "chroms.npy"), chroms)
-        np.save(os.path.join(target_dir, "tss.npy"), tss)
+    for sample_id, start, count in tqdm(
+        zip(unique_sample_ids, start_idx, counts),
+        total=len(unique_sample_ids),
+        desc="Processing samples"
+    ):
+        idx = order[start:start + count]
+
+        sample_dir = output_dir / sample_id
+        if sample_dir.exists():
+            print(f"Directory {sample_dir} already exists. Skipping sample {sample_id}.")
+            continue
+        sample_dir.mkdir(parents=True, exist_ok=False)
+
+        np.save(sample_dir / "features.npy", features[idx])
+        np.save(sample_dir / "ensids.npy", ensids[idx])
+        np.save(sample_dir / "chroms.npy", chroms[idx])
+        np.save(sample_dir / "tss.npy", tss[idx])
+
 
 def main() -> None:
     args = parse_args()
 
-    md = pd.read_csv(os.path.join(args.input_dir, "metadata.csv"))
+    chroms = np.load(f"{args.input_prefix}.chroms.npy", allow_pickle=True)
+    ensids = np.load(f"{args.input_prefix}.ensids.npy", allow_pickle=True)
+    sample_ids = np.load(f"{args.input_prefix}.sample_ids.npy", allow_pickle=True)
+    tss = np.load(f"{args.input_prefix}.tss.npy", allow_pickle=True)
 
-    for file in os.listdir(args.input_dir):
-        if file.endswith(".h5"):
-            person_name = file[:-3]  # remove .h5 extension
-            preprocess(args.input_dir, person_name, md, args.output_dir)
+    # Memory-mapped read for large array
+    features = np.load(
+        f"{args.input_prefix}.features.npy",
+        allow_pickle=True,
+        mmap_mode="r"
+    )
 
+    preprocess(chroms, ensids, tss, sample_ids, features, args.output_dir)
     print("Done!")
+
 
 if __name__ == "__main__":
     main()
