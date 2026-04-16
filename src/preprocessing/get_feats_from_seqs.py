@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+from concurrent.futures import process
 import sys
 import csv
 import logging
@@ -134,11 +135,11 @@ def setup_logging(verbosity: int) -> None:
 
 
 def save_checkpoint(checkpoint_path: Path, idx: int, ensids: np.ndarray, chroms: np.ndarray, tss: np.ndarray, sample_ids_arr: np.ndarray, output_path: Path):
-    np.save(output_path.with_suffix(".ensids.npy"), ensids[:idx])
-    np.save(output_path.with_suffix(".chroms.npy"), chroms[:idx])
-    np.save(output_path.with_suffix(".tss.npy"), tss[:idx])
+    np.save(output_path.with_suffix(".ensids.npy"), ensids)
+    np.save(output_path.with_suffix(".chroms.npy"), chroms)
+    np.save(output_path.with_suffix(".tss.npy"), tss)
     if sample_ids_arr is not None:
-        np.save(output_path.with_suffix(".sample_ids.npy"), sample_ids_arr[:idx])
+        np.save(output_path.with_suffix(".sample_ids.npy"), sample_ids_arr)
 
     # progress file for tracking checkpointing progress
     tmp_ckpt = checkpoint_path.with_suffix(".tmp")
@@ -327,7 +328,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
         if personalized:
             logging.info("Personalized mode enabled using VCF directory: %s", vcf_dir)
             chrom_to_vcf = open_variant_files(vcf_dir)
-            sampled_ids = sample_individual_ids(chrom_to_vcf, num_individuals, sample_seed)
+            sampled_ids  = sample_individual_ids(chrom_to_vcf, num_individuals, sample_seed)
         else:
             logging.info("Running in reference-sequence mode.")
 
@@ -421,17 +422,37 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
                         sample_ids_arr=sample_ids_arr,
                         output_path=output_path,
                     )
-        
-            logging.info("Checkpoint saved at row %d", idx)
+                    logging.info("Checkpoint saved at row %d", idx)
 
             logging.info("Features successfully extracted.")
             logging.debug("Sample of extracted features:\n%s", feats_mm[0])
+            logging.debug("Performing post-processing; removing None values...")
+
+            # post-process: mainly removes genes with missing/unaligned metadata (diff chroms)
+            ensids_mask = (ensids == None)
+            chroms_mask = (chroms == None)
+            tss_mask    = (tss == None)
+
+            if sample_ids_arr is not None:
+                sample_ids_mask = (sample_ids_arr == None)
+                combined_mask   = ensids_mask | chroms_mask | tss_mask | sample_ids_mask
+            else:
+                combined_mask   = ensids_mask | chroms_mask | tss_mask
+            
+            logging.debug("Number of masked rows: %d", combined_mask.sum())
+            # remove all masked values (also from feats)
+            feats_mm = feats_mm[~combined_mask]
+            ensids   = ensids[~combined_mask]
+            chroms   = chroms[~combined_mask]
+            tss      = tss[~combined_mask]
+            if sample_ids_arr is not None:
+                sample_ids_arr = sample_ids_arr[~combined_mask]
+
             logging.debug("Features saved to %s, now flushing...", feats_mm_path)
-
             del feats_mm
-
             np.save(output_path.with_suffix(".ensids.npy"), ensids)
             np.save(output_path.with_suffix(".chroms.npy"), chroms)
+            np.save(output_path.with_suffix(".tss.npy"), tss)
             if personalized and sample_ids_arr is not None:
                 np.save(output_path.with_suffix(".sample_ids.npy"), sample_ids_arr)
 
