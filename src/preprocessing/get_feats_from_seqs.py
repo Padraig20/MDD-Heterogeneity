@@ -7,6 +7,7 @@ import logging
 import random
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+from itertools import islice
 
 import numpy as np
 import torch
@@ -155,10 +156,16 @@ def count_rows_csv(input_path: Path) -> int:
         return sum(1 for _ in f) - 1  # exclude header
 
 
-def iter_rows_csv(input_path: Path) -> Iterator[Dict[str, Any]]:
+def count_autosomal_rows_csv(input_path: Path) -> int:
     with input_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        yield from reader  # already excludes header
+        return sum(1 for row in reader if str(row["chrom"]).isdigit())
+
+
+def iter_rows_csv(input_path: Path, skip_rows: int = 0) -> Iterator[Dict[str, Any]]:
+    with input_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        yield from islice(reader, skip_rows, None)
 
 
 def batched_rows(rows: Iterator[Dict[str, Any]], batch_size: int) -> Iterator[List[Dict[str, Any]]]:
@@ -272,9 +279,9 @@ def apply_variants_to_sequence(ref_seq: str, variants, individual_idx: int) -> s
     return "".join(seq_chars)
 
 
-def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.VariantFile"], sampled_ids: List[str]) -> Iterator[Dict[str, Any]]:
+def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.VariantFile"], sampled_ids: List[str], skip_input_rows: int = 0, skip_within_expanded_row: int = 0) -> Iterator[Dict[str, Any]]:
     """Expand each input row into gene x sampled-individual rows with SNP-personalized sequences."""
-    for row in iter_rows_csv(input_path):
+    for row_idx, row in enumerate(iter_rows_csv(input_path, skip_rows=skip_input_rows)):
         ref_seq = dna_seq_to_array(row["sequence"].upper())
         chrom   = row["chrom"]
         tss     = int(row["tss"])
@@ -295,7 +302,11 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
             ref_seq=ref_seq,
         )
 
-        for i, sample_id in enumerate(sampled_ids):
+        start_i = skip_within_expanded_row if row_idx == 0 else 0
+
+        for i in range(start_i, len(sampled_ids)):
+            sample_id = sampled_ids[i]
+
             seq_arr = ref_seq.copy()
             for rel_pos, alt_code in edits_per_individual[i]:
                 seq_arr[rel_pos] = alt_code
@@ -313,7 +324,7 @@ def get_total_output_rows(input_path: Path, personalized: bool, num_individuals:
     num_rows = count_rows_csv(input_path)
     if not personalized:
         return num_rows
-    return num_rows * num_individuals
+    return count_autosomal_rows_csv(input_path) * num_individuals
 
 
 def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: int = 0, sample_seed: int = 42, checkpoint_every: int = 1000) -> None:
@@ -345,32 +356,47 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
             )
             logging.info("Number of output sequences to process: %d", total_rows)
 
-            logging.debug("Creating memmap array at %s", feats_mm_path)
-            feats_mm = open_memmap(
-                feats_mm_path,
-                mode="w+",
-                dtype=np.float32,
-                shape=(total_rows, 5313),
-            )
+            # check for existing checkpoint
+            cidx = None
+            checkpoint_path = output_path.with_suffix(".checkpoint.json")
+            if checkpoint_path.exists():
+                with checkpoint_path.open("r", encoding="utf-8") as f:
+                    checkpoint = json.load(f)
+                    cidx        = checkpoint.get("idx", 0)
+                logging.info("Resuming from checkpoint at row %d", cidx)
+                ensids         = np.load(output_path.with_suffix(".ensids.npy"), allow_pickle=True)
+                chroms         = np.load(output_path.with_suffix(".chroms.npy"), allow_pickle=True)
+                tss            = np.load(output_path.with_suffix(".tss.npy"), allow_pickle=True)
+                sample_ids_arr = np.load(output_path.with_suffix(".sample_ids.npy"), allow_pickle=True) if personalized else None
+                feats_mm       = np.load(output_path.with_suffix(".features.npy"), allow_pickle=True, mmap_mode="r+")
+                logging.info("Checkpoint loaded. Resuming feature extraction from row %d", cidx)
+            else:
+                logging.debug("Creating memmap array at %s", feats_mm_path)
+                ensids         = np.empty(total_rows, dtype=object)
+                chroms         = np.empty(total_rows, dtype=object)
+                tss            = np.empty(total_rows, dtype=object)
+                sample_ids_arr = np.empty(total_rows, dtype=object) if personalized else None
+                feats_mm       = open_memmap(feats_mm_path, mode="w+", dtype=np.float32, shape=(total_rows, 5313))
 
-            ensids         = np.empty(total_rows, dtype=object)
-            chroms         = np.empty(total_rows, dtype=object)
-            tss            = np.empty(total_rows, dtype=object)
-            sample_ids_arr = np.empty(total_rows, dtype=object) if personalized else None
+            start_idx = cidx or 0
+            idx       = start_idx
+            bidx      = 0
+            remaining_rows = total_rows - start_idx
+            num_batches = (remaining_rows + batch_size - 1) // batch_size
 
             row_iter: Iterator[Dict[str, Any]]
             if personalized:
+                skip_input_rows = start_idx // num_individuals
+                skip_within_expanded_row = start_idx % num_individuals
                 row_iter = iter_personalized_rows(
                     input_path=data_path,
                     chrom_to_vcf=chrom_to_vcf,
                     sampled_ids=sampled_ids,
+                    skip_input_rows=skip_input_rows,
+                    skip_within_expanded_row=skip_within_expanded_row,
                 )
             else:
-                row_iter = iter_rows_csv(data_path)
-
-            idx  = 0
-            bidx = 0
-            num_batches = (total_rows + batch_size - 1) // batch_size
+                row_iter = iter_rows_csv(data_path, skip_rows=start_idx)
 
             checkpoint_path = output_path.with_suffix(".checkpoint.json")
 
@@ -424,32 +450,10 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
                     )
                     logging.info("Checkpoint saved at row %d", idx)
 
+            feats_mm.flush()
             logging.info("Features successfully extracted.")
             logging.debug("Sample of extracted features:\n%s", feats_mm[0])
-            logging.debug("Performing post-processing; removing None values...")
 
-            # post-process: mainly removes genes with missing/unaligned metadata (diff chroms)
-            ensids_mask = (ensids == None)
-            chroms_mask = (chroms == None)
-            tss_mask    = (tss == None)
-
-            if sample_ids_arr is not None:
-                sample_ids_mask = (sample_ids_arr == None)
-                combined_mask   = ensids_mask | chroms_mask | tss_mask | sample_ids_mask
-            else:
-                combined_mask   = ensids_mask | chroms_mask | tss_mask
-            
-            logging.debug("Number of masked rows: %d", combined_mask.sum())
-            # remove all masked values (also from feats)
-            feats_mm = feats_mm[~combined_mask]
-            ensids   = ensids[~combined_mask]
-            chroms   = chroms[~combined_mask]
-            tss      = tss[~combined_mask]
-            if sample_ids_arr is not None:
-                sample_ids_arr = sample_ids_arr[~combined_mask]
-
-            logging.debug("Features saved to %s, now flushing...", feats_mm_path)
-            del feats_mm
             np.save(output_path.with_suffix(".ensids.npy"), ensids)
             np.save(output_path.with_suffix(".chroms.npy"), chroms)
             np.save(output_path.with_suffix(".tss.npy"), tss)
