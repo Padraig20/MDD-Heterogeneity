@@ -151,21 +151,30 @@ def save_checkpoint(checkpoint_path: Path, idx: int, ensids: np.ndarray, chroms:
     tmp_ckpt.replace(checkpoint_path)
 
 
-def count_rows_csv(input_path: Path) -> int:
-    with input_path.open(newline="", encoding="utf-8") as f:
-        return sum(1 for _ in f) - 1  # exclude header
-
-
 def count_autosomal_rows_csv(input_path: Path) -> int:
     with input_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         return sum(1 for row in reader if str(row["chrom"]).isdigit())
 
 
-def iter_rows_csv(input_path: Path, skip_rows: int = 0) -> Iterator[Dict[str, Any]]:
+def get_total_output_rows(input_path: Path, personalized: bool, num_individuals: int) -> int:
+    num_rows = count_autosomal_rows_csv(input_path)
+    if not personalized:
+        return num_rows
+    return num_rows * num_individuals
+
+
+def iter_autosomal_rows_csv(input_path: Path, skip_rows: int = 0) -> Iterator[Dict[str, Any]]:
     with input_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        yield from islice(reader, skip_rows, None)
+        kept   = 0
+        for row in reader:
+            if not str(row["chrom"]).isdigit():
+                continue
+            if kept < skip_rows:
+                kept += 1
+                continue
+            yield row 
 
 
 def batched_rows(rows: Iterator[Dict[str, Any]], batch_size: int) -> Iterator[List[Dict[str, Any]]]:
@@ -281,15 +290,12 @@ def apply_variants_to_sequence(ref_seq: str, variants, individual_idx: int) -> s
 
 def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.VariantFile"], sampled_ids: List[str], skip_input_rows: int = 0, skip_within_expanded_row: int = 0) -> Iterator[Dict[str, Any]]:
     """Expand each input row into gene x sampled-individual rows with SNP-personalized sequences."""
-    for row_idx, row in enumerate(iter_rows_csv(input_path, skip_rows=skip_input_rows)):
+    for row_idx, row in enumerate(iter_autosomal_rows_csv(input_path, skip_rows=skip_input_rows)):
         ref_seq = dna_seq_to_array(row["sequence"].upper())
         chrom   = row["chrom"]
         tss     = int(row["tss"])
         start0  = int(row["actual_start"])
         end0    = int(row["actual_end"])
-
-        if not str(chrom).isdigit(): # skip non-autosomal chromosomes
-            continue
 
         chrom = f"chr{chrom}" if not chrom.startswith("chr") else chrom
 
@@ -318,13 +324,6 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
                 "tss": row["tss"],
                 "sample_id": sample_id,
             }
-
-
-def get_total_output_rows(input_path: Path, personalized: bool, num_individuals: int) -> int:
-    num_rows = count_rows_csv(input_path)
-    if not personalized:
-        return num_rows
-    return count_autosomal_rows_csv(input_path) * num_individuals
 
 
 def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: int = 0, sample_seed: int = 42, checkpoint_every: int = 1000) -> None:
@@ -396,7 +395,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
                     skip_within_expanded_row=skip_within_expanded_row,
                 )
             else:
-                row_iter = iter_rows_csv(data_path, skip_rows=start_idx)
+                row_iter = iter_autosomal_rows_csv(data_path, skip_rows=start_idx)
 
             checkpoint_path = output_path.with_suffix(".checkpoint.json")
 
