@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from bed_reader import open_bed
 from tqdm import tqdm
 
@@ -223,6 +222,7 @@ def predict_cell_type_distributed(
     model: dict[str, Any],
     input_dir: Path,
     sample_ids: np.ndarray,
+    out_path: Path,
     n_producers: int,
     batch_size: int,
     num_slots: int,
@@ -232,7 +232,7 @@ def predict_cell_type_distributed(
     use_gpu: bool,
     log_dir: Path | None,
     log_level: int,
-) -> pd.DataFrame:
+) -> None:
     n_samples  = len(sample_ids)
     gene_items = list(model.items())
 
@@ -316,6 +316,8 @@ def predict_cell_type_distributed(
                 "batch_size": batch_size,
                 "n_samples": n_samples,
                 "n_genes": len(gene_items),
+                "sample_ids": sample_ids.tolist(),
+                "out_path": str(out_path),
                 "use_gpu": use_gpu,
                 "geno_shm_names": geno_shm_names,
                 "coef_shm_names": coef_shm_names,
@@ -342,18 +344,8 @@ def predict_cell_type_distributed(
         if failed:
             names = ", ".join(f"{proc.name}(exitcode={proc.exitcode})" for proc in failed)
             raise RuntimeError(f"One or more worker processes failed: {names}")
-
         if result.get("type") == "error":
             raise RuntimeError(f"Consumer failed: {result.get('message')}")
-
-        predictions        = result["predictions"]
-        pred_df            = pd.DataFrame(predictions, index=sample_ids)
-        pred_df.index.name = "sample_id"
-
-        ordered_cols = [gene for gene, _ in gene_items if gene in pred_df.columns]
-        pred_df      = pred_df.reindex(columns=ordered_cols)
-
-        return pred_df
 
     finally:
         cleanup_shared_slot_pool(geno_shms, coef_shms)
@@ -396,13 +388,17 @@ def main() -> None:
 
         with open(args.model_dir / ct_file, "r") as f:
             model = json.load(f)
+        
+        out_path = args.output_dir / f"{ct_name}.predictions.tsv.gz"
+        LOGGER.info("Streaming predictions to %s", out_path)
 
         start = time.time()
 
-        pred_df = predict_cell_type_distributed(
+        predict_cell_type_distributed(
             model=model,
             input_dir=args.input_dir,
             sample_ids=sample_ids,
+            out_path=out_path,
             n_producers=args.n_producers,
             batch_size=args.batch_size,
             num_slots=num_slots,
@@ -417,10 +413,6 @@ def main() -> None:
         end = time.time()
         elapsed = end - start
         LOGGER.info("Finished predictions for %s in %.2f seconds", ct_name, elapsed)
-
-        out_path = args.output_dir / f"{ct_name}.predictions.tsv.gz"
-        LOGGER.info("Saving predictions to %s", out_path)
-        pred_df.to_csv(out_path, sep="\t", compression="gzip")
         LOGGER.info("Saved predictions for %s to %s", ct_name, out_path)
 
     LOGGER.info("Done.")

@@ -7,6 +7,7 @@ from pathlib import Path
 from queue import Empty
 from typing import Any
 
+import gzip
 import numpy as np
 import torch
 
@@ -28,6 +29,11 @@ def setup_worker_logging(log_path: Path, level: int = logging.INFO) -> None:
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
+
+
+def _write_gene_row(handle, gene: str, pred: np.ndarray) -> None:
+    values = "\t".join(map(str, pred.tolist()))
+    handle.write(f"{gene}\t{values}\n")
 
 
 def _open_shared_slot_buffers(
@@ -163,6 +169,8 @@ def consumer_main(
     batch_size: int,
     n_samples: int,
     n_genes: int,
+    sample_ids: list[str],
+    out_path: str,
     use_gpu: bool,
     geno_shm_names: list[str],
     coef_shm_names: list[str],
@@ -175,7 +183,6 @@ def consumer_main(
         setup_worker_logging(Path(log_dir) / "consumer.log", level=log_level)
 
     producer_done = 0
-    predictions: dict[str, np.ndarray] = {}
 
     geno_shms: list[SharedMemory] = []
     coef_shms: list[SharedMemory] = []
@@ -194,91 +201,85 @@ def consumer_main(
             coef_capacity_floats=coef_capacity_floats,
         )
 
-        while True:
-            descriptors: list[dict[str, Any]] = []
-            num_collected_genes = 0
+        with gzip.open(out_path, mode="wt", compresslevel=1) as out_f:
+            out_f.write("gene\t" + "\t".join(sample_ids) + "\n")
 
-            while num_collected_genes < batch_size:
-                if producer_done >= n_producers:
-                    try:
-                        item = ready_queue.get_nowait()
-                    except Empty:
-                        break
-                else:
-                    try:
-                        item = ready_queue.get(timeout=1.0)
-                    except Empty:
+            while True:
+                descriptors: list[dict[str, Any]] = []
+                num_collected_genes = 0
+
+                while num_collected_genes < batch_size:
+                    if producer_done >= n_producers:
+                        try:
+                            item = ready_queue.get_nowait()
+                        except Empty:
+                            break
+                    else:
+                        try:
+                            item = ready_queue.get(timeout=1.0)
+                        except Empty:
+                            continue
+
+                    if item.get("type") == "producer_done":
+                        producer_done += 1
+                        LOGGER.info(
+                            "Received completion from producer %s (%d/%d)",
+                            item.get("producer_id"),
+                            producer_done,
+                            n_producers,
+                        )
                         continue
 
-                if item.get("type") == "producer_done":
-                    producer_done += 1
-                    LOGGER.info(
-                        "Received completion from producer %s (%d/%d)",
-                        item.get("producer_id"),
-                        producer_done,
-                        n_producers,
-                    )
-                    continue
+                    if item.get("type") == "error":
+                        raise RuntimeError(f"Producer {item.get('producer_id')} failed: {item.get('message')}")
 
-                if item.get("type") == "error":
-                    raise RuntimeError(f"Producer {item.get('producer_id')} failed: {item.get('message')}")
-                
-                descriptors.append(item)
-                num_collected_genes += len(item.get("gene_names", []))
+                    descriptors.append(item)
+                    num_collected_genes += len(item.get("gene_names", []))
 
-                LOGGER.debug(
-                    "Received descriptor for slot %s with %d genes (producer %s)",
-                    item.get("slot_id"),
-                    len(item.get("gene_names", [])),
-                    item.get("producer_id"),
-                )
+                if descriptors:
+                    active_items: list[dict[str, Any]] = []
+                    immediate_results: dict[str, np.ndarray] = {}
 
-            if descriptors:
-                active_items: list[dict[str, Any]]       = []
-                immediate_results: dict[str, np.ndarray] = {}
-
-                for descriptor in descriptors:
-                    slot_active, slot_immediate = _build_gene_views_from_descriptor(
-                        descriptor=descriptor,
-                        geno_views=geno_views,
-                        coef_views=coef_views,
-                        n_samples=n_samples,
-                    )
-                    active_items.extend(slot_active)
-                    immediate_results.update(slot_immediate)
-
-                predictions.update(immediate_results)
-
-                if active_items:
-                    LOGGER.debug(
-                        "Consumer processing %d shared-slot descriptors containing %d active genes",
-                        len(descriptors),
-                        len(active_items),
-                    )
-                    if gpu_enabled:
-                        batch_preds = _predict_active_batch_gpu(
-                            active_items=active_items,
-                            n_samples=n_samples
+                    for descriptor in descriptors:
+                        slot_active, slot_immediate = _build_gene_views_from_descriptor(
+                            descriptor=descriptor,
+                            geno_views=geno_views,
+                            coef_views=coef_views,
+                            n_samples=n_samples,
                         )
-                    else:
-                        batch_preds = _predict_active_batch_cpu(active_items=active_items)
-                    predictions.update(batch_preds)
+                        active_items.extend(slot_active)
+                        immediate_results.update(slot_immediate)
 
-                    total_genes_processed += len(active_items)
-                    LOGGER.info(
-                        "UPDATE: Total genes processed: %d / %d)",
-                        total_genes_processed,
-                        n_genes
-                    )
+                    for gene, pred in immediate_results.items():
+                        _write_gene_row(out_f, gene, pred)
 
-                for descriptor in descriptors:
-                    free_slot_queue.put(int(descriptor["slot_id"]))
+                    if active_items:
+                        if gpu_enabled:
+                            batch_preds = _predict_active_batch_gpu(
+                                active_items=active_items,
+                                n_samples=n_samples
+                            )
+                        else:
+                            batch_preds = _predict_active_batch_cpu(active_items=active_items)
 
-            if producer_done >= n_producers and not descriptors:
-                break
+                        for gene, pred in batch_preds.items():
+                            _write_gene_row(out_f, gene, pred)
 
-        LOGGER.info("Consumer finished successfully with %d predicted genes", len(predictions))
-        result_queue.put({"type": "predictions", "predictions": predictions})
+                        total_genes_processed += len(active_items)
+                        LOGGER.info(
+                            "UPDATE: Total genes processed: %d / %d",
+                            total_genes_processed,
+                            n_genes
+                        )
+
+                    for descriptor in descriptors:
+                        free_slot_queue.put(int(descriptor["slot_id"]))
+
+                if producer_done >= n_producers and not descriptors:
+                    break
+
+        LOGGER.info("Consumer finished successfully")
+        result_queue.put({"type": "done"})
 
     except Exception as exc:
         LOGGER.exception("Consumer failed")
