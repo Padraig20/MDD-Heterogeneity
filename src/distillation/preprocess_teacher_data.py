@@ -1,4 +1,3 @@
-import os
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -59,10 +58,10 @@ def preprocess(chroms, ensids, tss, sample_ids, features, output_dir):
 def main() -> None:
     args = parse_args()
 
-    chroms = np.load(f"{args.input_prefix}.chroms.npy", allow_pickle=True)
-    ensids = np.load(f"{args.input_prefix}.ensids.npy", allow_pickle=True)
+    chroms     = np.load(f"{args.input_prefix}.chroms.npy", allow_pickle=True)
+    ensids     = np.load(f"{args.input_prefix}.ensids.npy", allow_pickle=True)
     sample_ids = np.load(f"{args.input_prefix}.sample_ids.npy", allow_pickle=True)
-    tss = np.load(f"{args.input_prefix}.tss.npy", allow_pickle=True)
+    tss        = np.load(f"{args.input_prefix}.tss.npy", allow_pickle=True)
 
     # Memory-mapped read for large array
     features = np.load(
