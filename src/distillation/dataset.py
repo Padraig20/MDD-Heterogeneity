@@ -27,7 +27,17 @@ and are nicely put into a dict with keys according to their chromosome (e.g. "ch
 
 class GenotypeDataset(Dataset):
     
-    def __init__(self, bims: dict[str], idx2ind: dict[np.ndarray], y: Path | pd.DataFrame, bim_dir: str = "", window_size=1_000_000, select_genes: Path | None = None, normalize: str = "log"):
+    def __init__(
+        self,
+        bims: dict[str],
+        idx2ind: dict[np.ndarray],
+        y: Path | pd.DataFrame,
+        bim_dir: str = "",
+        window_size=1_000_000,
+        select_genes: Path | None = None,
+        normalize: str = "log",
+        max_individuals: int | None = None,
+    ):
         """
         Args:
             bims (dict[str]):             Dictionary of BIM files indexed by chromosome.
@@ -37,6 +47,7 @@ class GenotypeDataset(Dataset):
             window_size (int):            Size of the genomic window to consider around each TSS.
             select_genes (Path | None):   Path to a file containing a list of genes to select. If None, use all genes.
             normalize (str):              Normalization method for expression values. Options are "log" or "percentiles".
+            max_individuals (int | None):  Maximum number of individuals to use. If None, use all individuals.
         """
         self.bims         = bims
         self.bim_dir      = bim_dir
@@ -44,6 +55,7 @@ class GenotypeDataset(Dataset):
         self.window_size  = window_size
         self.select_genes = select_genes
         self.normalize    = normalize
+        self.max_individuals = max_individuals
         if isinstance(y, Path) or isinstance(y, str):
             self.y    = pd.read_csv(y)
         else:
@@ -53,6 +65,11 @@ class GenotypeDataset(Dataset):
         # we will denormalize this to have one row per gene-individual pair
         # with columns: gene, chrom, tss, individual, expression
         if "individual" not in self.y.columns:
+            if self.max_individuals is not None:
+                metadata_cols = ["gene", "chrom", "tss"]
+                individual_cols = [col for col in self.y.columns if col not in metadata_cols]
+                keep_cols = metadata_cols + individual_cols[:self.max_individuals]
+                self.y = self.y.loc[:, keep_cols].copy()
             self.y = self.y.melt(id_vars=["gene", "chrom", "tss"], var_name="individual", value_name="expression")
             if self.normalize == "percentiles":
                 self.y = self.to_percentiles(self.y)
@@ -60,6 +77,9 @@ class GenotypeDataset(Dataset):
                 self.y["expression"] = np.log1p(self.y["expression"])
             else:
                 raise ValueError(f"Invalid normalization method: {self.normalize}")
+        elif self.max_individuals is not None:
+            selected_individuals = self.y["individual"].drop_duplicates().head(self.max_individuals)
+            self.y = self.y[self.y["individual"].isin(selected_individuals)].copy()
         
         # get all different genes
         self.genes = self.y["gene"].unique()
@@ -77,6 +97,35 @@ class GenotypeDataset(Dataset):
             self.genes = np.array([g for g in self.genes if g in selected_genes])
             self.y     = self.y[self.y["gene"].isin(selected_genes)].copy()
 
+        # Build per-chromosome and per-gene caches so that get_gene_matrix is
+        # O(log M + W) instead of repeating O(N) scans / dict builds per call.
+        self._build_caches()
+
+    def _build_caches(self) -> None:
+        # Per-chromosome: sorted bp array (BIM files from plink are bp-sorted by
+        # chrom), snp id array, individual->row dict.
+        self._chrom_bps: dict[str, np.ndarray] = {}
+        self._chrom_snp_ids: dict[str, np.ndarray] = {}
+        for chrom, bim in self.bims.items():
+            self._chrom_bps[chrom] = bim["bp"].to_numpy()
+            self._chrom_snp_ids[chrom] = bim["snp"].astype(str).to_numpy()
+
+        self._ind_to_idx: dict[str, dict[str, int]] = {}
+        for chrom, ind_arr in self.idx2ind.items():
+            ind_str = np.asarray(ind_arr).astype(str)
+            self._ind_to_idx[chrom] = {ind: i for i, ind in enumerate(ind_str)}
+
+        # Per-gene: metadata + the row-individuals/expression vectors.
+        self._gene_meta: dict[str, tuple[str, int, np.ndarray, np.ndarray]] = {}
+        if "gene" in self.y.columns and len(self.y) > 0:
+            for gene, group in self.y.groupby("gene", sort=False):
+                self._gene_meta[gene] = (
+                    str(group["chrom"].iloc[0]),
+                    int(group["tss"].iloc[0]),
+                    group["individual"].astype(str).to_numpy(),
+                    group["expression"].to_numpy(),
+                )
+
     @staticmethod
     def to_percentiles(y_df: pd.DataFrame) -> pd.DataFrame:
         """Convert expression values to percentiles separately for each gene, ranking across individuals."""
@@ -93,7 +142,16 @@ class GenotypeDataset(Dataset):
         y_filtered       = self.y[self.y["chrom"].astype(str).isin(chroms)].copy()
         bims_filtered    = {chrom: bim for chrom, bim in self.bims.items() if chrom in chroms}
         idx2ind_filtered = {chrom: idx2ind for chrom, idx2ind in self.idx2ind.items() if chrom in chroms}
-        return GenotypeDataset(bims_filtered, idx2ind_filtered, y_filtered, bim_dir=self.bim_dir, window_size=self.window_size, select_genes=self.select_genes)
+        return GenotypeDataset(
+            bims_filtered,
+            idx2ind_filtered,
+            y_filtered,
+            bim_dir=self.bim_dir,
+            window_size=self.window_size,
+            select_genes=self.select_genes,
+            normalize=self.normalize,
+            max_individuals=self.max_individuals,
+        )
     
     def __len__(self) -> int:
         return len(self.y)
@@ -124,47 +182,54 @@ class GenotypeDataset(Dataset):
 
         return x, y
     
-    def get_gene_matrix(self, gene: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def get_gene_matrix(self, gene: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
         """
         Build the full design matrix for one gene.
-        Good for LR - we model genes and cell-types separately... unhappy :(
-        We train one row of the whole weight matrix of the LR.
+
+        Uses pre-built caches from `_build_caches`:
+        - per-chromosome sorted bp + searchsorted for the cis window (O(log M))
+        - per-chromosome individual -> BED row dict (O(1) lookup)
+        - per-gene (chrom, tss, individuals, expression) tuple (O(1) lookup)
 
         Returns:
             X       : shape (n_individuals_for_gene, n_snps_in_window)
             y       : shape (n_individuals_for_gene,)
             snp_ids : shape (n_snps_in_window,)
+            chrom   : chromosome name
         """
-        gene_data  = self.y[self.y["gene"] == gene]
-        if len(gene_data) == 0:
+        meta = self._gene_meta.get(gene)
+        if meta is None:
             raise ValueError(f"No data found for gene {gene}")
-        chrom      = str(gene_data["chrom"].iloc[0])
-        tss        = gene_data["tss"].iloc[0]
+        chrom, tss, row_individuals, y = meta
 
-        # find window in BIM file for this chrom that contains tss
-        bim     = self.bims[chrom]
-        start   = tss - self.window_size
-        end     = tss + self.window_size
+        # Cis window via sorted-bp searchsorted (BIM is bp-sorted by chrom in plink output).
+        bps      = self._chrom_bps[chrom]
+        all_snps = self._chrom_snp_ids[chrom]
+        start    = tss - self.window_size
+        end      = tss + self.window_size
+        left     = int(np.searchsorted(bps, start, side="left"))
+        right    = int(np.searchsorted(bps, end,   side="right"))
+        var_idx  = np.arange(left, right, dtype=np.int64)
+        snp_ids  = all_snps[left:right]
 
-        mask    = (bim["chrom"] == chrom) & (bim["bp"] >= start) & (bim["bp"] <= end)
-        var_idx = np.flatnonzero(mask.to_numpy())
-        snp_ids = bim.loc[mask, "snp"].astype(str).to_numpy()
+        # Map individuals to BED/FAM row indices via cached dict.
+        ind_to_idx = self._ind_to_idx[chrom]
+        individual_idx = np.fromiter(
+            (ind_to_idx.get(ind, -1) for ind in row_individuals),
+            dtype=np.int64,
+            count=len(row_individuals),
+        )
+        keep = individual_idx >= 0
+        if not keep.all():
+            individual_idx = individual_idx[keep]
+            y = y[keep]
 
-        fam_order_ids   = self.idx2ind[chrom].astype(str)
-        row_individuals = gene_data["individual"].astype(str).to_numpy()
-        ind_to_idx      = {ind: i for i, ind in enumerate(fam_order_ids)} # individuals to BED/FAM row indices
-
-        # which individuals do we keep?
-        keep_mask = np.array([ind in ind_to_idx for ind in row_individuals], dtype=bool)
-        if not np.all(keep_mask):
-            gene_data = gene_data.loc[keep_mask].copy()
-            row_individuals = gene_data["individual"].astype(str).to_numpy()
-        individual_idx = np.array([ind_to_idx[ind] for ind in row_individuals], dtype=int)
-
-        with open_bed(os.path.join(self.bim_dir, f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic.bed")) as bed:
+        bed_path = os.path.join(
+            self.bim_dir,
+            f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic.bed",
+        )
+        with open_bed(bed_path) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
-
-        y = gene_data["expression"].to_numpy()
 
         return X, y, snp_ids, chrom
 

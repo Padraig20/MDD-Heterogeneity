@@ -1,12 +1,15 @@
 import json
-import numpy as np
-import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Optional
-from sklearn.linear_model import ElasticNetCV
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import RidgeCV
+from threadpoolctl import threadpool_limits
+from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.utils import ld_prune
@@ -43,16 +46,21 @@ class LR:
         alphas: int     = 100,
         max_iter: int   = 10000,
         seed: int       = 42,
+        n_jobs: int     = 1,
     ):
         self.l1_ratio   = l1_ratio
         self.cv         = cv
         self.alphas     = alphas
         self.max_iter   = max_iter
         self.seed       = seed
+        self.n_jobs     = n_jobs
         self.model_name = model_name
         self.models_: Dict[str, LRStruct] = {}
 
     def _make_model(self):
+        # Inner CV is small (e.g. cv=3, alphas=5), so spawning a joblib pool per
+        # ENCV.fit usually costs more than it saves. Outer parallelism over
+        # genes (see fit_dataset) does the heavy lifting instead.
         if self.model_name == "ridge":
             return RidgeCV(
                 cv=self.cv,
@@ -69,7 +77,7 @@ class LR:
                 max_iter=self.max_iter,
                 fit_intercept=True,
                 random_state=self.seed,
-                n_jobs=-1,
+                n_jobs=1,
             )
         else:
             raise ValueError(f"Unknown model name: {self.model_name}")
@@ -125,24 +133,56 @@ class LR:
         X, y, snp_ids, chr = dataset.get_gene_matrix(gene)
         return self.fit_gene_matrix(gene, X, y, snp_ids, chr)
 
+    def _fit_one(
+        self,
+        dataset: GenotypeDataset,
+        gene: str,
+        i: int,
+        n: int,
+        verbose: bool,
+    ) -> Optional[LRStruct]:
+        try:
+            model = self.fit_gene_from_dataset(dataset, gene)
+            if verbose:
+                nnz = int(np.sum(model.coef_ != 0))
+                print(
+                    f"[{i}/{n}] fit {gene}: "
+                    f"nonzero={nnz}, r2={model.train_r2_:.4f}"
+                )
+            return model
+        except Exception as e:
+            if verbose:
+                print(f"[{i}/{n}] skip {gene}: {e}")
+            return None
+
     def fit_dataset(
         self,
         dataset: GenotypeDataset,
         verbose: bool = True,
     ) -> Dict[str, LRStruct]:
-        for i, gene in enumerate(dataset.genes, start=1):
-            try:
-                model = self.fit_gene_from_dataset(dataset, gene)
+        genes = list(dataset.genes)
+        n     = len(genes)
+        n_jobs = max(1, int(self.n_jobs))
 
-                if verbose:
-                    nnz = int(np.sum(model.coef_ != 0))
-                    print(
-                        f"[{i}/{len(dataset.genes)}] fit {gene}: "
-                        f"nonzero={nnz}, r2={model.train_r2_:.4f}"
-                    )
-            except Exception as e:
-                if verbose:
-                    print(f"[{i}/{len(dataset.genes)}] skip {gene}: {e}")
+        if n_jobs == 1:
+            for i, gene in enumerate(genes, start=1):
+                self._fit_one(dataset, gene, i, n, verbose)
+            return self.models_
+
+        # Parallel path: thread pool over genes with BLAS pinned to 1 thread per
+        # call. sklearn's coordinate descent releases the GIL, so threads scale
+        # well, and capping BLAS prevents N x M thread oversubscription.
+        with threadpool_limits(limits=1):
+            with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+                futures = {
+                    ex.submit(self._fit_one, dataset, gene, i, n, verbose): gene
+                    for i, gene in enumerate(genes, start=1)
+                }
+                iterator = as_completed(futures)
+                if not verbose:
+                    iterator = tqdm(iterator, total=len(futures), desc="Fitting genes", leave=False)
+                for fut in iterator:
+                    fut.result()
 
         return self.models_
 

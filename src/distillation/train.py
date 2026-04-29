@@ -6,7 +6,6 @@ from pathlib import Path
 import os
 import numpy as np
 import pandas as pd
-import tqdm
 from tqdm import tqdm
 
 from src.distillation.models.lr import LR
@@ -93,6 +92,21 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Random seed for splitting the data."
     )
+    parser.add_argument(
+        "-j", "--jobs",
+        type=int,
+        default=os.cpu_count() or 1,
+        help=(
+            "Number of parallel workers used per cell type to fit genes in "
+            "parallel. Defaults to the number of CPUs."
+        ),
+    )
+    parser.add_argument(
+        "-ni", "--max-individuals",
+        type=int,
+        default=None,
+        help="Maximum number of individuals to use for training. Defaults to all individuals.",
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -117,18 +131,19 @@ def main() -> None:
 
     all_chromosomes = [str(c) for c in range(1, 23)]
 
-    bims    = {}
+    bims = {}
     idx2ind = {}
 
     for chrom in all_chromosomes:
         chrom_name = f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
-        if not os.path.exists(os.path.join(args.observations, f"{chrom_name}.bim")) or \
-           not os.path.exists(os.path.join(args.observations, f"{chrom_name}.fam")):
+        bim_path = os.path.join(args.observations, f"{chrom_name}.bim")
+        fam_path = os.path.join(args.observations, f"{chrom_name}.fam")
+        if not os.path.exists(bim_path) or not os.path.exists(fam_path):
             logging.warning(f"Missing genotype data for {chrom}. Aborting! :(")
             raise FileNotFoundError(f"Missing genotype data for {chrom} in {args.observations}")
 
         bim = pd.read_csv(
-            os.path.join(args.observations, f"{chrom_name}.bim"),
+            bim_path,
             sep=r"\s+",
             header=None,
             names=["chrom", "snp", "cm", "bp", "a1", "a2"],
@@ -136,7 +151,7 @@ def main() -> None:
         )
         
         idx2ind_arr = pd.read_csv(
-            os.path.join(args.observations, f"{chrom_name}.fam"),
+            fam_path,
             sep=r"\s+",
             header=None,
             usecols=[0, 1],
@@ -156,19 +171,34 @@ def main() -> None:
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
+    jobs = max(1, args.jobs)
+    logging.info("Fitting genes per cell type with %d parallel workers.", jobs)
+
     for ct_file in tqdm(cell_type_files, desc="Processing cell types"):
-        ct_name = ct_file[:-4] # remove .csv extension
-        logging.info(f"Processing cell type: {ct_name}")
+        ct_name = ct_file[:-4]  # remove .csv extension
+        logging.info("Processing cell type: %s", ct_name)
 
-        dataset = GenotypeDataset(bims=bims, idx2ind=idx2ind, y=os.path.join(args.targets,ct_file), bim_dir=args.observations, select_genes=args.select_genes, normalize=args.norm_targets)
-        dataset = dataset.split_by_chromosome(all_chromosomes) # filter to only autosomes
-        model   = LR(model_name=args.model_name, max_iter=args.max_iter, alphas=args.alphas, seed=args.seed)
-
+        dataset = GenotypeDataset(
+            bims=bims,
+            idx2ind=idx2ind,
+            y=os.path.join(args.targets, ct_file),
+            bim_dir=args.observations,
+            select_genes=args.select_genes,
+            normalize=args.norm_targets,
+            max_individuals=args.max_individuals,
+        )
+        model = LR(
+            model_name=args.model_name,
+            max_iter=args.max_iter,
+            alphas=args.alphas,
+            seed=args.seed,
+            n_jobs=jobs,
+        )
         model.fit_dataset(dataset, verbose=args.verbose > 0)
 
         if args.output_dir is not None:
             ct_path = ct_name.replace(" ", "_")
-            path    = os.path.join(args.output_dir, f"{ct_path}.json")
+            path = os.path.join(args.output_dir, f"{ct_path}.json")
             model.save_coefficients(path)
 
         df = model.summarize_models()
