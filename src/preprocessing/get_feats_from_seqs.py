@@ -28,7 +28,7 @@ Script that takes input from the human reference genome sequences we extracted
 earlier (around the TSS) and then extracts features from these sequences using
 some sort of gLM model. Here, we use e.g. Enformer via Hugging Face
 
-Optionally personalize each gene window using genotype VCFs, sampling N
+Optionally personalize each gene window using genotype VCFs, selecting
 individuals from the VCF headers and replacing SNPs in the sequence window.
 
 Note: only biallelic SNPs are substituted, and heterozygous genotypes are currently
@@ -94,18 +94,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--num-individuals",
-        type=int,
-        default=0,
+        type=str,
+        default="0",
         help=(
-            "Number of individuals to randomly sample from the VCF files when "
-            "--vcf-dir is provided."
+            "Individuals to use from the VCF files when --vcf-dir is provided. "
+            "Use an integer to randomly sample that many individuals, 'all' to "
+            "use every individual, or 'K/N' to process split K of N contiguous "
+            "splits from the VCF header order (1-based)."
         )
     )
     parser.add_argument(
         "--sample-seed",
         type=int,
         default=42,
-        help="Random seed for sampling individuals from the VCF header.",
+        help="Random seed for integer-based sampling from the VCF header.",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -213,13 +215,62 @@ def close_variant_files(chrom_to_vcf: Dict[str, "pysam.VariantFile"]) -> None:
             pass
 
 
-def sample_individual_ids(chrom_to_vcf: Dict[str, "pysam.VariantFile"], num_individuals: int, seed: int) -> List[str]:
+def split_contiguous(items: List[str], split_idx: int, total_splits: int) -> List[str]:
+    quotient, remainder = divmod(len(items), total_splits)
+    start = (split_idx - 1) * quotient + min(split_idx - 1, remainder)
+    stop = start + quotient + (1 if split_idx <= remainder else 0)
+    return items[start:stop]
+
+
+def sample_individual_ids(chrom_to_vcf: Dict[str, "pysam.VariantFile"], selection: str, seed: int) -> List[str]:
     first_vcf = next(iter(chrom_to_vcf.values()))
     samples   = list(first_vcf.header.samples)
-    rng       = random.Random(seed)
-    chosen    = rng.sample(samples, num_individuals)
-    logging.info("Sampled %d individuals from VCF headers.", len(chosen))
-    logging.debug("Sampled individuals: %s", chosen[:5])
+    selection = selection.strip().lower()
+
+    if selection == "all":
+        chosen = samples
+        logging.info("Selected all %d individuals from VCF headers.", len(chosen))
+    elif "/" in selection:
+        split_parts = selection.split("/")
+        if len(split_parts) != 2:
+            raise ValueError("--num-individuals split syntax must be K/N, e.g. 2/4.")
+        try:
+            split_idx = int(split_parts[0])
+            total_splits = int(split_parts[1])
+        except ValueError as exc:
+            raise ValueError("--num-individuals split syntax must use integer values, e.g. 2/4.") from exc
+        if total_splits <= 0:
+            raise ValueError("--num-individuals split total N must be greater than 0.")
+        if split_idx < 1 or split_idx > total_splits:
+            raise ValueError("--num-individuals split K must satisfy 1 <= K <= N.")
+
+        chosen = split_contiguous(samples, split_idx, total_splits)
+        logging.info(
+            "Selected split %d/%d with %d of %d VCF individuals.",
+            split_idx,
+            total_splits,
+            len(chosen),
+            len(samples),
+        )
+    else:
+        try:
+            num_individuals = int(selection)
+        except ValueError as exc:
+            raise ValueError("--num-individuals must be an integer, 'all', or K/N, e.g. 2/4.") from exc
+        if num_individuals <= 0:
+            raise ValueError("--num-individuals must select at least one individual when --vcf-dir is provided.")
+        if num_individuals > len(samples):
+            raise ValueError(
+                f"Requested {num_individuals} individuals, but VCF header only contains {len(samples)} samples."
+            )
+
+        rng    = random.Random(seed)
+        chosen = rng.sample(samples, num_individuals)
+        logging.info("Sampled %d individuals from VCF headers.", len(chosen))
+
+    if not chosen:
+        raise ValueError("--num-individuals selected zero individuals.")
+    logging.debug("Selected individuals: %s", chosen[:5])
     return chosen
 
 
@@ -324,7 +375,7 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
             }
 
 
-def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: int = 0, sample_seed: int = 42, checkpoint_every: int = 1000) -> None:
+def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000) -> None:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
 
@@ -349,7 +400,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
             total_rows = get_total_output_rows(
                 input_path=data_path,
                 personalized=personalized,
-                num_individuals=num_individuals if personalized else 0
+                num_individuals=len(sampled_ids) if personalized else 0
             )
             logging.info("Number of output sequences to process: %d", total_rows)
 
@@ -383,8 +434,9 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
 
             row_iter: Iterator[Dict[str, Any]]
             if personalized:
-                skip_input_rows = start_idx // num_individuals
-                skip_within_expanded_row = start_idx % num_individuals
+                num_selected_ids = len(sampled_ids)
+                skip_input_rows = start_idx // num_selected_ids
+                skip_within_expanded_row = start_idx % num_selected_ids
                 row_iter = iter_personalized_rows(
                     input_path=data_path,
                     chrom_to_vcf=chrom_to_vcf,
