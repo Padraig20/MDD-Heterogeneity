@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from src.training.dataset import MddDataset
+from src.training.dataset import MddDataset, MultiIndividualMddDataset
 from src.training.utils import get_train_test_dataset, EarlyStopping
 
 from src.training.models.mlp import MLPPredictor
@@ -41,13 +41,33 @@ def parse_args() -> argparse.Namespace:
         "-X", "--observations",
         type=Path,
         required=True,
-        help="Path to input observations files; type in only the common name of the files, i.e. without extension(s)."
+        help=(
+            "Either: (a) the common name (without extension) of a single-individual "
+            "observation set with sibling files <name>.features.npy, <name>.ensids.npy, "
+            "<name>.chroms.npy; or (b) a directory whose subdirectories are named after "
+            "individual IDs and each contain features.npy / ensids.npy / chroms.npy. "
+            "Detected automatically from whether the path is a directory."
+        )
     )
     parser.add_argument(
         "-y", "--targets",
         type=Path,
         required=True,
-        help="Path to the target file (csv)."
+        help=(
+            "Path to the target file. Either a CSV (single-individual targets, rows = "
+            "cell types, columns = ENSIDs) or a pseudo-bulk .h5ad produced by "
+            "get_ge_per_ind.py (multi-individual). Detected automatically from extension."
+        )
+    )
+    parser.add_argument(
+        "--cell-type",
+        type=str,
+        default=None,
+        help=(
+            "When using a multi-individual h5ad target, optionally restrict to a single "
+            "cell type label. Otherwise all cell types in obs are used (output_dim = "
+            "n_cell_types)."
+        )
     )
     parser.add_argument(
         "-m", "--model-name",
@@ -173,13 +193,29 @@ def main() -> None:
     setup_logging(args.verbose)
     logging.debug("Arguments: %s", args)
 
-    dataset = MddDataset(
-        X_feats=args.observations.with_suffix(".features.npy"),
-        X_ensids=args.observations.with_suffix(".ensids.npy"),
-        X_chroms=args.observations.with_suffix(".chroms.npy"),
-        y=args.targets,
-        normalize=args.norm_targets
-    )
+    if args.observations.is_dir() and args.targets.suffix == ".h5ad":
+        logging.info(
+            "Detected multi-individual setup: -X is a directory and -y is .h5ad. "
+            "Using MultiIndividualMddDataset."
+        )
+        dataset = MultiIndividualMddDataset(
+            X_dir=args.observations,
+            y=args.targets,
+            normalize=args.norm_targets,
+            cell_type=args.cell_type,
+        )
+    else:
+        if args.cell_type is not None:
+            logging.warning(
+                "--cell-type is only used with multi-individual h5ad targets; ignoring."
+            )
+        dataset = MddDataset(
+            X_feats=args.observations.with_suffix(".features.npy"),
+            X_ensids=args.observations.with_suffix(".ensids.npy"),
+            X_chroms=args.observations.with_suffix(".chroms.npy"),
+            y=args.targets,
+            normalize=args.norm_targets
+        )
 
     if args.select_genes is not None:
         selected_genes = set(pd.read_csv(args.select_genes, sep="\t")["ENSID"])
