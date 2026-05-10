@@ -166,8 +166,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-nt", "--norm-targets",
         type=str,
-        default="log",
-        choices=["log", "percentiles"],
+        default="none",
+        choices=["none", "log", "percentiles"],
         help="Normalization method for target labels."
     )
     parser.add_argument(
