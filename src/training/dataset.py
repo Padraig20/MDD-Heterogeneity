@@ -71,13 +71,12 @@ class MddDataset(Dataset):
 
     @staticmethod
     def to_percentiles(y_df: pd.DataFrame) -> pd.DataFrame:
-        """Convert each gene column to percentiles across rows, same as scPrediXcan."""
-        y_pct = pd.DataFrame(index=y_df.index, columns=y_df.columns, dtype=float)
-        for gene in y_df.columns:
-            values      = y_df[gene].to_numpy()
-            ranks       = rankdata(values, method="average")
-            y_pct[gene] = ranks / len(ranks)
-        return y_pct
+        """For each cell type (row), rank its genes by expression and divide
+        by n_genes to get percentiles in (0, 1] (scPrediXcan style).
+        """
+        n_genes = y_df.shape[1]
+        ranks = rankdata(y_df.values, method="average", axis=1)
+        return pd.DataFrame(ranks / n_genes, index=y_df.index, columns=y_df.columns)
     
     def __len__(self) -> int:
         return self.X_ensids.shape[0]
@@ -248,11 +247,12 @@ class MultiIndividualMddDataset(Dataset):
         y_tensor = y_tensor_full[:, :, y_idx_for_each_X].astype(np.float32, copy=False)
 
         if normalize == "percentiles":
-            # Per-(individual, gene), rank across cell types; same semantics as
-            # MddDataset.to_percentiles (rank along the row axis of the y CSV).
-            n_ct = y_tensor.shape[1]
-            ranks = rankdata(y_tensor, method="average", axis=1)
-            y_tensor = (ranks / n_ct).astype(np.float32, copy=False)
+            # Within each (individual, cell_type), rank genes by expression and
+            # divide by n_genes (scPrediXcan style; same direction as
+            # MddDataset.to_percentiles).
+            n_genes_y = y_tensor.shape[2]
+            ranks = rankdata(y_tensor, method="average", axis=2)
+            y_tensor = (ranks / n_genes_y).astype(np.float32, copy=False)
 
         self.gene_indices: np.ndarray = gene_indices
         self.X_ensids: np.ndarray = kept_ensids
