@@ -218,3 +218,7 @@ wandb/
 
 tools/
 GTEx-Brain
+
+plots
+
+*.png

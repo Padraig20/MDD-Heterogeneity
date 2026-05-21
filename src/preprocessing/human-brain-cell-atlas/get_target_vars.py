@@ -31,7 +31,10 @@ def parse_args() -> argparse.Namespace:
         "-o", "--output",
         type=Path,
         required=True,
-        help="Path to write output file (*.csv)."
+        help=(
+            "Path to write output file (*.csv). With --split-by-age, age-specific "
+            "files are written next to this path."
+        )
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -51,7 +54,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="If provided, path to MDD gene list (TSV) to filter target variables."
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--split-by-age",
+        default=False,
+        action="store_true",
+        help="If provided, split target variables by age group. Outputs one CSV per observed age group."
+    )
+    args = parser.parse_args()
+    if args.split_by_age and args.chromosome:
+        parser.error("--split-by-age is currently only supported without --chromosome.")
+    return args
 
 def setup_logging(verbosity: int) -> None:
     """Configure basic logging based on verbosity level."""
@@ -75,9 +87,28 @@ def simplify_chr(c: str) -> str | None:
         m = re.match(r"^(chr(?:\d+|X|Y))\b", c)
         return m.group(1) if m else None
 
-def prepare_target_vars(data: sc.AnnData, mdd_genes_path: Path | None, group_by_chromosome: bool = True) -> pd.DataFrame:
+def get_age(age_stage: str) -> int:
+    age_str = age_stage.split("-")[0]
+    return int(age_str)
+
+TargetVars = pd.DataFrame | dict[int, pd.DataFrame]
+
+def get_mean_expression(x) -> np.ndarray:
+    means = x.mean(axis=0)
+    return np.asarray(means).ravel()
+
+def collapse_duplicate_genes(Y: pd.DataFrame, gene_names: pd.Index) -> pd.DataFrame:
+    for g in gene_names.unique():
+        cols = np.where(gene_names == g)[0]
+        if len(cols) > 1: # collapse duplicate genes by averaging
+            Y[g] = Y.iloc[:, cols].mean(axis=1)
+    return Y
+
+def prepare_target_vars(data: sc.AnnData, mdd_genes_path: Path | None, group_by_chromosome: bool = True, split_by_age: bool = False) -> TargetVars:
     """Transform raw data into target variables."""
     logging.info("Preparing target variables")
+    if group_by_chromosome and split_by_age:
+        raise ValueError("split_by_age is currently only supported without group_by_chromosome.")
 
     cell_types = data.obs['supercluster_term'] # dim <= 461 for sc human brain atlas v1.0
     cell_types_unique = cell_types.unique().tolist()
@@ -119,33 +150,73 @@ def prepare_target_vars(data: sc.AnnData, mdd_genes_path: Path | None, group_by_
             idx_cells = np.where(cell_types == ct)[0]
             if idx_cells.size == 0:
                 continue
-            means = data.X[idx_cells].mean(axis=0).A1
+            means = get_mean_expression(data.X[idx_cells])
             mask_ch = (chromosome_names == ch).values
             row = np.full_like(means, 0, dtype=float)
             row[mask_ch] = means[mask_ch]
             Y.loc[ct_chr] = row
+        Y = collapse_duplicate_genes(Y, gene_names)
 
     else: # don't group by chromosome
-        Y = pd.DataFrame(
-            index=cell_types_unique,  # cell types
-            columns=gene_names,       # genes
-        )
-        for ct in Y.index:
-            idx = np.where(cell_types == ct)[0]
-            Y.loc[ct] = data.X[idx].mean(axis=0).A1
 
-    for g in gene_names_unique:
-        cols = np.where(gene_names == g)[0]
-        if len(cols) > 1: # collapse duplicate genes by averaging
-            Y[g] = Y.iloc[:, cols].mean(axis=1)
-    
-    logging.info("Prepared target variables with shape %s", Y.shape)
-    logging.debug("Target variables preview:\n%s", Y.head())
+        if split_by_age:
+            logging.info("Splitting target variables by age group")
+            ages = data.obs['development_stage'].apply(get_age)
+            age_groups = sorted(int(age) for age in ages.unique()) # 29, 42, 50, 60
+            Y = {}
+
+            for age_group in age_groups:
+                Y[age_group] = pd.DataFrame(
+                    index=cell_types_unique,
+                    columns=gene_names,
+                )
+                for ct in Y[age_group].index:
+                    idx_cells = np.where((cell_types == ct) & (ages == age_group))[0]
+                    if idx_cells.size == 0:
+                        continue
+                    Y[age_group].loc[ct] = get_mean_expression(data.X[idx_cells])
+                Y[age_group] = collapse_duplicate_genes(Y[age_group], gene_names)
+        else:
+            Y = pd.DataFrame(
+                index=cell_types_unique,  # cell types
+                columns=gene_names,       # genes
+            )
+            for ct in Y.index:
+                idx = np.where(cell_types == ct)[0]
+                Y.loc[ct] = get_mean_expression(data.X[idx])
+            Y = collapse_duplicate_genes(Y, gene_names)
+
+    if isinstance(Y, dict):
+        logging.info(
+            "Prepared target variables for %d age groups: %s",
+            len(Y),
+            {age_group: frame.shape for age_group, frame in Y.items()},
+        )
+        logging.debug(
+            "Target variables previews by age:\n%s",
+            "\n".join(
+                f"age {age_group}:\n{frame.head()}"
+                for age_group, frame in Y.items()
+            ),
+        )
+    else:
+        logging.info("Prepared target variables with shape %s", Y.shape)
+        logging.debug("Target variables preview:\n%s", Y.head())
 
     return Y
 
-def save_output(data: pd.DataFrame, output_path: Path) -> None:
+def age_output_path(output_path: Path, age_group: int) -> Path:
+    if output_path.suffix:
+        return output_path.with_name(f"{output_path.stem}_age_{age_group}{output_path.suffix}")
+    return output_path / f"age_{age_group}.csv"
+
+def save_output(data: TargetVars, output_path: Path) -> None:
     """Save processed data to `output_path`."""
+    if isinstance(data, dict):
+        for age_group, frame in sorted(data.items()):
+            save_output(frame, age_output_path(output_path, age_group))
+        return
+
     logging.info("Saving output to %s", output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     data.to_csv(output_path)
@@ -156,7 +227,7 @@ def main() -> None:
     logging.debug("Arguments: %s", args)
 
     data = load_data(args.input)
-    targets = prepare_target_vars(data, args.mdd_genes, args.chromosome)
+    targets = prepare_target_vars(data, args.mdd_genes, args.chromosome, args.split_by_age)
 
     save_output(targets, args.output)
     logging.info("Done.")
