@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 from enformer_pytorch import Enformer
 from numpy.lib.format import open_memmap
@@ -68,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         "-m", "--model-name",
         type=str,
         default="enformer",
-        choices=["enformer"],
+        choices=["enformer", "variantformer-pcg", "variantformer-ag"],
         help="Name of the model to use for feature extraction. List of available models will be expanded in the future."
     )
     parser.add_argument(
@@ -89,7 +90,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional directory containing chromosome-level VCF files "
-            "(e.g. chr1.vcf.gz ... chr22.vcf.gz). Omit if personalization not needed."
+            "(e.g. chr1.vcf.gz ... chr22.vcf.gz). Used for personalization by both "
+            "the 'enformer' (SNP substitution) and 'variantformer' (applied "
+            "internally per chromosome) backbones. Omit if personalization not needed."
+        )
+    )
+    parser.add_argument(
+        "-t", "--tissue",
+        type=str,
+        default=None,
+        help=(
+            "Tissue name to condition the embeddings on (required for the "
+            "'variantformer' backbone). Must be a tissue present in VariantFormer's "
+            "tissue vocabulary, e.g. 'brain - cortex' or 'liver'."
+        )
+    )
+    parser.add_argument(
+        "--variantformer-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the VariantFormer package directory (the folder containing "
+            "the 'processors', 'datasets' and 'configs' subpackages). Defaults to "
+            "'<repo-root>/variantformer'."
         )
     )
     parser.add_argument(
@@ -225,6 +248,24 @@ def split_contiguous(items: List[str], split_idx: int, total_splits: int) -> Lis
 def sample_individual_ids(chrom_to_vcf: Dict[str, "pysam.VariantFile"], selection: str, seed: int) -> List[str]:
     first_vcf = next(iter(chrom_to_vcf.values()))
     samples   = list(first_vcf.header.samples)
+    return select_individual_ids(samples, selection, seed)
+
+
+def get_vcf_samples(vcf_path: Path) -> List[str]:
+    """Read the sample/individual IDs from a single VCF header."""
+    vf = pysam.VariantFile(str(vcf_path))
+    try:
+        return list(vf.header.samples)
+    finally:
+        vf.close()
+
+
+def select_individual_ids(samples: List[str], selection: str, seed: int) -> List[str]:
+    """Select individuals from a list of VCF sample IDs.
+
+    Supports 'all', an integer count (randomly sampled), or a 'K/N' contiguous
+    split of the header order (1-based).
+    """
     selection = selection.strip().lower()
 
     if selection == "all":
@@ -375,9 +416,223 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
             }
 
 
-def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000) -> None:
+def _row_tss(row: Dict[str, Any]) -> Any:
+    """Best-effort extraction of a TSS-like value from a CSV row."""
+    for key in ("tss", "tss_start", "actual_start"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def extract_variantformer_features(
+    data_path: Path,
+    output_path: Path,
+    tissue: str,
+    vf_model_class: str = "v4_pcg",
+    vcf_dir: Optional[Path] = None,
+    num_individuals: str = "0",
+    sample_seed: int = 42,
+) -> None:
+    if tissue is None:
+        raise ValueError("--tissue is required when using the 'variantformer' backbone.")
+
+    from variantformer.processors.vcfprocessor import VCFProcessor # lazy import
+
+    logging.info("Initializing VariantFormer (model class: %s)", vf_model_class)
+    vcf_processor = VCFProcessor(model_class=vf_model_class)
+
+    available_tissues = set(vcf_processor.get_tissues())
+    if tissue not in available_tissues:
+        raise ValueError(
+            f"Tissue '{tissue}' is not in VariantFormer's tissue vocabulary. "
+            f"Available tissues include e.g.: {sorted(available_tissues)[:10]} ..."
+        )
+
+    # variantformer uses versioned ENSIDs, CSV may have unversioned ones...
+    genes_df = vcf_processor.get_genes()
+    base_to_gene_id: Dict[str, str] = {}
+    for gid in genes_df["gene_id"].astype(str):
+        base = gid.split(".")[0]
+        base_to_gene_id.setdefault(base, gid)
+
+    # all autosomal query genes from input CSV, de-duplicate on gene_id
+    gene_meta_by_id: Dict[str, Dict[str, Any]] = {}
+    ordered_gene_ids: List[str] = []
+    for row in iter_autosomal_rows_csv(data_path):
+        ensid = str(row["ensid"])
+        gene_id = base_to_gene_id.get(ensid.split(".")[0])
+        if gene_id is None:
+            logging.debug("ENSID %s not found in VariantFormer gencode; skipping.", ensid)
+            continue
+        if gene_id in gene_meta_by_id:
+            continue
+        gene_meta_by_id[gene_id] = {
+            "ensid": ensid,
+            "chrom": str(row.get("chrom")),
+            "tss": _row_tss(row),
+        }
+        ordered_gene_ids.append(gene_id)
+
+    if not ordered_gene_ids:
+        raise ValueError(
+            "None of the genes in the input CSV matched VariantFormer's gencode v24."
+        )
+    logging.info("Matched %d genes to VariantFormer's gencode.", len(ordered_gene_ids))
+
+    num_genes = len(ordered_gene_ids)
+    gene_row_offset = {gid: i for i, gid in enumerate(ordered_gene_ids)}
+
+    # group genes by chromosome
+    genes_by_chrom: Dict[str, List[str]] = {}
+    for gid in ordered_gene_ids:
+        genes_by_chrom.setdefault(gene_meta_by_id[gid]["chrom"], []).append(gid)
+
+    def build_query_df(gene_ids: List[str]) -> "pd.DataFrame":
+        return pd.DataFrame(
+            {"gene_id": gene_ids, "tissues": [tissue] * len(gene_ids)}
+        )
+
+    # specific individuals to process
+    personalized = vcf_dir is not None
+    if personalized:
+        header_vcf = None
+        for chrom in genes_by_chrom:
+            candidate = vcf_dir / f"chr{chrom}.vcf.gz"
+            if candidate.exists():
+                header_vcf = candidate
+                break
+        if header_vcf is None:
+            raise FileNotFoundError(
+                f"No chromosome VCFs (chrN.vcf.gz) found in {vcf_dir} for the query genes."
+            )
+        all_samples = get_vcf_samples(header_vcf)
+        sample_ids: List[Optional[str]] = list(
+            select_individual_ids(all_samples, num_individuals, sample_seed)
+        )
+        logging.info("Personalized mode: %d individuals from %s", len(sample_ids), vcf_dir)
+    else:
+        sample_ids = [None]
+        logging.info("Reference-sequence mode (no --vcf-dir provided).")
+
+    num_samples = len(sample_ids)
+
+    logging.info("Loading VariantFormer model and checkpoint...")
+    model, ckpt_path, trainer = vcf_processor.load_model()
+
+    feats_mm_path = output_path.with_suffix(".features.npy")
+    checkpoint_path = output_path.with_suffix(".checkpoint.json")
+
+    # resume if checkpoint exists
+    start_sample = 0
+    emb_dim: Optional[int] = None
+    ensids = chroms = tss = sample_ids_arr = gene_ids_arr = None
+    feats_mm = None
+
+    if checkpoint_path.exists():
+        with checkpoint_path.open("r", encoding="utf-8") as f:
+            cp = json.load(f)
+        start_sample = cp.get("sample_idx", 0)
+        emb_dim = cp.get("emb_dim")
+        ensids = np.load(output_path.with_suffix(".ensids.npy"), allow_pickle=True)
+        chroms = np.load(output_path.with_suffix(".chroms.npy"), allow_pickle=True)
+        tss = np.load(output_path.with_suffix(".tss.npy"), allow_pickle=True)
+        gene_ids_arr = np.load(output_path.with_suffix(".gene_ids.npy"), allow_pickle=True)
+        sample_ids_arr = np.load(output_path.with_suffix(".sample_ids.npy"), allow_pickle=True)
+        feats_mm = np.load(feats_mm_path, allow_pickle=True, mmap_mode="r+")
+        logging.info("Resuming VariantFormer extraction from individual %d/%d", start_sample, num_samples)
+
+    def allocate_outputs(dim: int) -> None:
+        nonlocal feats_mm, ensids, chroms, tss, gene_ids_arr, sample_ids_arr
+        total_rows = num_genes * num_samples
+        logging.info(
+            "Allocating output: %d genes x %d individuals = %d rows of dim %d",
+            num_genes, num_samples, total_rows, dim,
+        )
+        ensids = np.empty(total_rows, dtype=object)
+        chroms = np.empty(total_rows, dtype=object)
+        tss = np.empty(total_rows, dtype=object)
+        gene_ids_arr = np.empty(total_rows, dtype=object)
+        sample_ids_arr = np.empty(total_rows, dtype=object)
+        feats_mm = open_memmap(feats_mm_path, mode="w+", dtype=np.float32, shape=(total_rows, dim))
+
+    def write_predictions(pred_df: "pd.DataFrame", s_idx: int, sample: Optional[str]) -> None:
+        nonlocal emb_dim
+        if feats_mm is None:
+            emb_dim = int(np.asarray(pred_df.iloc[0]["embeddings"], dtype=np.float32).reshape(-1).shape[0])
+            allocate_outputs(emb_dim)
+        base = s_idx * num_genes
+        for _, prow in pred_df.iterrows():
+            gene_id = prow["gene_id"]
+            meta = gene_meta_by_id.get(gene_id, {})
+            idx = base + gene_row_offset[gene_id]
+            feats_mm[idx, :] = np.asarray(prow["embeddings"], dtype=np.float32).reshape(-1)
+            ensids[idx] = meta.get("ensid", gene_id)
+            chroms[idx] = meta.get("chrom")
+            tss[idx] = meta.get("tss", "")
+            gene_ids_arr[idx] = gene_id
+            sample_ids_arr[idx] = sample
+
+    for s_idx in range(start_sample, num_samples):
+        sample = sample_ids[s_idx]
+        sample_label = sample if sample is not None else "REFERENCE"
+        logging.info("Processing individual %d/%d: %s", s_idx + 1, num_samples, sample_label)
+
+        if personalized:
+            # one prediction pass per chromosome!
+            for chrom, gene_ids in genes_by_chrom.items():
+                chrom_vcf = vcf_dir / f"chr{chrom}.vcf.gz"
+                if not chrom_vcf.exists():
+                    logging.warning("Missing %s; skipping %d genes on chr%s.", chrom_vcf, len(gene_ids), chrom)
+                    continue
+                logging.info("  chr%s: %d genes", chrom, len(gene_ids))
+                vcf_dataset, dataloader = vcf_processor.create_data(
+                    str(chrom_vcf), build_query_df(gene_ids), sample_ids=[sample]
+                )
+                pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
+                write_predictions(pred_df, s_idx, sample)
+        else:
+            vcf_dataset, dataloader = vcf_processor.create_data(
+                None, build_query_df(ordered_gene_ids), sample_ids=None
+            )
+            pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
+            write_predictions(pred_df, s_idx, sample)
+
+        # checkpoint after each individual
+        feats_mm.flush()
+        np.save(output_path.with_suffix(".ensids.npy"), ensids)
+        np.save(output_path.with_suffix(".chroms.npy"), chroms)
+        np.save(output_path.with_suffix(".tss.npy"), tss)
+        np.save(output_path.with_suffix(".gene_ids.npy"), gene_ids_arr)
+        np.save(output_path.with_suffix(".sample_ids.npy"), sample_ids_arr)
+        tmp_ckpt = checkpoint_path.with_suffix(".tmp")
+        with tmp_ckpt.open("w", encoding="utf-8") as f:
+            json.dump({"sample_idx": s_idx + 1, "num_genes": num_genes, "emb_dim": emb_dim}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_ckpt.replace(checkpoint_path)
+        logging.info("Checkpoint saved after individual %d/%d", s_idx + 1, num_samples)
+
+    if feats_mm is not None:
+        feats_mm.flush()
+    logging.info("VariantFormer embeddings successfully extracted to %s", feats_mm_path)
+
+
+def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000, tissue: Optional[str] = None, vf_model_class: str = "v4_pcg") -> None:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
+
+    if "variantformer" in model_name:
+        extract_variantformer_features(
+            data_path=data_path,
+            output_path=output_path,
+            tissue=tissue,
+            vf_model_class=vf_model_class,
+            vcf_dir=vcf_dir,
+            num_individuals=num_individuals,
+            sample_seed=sample_seed,
+        )
+        return
 
     personalized = vcf_dir is not None
     chrom_to_vcf: Dict[str, pysam.VariantFile] = {}
@@ -532,6 +787,8 @@ def main() -> None:
         num_individuals=args.num_individuals,
         sample_seed=args.sample_seed,
         checkpoint_every=args.checkpoint_every,
+        tissue=args.tissue,
+        vf_model_class="v4_pcg" if args.model_name == "variantformer-pcg" else "v4_ag",
     )
 
     logging.info("Done.")
