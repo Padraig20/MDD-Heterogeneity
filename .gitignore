@@ -222,3 +222,5 @@ GTEx-Brain
 plots
 
 *.png
+
+.tmp

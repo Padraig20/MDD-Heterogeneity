@@ -310,8 +310,6 @@ def evaluate_ensemble_model(
         f"{mode}/pearson_cells": 0.0,
         f"{mode}/pearson_genes": 0.0,
         f"{mode}/pearson": 0.0,
-        f"{mode}/total_uncertainty_cells": 0.0,
-        f"{mode}/total_uncertainty_genes": 0.0,
         f"{mode}/aleatoric": 0.0, # should theoretically stay consistent
         f"{mode}/epistemic": 0.0  # should theoretically go down with training
     }
