@@ -647,7 +647,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
             logging.info("Running in reference-sequence mode.")
 
         if model_name == "enformer":
-            model = Enformer.from_pretrained("EleutherAI/enformer-official-rough", dtype="auto").to(device)
+            model = Enformer.from_pretrained("EleutherAI/enformer-official-rough").to(device)
             model.eval()
 
             feats_mm_path = output_path.with_suffix(".features.npy")
