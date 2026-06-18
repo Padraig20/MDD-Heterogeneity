@@ -3,8 +3,18 @@ Custom Metrics to get the Pearson Correlation Coefficient per cell and per gene.
 Idea adapted from seq2cells:
 https://github.com/GSK-AI/seq2cells/blob/main/seq2cells/metrics_and_losses/metrics.py
 
-Furthermore, we keep track of the mean predicted uncertainty per cell and per gene.
+Furthermore, we keep track of the mean predicted uncertainty. We also keep track of
+the Expected Normalized Calibration Error (ENCE) and Spearman rank correlation between
+predicted uncertainty and observed squared error. We also produce a boxplot of
+MSE vs predicted uncertainty quantiles.
+Idea(s) adapted from:
+"Evaluating and Calibrating Uncertainty Prediction in Regression Tasks" (2020)
 """
+
+import matplotlib
+matplotlib.use("Agg")  # headless backend; we only render figures to log them
+import matplotlib.pyplot as plt
+import numpy as np
 
 import torch
 from torch import Tensor
@@ -120,3 +130,110 @@ class MeanGenePearson(Metric):
         ret = torch.where((ret < -1.0) | (ret > 1.0), torch.nan, ret)
 
         return ret
+
+
+def _spearman(a: Tensor, b: Tensor) -> float:
+    """Spearman rank correlation == Pearson correlation computed on ranks."""
+    # ordinal ranks via double argsort (ties broken arbitrarily, fine for continuous data)
+    ra = a.argsort().argsort().float()
+    rb = b.argsort().argsort().float()
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
+    denom = ra.norm() * rb.norm()
+    if denom <= 0:
+        return float("nan")
+    return float((ra @ rb) / denom)
+
+
+class UncertaintyCalibration:
+    """
+    Accumulates per-element predicted uncertainty and squared error during evaluation,
+    then computes calibration metrics and a MSE-vs-uncertainty boxplot.
+
+    Uncertainty is the total predictive variance, and error is the squared error.
+    A perfectly calibrated regressor's predicted variance would match the observed
+    squared error in expectation.
+    """
+
+    def __init__(self, n_ence_bins: int = 15, n_box_bins: int = 6, max_samples: int = 5_000_000):
+        self.n_ence_bins = n_ence_bins
+        self.n_box_bins = n_box_bins
+        self.max_samples = max_samples  # cap to keep memory bounded
+        self._unc_chunks: list[Tensor] = []
+        self._err_chunks: list[Tensor] = []
+        self._n = 0
+
+    def update(self, prediction: Tensor, total_uncertainty: Tensor, targets: Tensor) -> None:
+        """All tensors shaped [B, n_cells]; flattened and stored on CPU."""
+        if self._n >= self.max_samples:
+            return
+        unc = total_uncertainty.detach().reshape(-1).float().cpu()
+        err = (prediction.detach() - targets.detach()).reshape(-1).float().cpu() ** 2
+        self._unc_chunks.append(unc)
+        self._err_chunks.append(err)
+        self._n += unc.numel()
+
+    def _gather(self) -> tuple[Tensor, Tensor]:
+        unc = torch.cat(self._unc_chunks)
+        err = torch.cat(self._err_chunks)
+        # drop non-finite entries (e.g. nan targets) to keep metrics well-defined
+        mask = torch.isfinite(unc) & torch.isfinite(err)
+        return unc[mask], err[mask]
+
+    def compute_ence(self) -> float:
+        unc, err = self._gather()
+        n = unc.numel()
+        if n < self.n_ence_bins:
+            return float("nan")
+
+        order = torch.argsort(unc)
+        unc_s, err_s = unc[order], err[order]
+
+        ence = 0.0
+        valid_bins = 0
+        for idx in torch.chunk(torch.arange(n), self.n_ence_bins):
+            if idx.numel() == 0:
+                continue
+            rmv = torch.sqrt(unc_s[idx].mean().clamp_min(1e-12))
+            rmse = torch.sqrt(err_s[idx].mean().clamp_min(0.0))
+            ence += float((rmv - rmse).abs() / rmv.clamp_min(1e-12))
+            valid_bins += 1
+        return ence / max(valid_bins, 1)
+
+    def compute_spearman(self) -> float:
+        unc, err = self._gather()
+        if unc.numel() < 2:
+            return float("nan")
+        return _spearman(unc, err)
+
+    def make_boxplot(self, title: str = "Uncertainty"):
+        """Boxplot of squared error (MSE per element) across equal-count (quantile) bins of total predictive uncertainty."""
+        unc, err = self._gather()
+        n = unc.numel()
+        if n < self.n_box_bins:
+            return None
+
+        order = torch.argsort(unc)
+        err_s = err[order].numpy()
+
+        bins = np.array_split(err_s, self.n_box_bins)
+
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.boxplot(
+            bins,
+            positions=range(self.n_box_bins),
+            widths=0.6,
+            showfliers=False,
+            patch_artist=True,
+            boxprops=dict(facecolor="#b9d9e0", edgecolor="#5a7d8c"),
+            medianprops=dict(color="#5a7d8c"),
+            whiskerprops=dict(color="#5a7d8c"),
+            capprops=dict(color="#5a7d8c"),
+        )
+        ax.set_title(title)
+        ax.set_xlabel("Total Uncertainty (quantile bin)")
+        ax.set_ylabel("MSE")
+        ax.set_xticks(range(self.n_box_bins))
+        ax.set_xticklabels(range(self.n_box_bins))
+        fig.tight_layout()
+        return fig

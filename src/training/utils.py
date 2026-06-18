@@ -8,8 +8,10 @@ import random
 
 from torch.optim.lr_scheduler import SequentialLR
 
-from src.training.metrics import MeanCellPearson, MeanGenePearson
+from src.training.metrics import MeanCellPearson, MeanGenePearson, UncertaintyCalibration
 from src.training.wandb_logger import WandBLogger
+import wandb
+import matplotlib.pyplot as plt
 
 # taken from scPrediXcan tutorial
 # https://github.com/hakyimlab/scPrediXcan/blob/master/Scripts/ctPred/Tutorial.ipynb
@@ -311,7 +313,9 @@ def evaluate_ensemble_model(
         f"{mode}/pearson_genes": 0.0,
         f"{mode}/pearson": 0.0,
         f"{mode}/aleatoric": 0.0, # should theoretically stay consistent
-        f"{mode}/epistemic": 0.0  # should theoretically go down with training
+        f"{mode}/epistemic": 0.0, # should theoretically go down with training
+        f"{mode}/ence": 0.0,                       # calibration error of total uncertainty (lower is better)
+        f"{mode}/uncertainty_error_spearman": 0.0  # rank corr. of total uncertainty vs error (higher is better)
     }
     
     for key in loss_dict.keys():
@@ -320,6 +324,7 @@ def evaluate_ensemble_model(
     model.eval()
     metric_cells = MeanCellPearson(n_cells=model.output_dim).to(device)
     metric_genes = MeanGenePearson(n_cells=model.output_dim, n_genes=len(eval_loader.dataset)).to(device)
+    calibration  = UncertaintyCalibration()
 
     epistemic_uncertainties = []
     aleatoric_uncertainties = []
@@ -333,6 +338,9 @@ def evaluate_ensemble_model(
 
             aleatoric_uncertainties.append(aleatoric_unc.mean(dim=0)) # avg aleatoric uncertainty across cells
             epistemic_uncertainties.append(epistemic_unc.mean(dim=0)) # avg epistemic uncertainty across cells
+
+            # total predictive variance = aleatoric + epistemic (for calibration)
+            calibration.update(prediction, aleatoric_unc + epistemic_unc, targets)
 
             outputs = torch.stack([prediction, aleatoric_unc], dim=2) # shape (batch_size, output_dim, 2)
             composite_loss = torch.tensor(0.0, device=device)
@@ -351,12 +359,22 @@ def evaluate_ensemble_model(
     log_dict[f"{mode}/pearson"] = (log_dict[f"{mode}/pearson_cells"] + log_dict[f"{mode}/pearson_genes"]) / 2.0
     log_dict[f"{mode}/aleatoric"] = torch.mean(torch.stack(aleatoric_uncertainties)).item()
     log_dict[f"{mode}/epistemic"] = torch.mean(torch.stack(epistemic_uncertainties)).item()
+    log_dict[f"{mode}/ence"] = calibration.compute_ence()
+    log_dict[f"{mode}/uncertainty_error_spearman"] = calibration.compute_spearman()
 
     for key in loss_dict.keys():
         log_dict[f"{mode}/{key}_loss"] /= len(eval_loader)
     
     logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().nanmean():.4f}, PC Genes: {metric_genes.compute().nanmean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
+    logging.info(f"{mode.capitalize()} ENCE: {log_dict[f'{mode}/ence']:.4f}, Uncertainty-Error Spearman: {log_dict[f'{mode}/uncertainty_error_spearman']:.4f}")
     
     wb_logger.log(log_dict)
+
+    # render calibration boxplot only when logging
+    if wb_logger.enabled:
+        fig = calibration.make_boxplot(title=f"{mode} uncertainty")
+        if fig is not None:
+            wb_logger.log({f"{mode}/mse_vs_uncertainty": wandb.Image(fig)})
+            plt.close(fig)
 
     return log_dict[f"{mode}/loss"]
