@@ -12,29 +12,39 @@ class MLP(nn.Module):
             self.layers.append(nn.Linear(int(layer_sizes[i]), int(layer_sizes[i+1])))
 
         self.relu = nn.ReLU()
-        self.softplus = nn.Softplus() # ensure non-negative outputs
     
     def forward(self, x):
         for layer in self.layers[:-1]:
             x = layer(x)
             x = self.relu(x)
-        x = self.softplus(self.layers[-1](x))
+        # raw (linear) logits; per-head activations are applied in MLPPredictor so that
+        # the mean and the variance can be parameterized differently.
+        x = self.layers[-1](x)
         return x
 
 class MLPPredictor(nn.Module):
     def __init__(self, input_dim, n_layers, output_dim, layer_norm=False):
         super(MLPPredictor, self).__init__()
-        # output mean and variance
-        # first half of output_dim is mean, second half is variance
+        # the network emits 2 * output_dim logits:
+        #   first  output_dim -> mean
+        #   second output_dim -> variance (raw logit, made positive via softplus below)
         self.mlp = MLP(input_dim, n_layers, output_dim*2)
         self.input_dim  = input_dim
+        self.n_targets  = output_dim
         self.output_dim = output_dim*2
+        self.softplus   = nn.Softplus()
         self.layer_norm = nn.LayerNorm(input_dim) if layer_norm else None
     
     def forward(self, x):
         if self.layer_norm:
             x = self.layer_norm(x)
-        return self.mlp(x)
+        raw  = self.mlp(x)
+        # mean: softplus keeps predictions non-negative (targets are >= 0).
+        # variance: softplus gives a strictly positive, *unbounded* variance, i.e. a
+        # proper Gaussian scale (unlike sigmoid, which caps it at 1).
+        mean = self.softplus(raw[..., :self.n_targets])
+        var  = self.softplus(raw[..., self.n_targets:])
+        return torch.cat([mean, var], dim=-1)
 
 class MLPEnsemble(nn.Module):
     def __init__(self, n_models, input_dim, n_layers, output_dim, layer_norm=False):
