@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import logging
 import pandas as pd
+import numpy as np
 from pathlib import Path
 
 import torch
@@ -398,6 +399,12 @@ def main() -> None:
             "layer_norm": args.norm_layer,
         }, args.output)
         logging.info(f"Model saved to {args.output}.")
+
+        idx2ct = np.asarray(dataset.y.index.astype(str).tolist(), dtype=object)
+
+        mapping_path = args.output.with_suffix(".idx2ct.npy")
+        np.save(mapping_path, idx2ct)
+        logging.info(f"Cell-type mapping saved to {mapping_path}.")
 
     logging.info("Done.")
 
