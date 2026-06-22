@@ -10,8 +10,6 @@ import numpy as np
 import pandas as pd
 from bed_reader import open_bed
 
-from distillation.inference.inference import UKB_BED_TEMPLATE, ONEK1K_BED_TEMPLATE
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -34,7 +32,7 @@ def setup_worker_logging(log_path: Path, level: int = logging.INFO) -> None:
 class GenotypeResourceManager:
     """ Lazily opens BED/BIM resources per chromosome inside a producer process. """
 
-    def __init__(self, input_dir: Path, bed_template: str = UKB_BED_TEMPLATE) -> None:
+    def __init__(self, input_dir: Path, bed_template: str) -> None:
         self.input_dir = Path(input_dir)
         self.bed_template = bed_template
         self._beds: dict[str, Any] = {}
@@ -164,6 +162,7 @@ def producer_main(
     ready_queue: mp.Queue,
     free_slot_queue: mp.Queue,
     n_samples: int,
+    bed_template: str,
     geno_shm_names: list[str],
     coef_shm_names: list[str],
     geno_capacity_floats: int,
@@ -171,7 +170,6 @@ def producer_main(
     max_genes_per_slot: int,
     log_dir: str | None = None,
     log_level: int = logging.INFO,
-    bed_template: str = UKB_BED_TEMPLATE,
 ) -> None:
     if log_dir is not None:
         setup_worker_logging(Path(log_dir) / f"producer-{producer_id}.log", level=log_level)
