@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from bed_reader import open_bed
 
+from distillation.inference.inference import UKB_BED_TEMPLATE, ONEK1K_BED_TEMPLATE
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,21 +34,19 @@ def setup_worker_logging(log_path: Path, level: int = logging.INFO) -> None:
 class GenotypeResourceManager:
     """ Lazily opens BED/BIM resources per chromosome inside a producer process. """
 
-    def __init__(self, input_dir: Path) -> None:
+    def __init__(self, input_dir: Path, bed_template: str = UKB_BED_TEMPLATE) -> None:
         self.input_dir = Path(input_dir)
+        self.bed_template = bed_template
         self._beds: dict[str, Any] = {}
         self._snp_to_col: dict[str, dict[str, int]] = {}
         self._sample_ids: np.ndarray | None = None
-
-    def _chrom_prefix(self, chrom: str) -> str:
-        return f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
 
     def _load_chromosome(self, chrom: str) -> None:
         # enables lazy loading!
         if chrom in self._beds:
             return
 
-        chrom_prefix = self._chrom_prefix(chrom)
+        chrom_prefix = self.bed_template.format(chrom=chrom)
         bed_path     = self.input_dir / f"{chrom_prefix}.bed"
         bim_path     = self.input_dir / f"{chrom_prefix}.bim"
 
@@ -171,13 +171,14 @@ def producer_main(
     max_genes_per_slot: int,
     log_dir: str | None = None,
     log_level: int = logging.INFO,
+    bed_template: str = UKB_BED_TEMPLATE,
 ) -> None:
     if log_dir is not None:
         setup_worker_logging(Path(log_dir) / f"producer-{producer_id}.log", level=log_level)
 
     LOGGER.info("Producer %d started with %d genes", producer_id, len(genes))
 
-    manager = GenotypeResourceManager(Path(input_dir))
+    manager = GenotypeResourceManager(Path(input_dir), bed_template=bed_template)
     geno_shms: list[SharedMemory] = []
     coef_shms: list[SharedMemory] = []
 

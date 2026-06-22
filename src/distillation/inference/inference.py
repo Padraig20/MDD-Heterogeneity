@@ -243,6 +243,7 @@ def predict_cell_type_distributed(
     use_gpu: bool,
     log_dir: Path | None,
     log_level: int,
+    genotype_template: str,
 ) -> None:
     n_samples  = len(sample_ids)
     gene_items = list(model.items())
@@ -311,6 +312,7 @@ def predict_cell_type_distributed(
                     "max_genes_per_slot": max_genes_per_slot,
                     "log_dir": str(log_dir) if log_dir is not None else None,
                     "log_level": log_level,
+                    "bed_template": genotype_template,
                 },
                 name=f"producer-{producer_id}",
             )
@@ -426,6 +428,7 @@ def main() -> None:
             use_gpu=args.gpu,
             log_dir=args.log_dir,
             log_level=log_level,
+            genotype_template=genotype_template,
         )
 
         end = time.time()
