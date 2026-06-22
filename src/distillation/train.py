@@ -174,7 +174,8 @@ def main() -> None:
             names=["family_id", "individual_id"]
         )
         idx2ind_arr = idx2ind_arr["individual_id"].to_numpy()
-        idx2ind_arr = np.array([f"{ind}_{ind}" for ind in idx2ind_arr])
+        if args.genotype_template == "UKB":
+            idx2ind_arr = np.array([f"{ind}_{ind}" for ind in idx2ind_arr])
 
         bims[chrom]    = bim
         idx2ind[chrom] = idx2ind_arr

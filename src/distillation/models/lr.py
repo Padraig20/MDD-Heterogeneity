@@ -93,6 +93,14 @@ class LR:
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
 
+        has_target = ~np.isnan(y)
+        if not has_target.all():
+            X = X[has_target]
+            y = y[has_target]
+
+        if y.size == 0:
+            raise ValueError("No non-missing target values available")
+
         if self.model_name == "ridge":
             # perform LD pruning
             X, snp_ids = ld_prune(X, snp_ids)
