@@ -25,6 +25,13 @@ We assume here that the BIM files have been read into memory (that should fit!)
 and are nicely put into a dict with keys according to their chromosome (e.g. "chr1").
 """
 
+# Default PLINK fileset basename template (UKB naming). `{chrom}` is filled in
+# with the chromosome label used to key the `bims`/`idx2ind` dicts and the `y`
+# `chrom` column. Override via the `bed_template` argument for other cohorts
+# (e.g. OneK1K: "OneK1K.GrCH38_chr{chrom}.biallelic").
+DEFAULT_BED_TEMPLATE = "ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
+
+
 class GenotypeDataset(Dataset):
     
     def __init__(
@@ -37,6 +44,7 @@ class GenotypeDataset(Dataset):
         select_genes: Path | None = None,
         normalize: str = "log",
         max_individuals: int | None = None,
+        bed_template: str = DEFAULT_BED_TEMPLATE,
     ):
         """
         Args:
@@ -48,6 +56,7 @@ class GenotypeDataset(Dataset):
             select_genes (Path | None):   Path to a file containing a list of genes to select. If None, use all genes.
             normalize (str):              Normalization method for expression values. Options are "log" or "percentiles".
             max_individuals (int | None):  Maximum number of individuals to use. If None, use all individuals.
+            bed_template (str):           Template for the PLINK fileset basename, with a `{chrom}` placeholder.
         """
         self.bims         = bims
         self.bim_dir      = bim_dir
@@ -56,6 +65,7 @@ class GenotypeDataset(Dataset):
         self.select_genes = select_genes
         self.normalize    = normalize
         self.max_individuals = max_individuals
+        self.bed_template = bed_template
         if isinstance(y, Path) or isinstance(y, str):
             self.y    = pd.read_csv(y)
         else:
@@ -151,6 +161,7 @@ class GenotypeDataset(Dataset):
             select_genes=self.select_genes,
             normalize=self.normalize,
             max_individuals=self.max_individuals,
+            bed_template=self.bed_template,
         )
     
     def __len__(self) -> int:
@@ -174,7 +185,8 @@ class GenotypeDataset(Dataset):
         mask = (bim["chrom"] == chrom) & (bim["bp"] >= start) & (bim["bp"] <= end)
         var_idx = np.flatnonzero(mask.to_numpy())
 
-        with open_bed(os.path.join(self.bim_dir, f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic.bed")) as bed:
+        bed_path = os.path.join(self.bim_dir, f"{self.bed_template.format(chrom=chrom)}.bed")
+        with open_bed(bed_path) as bed:
             x = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
 
         x = torch.from_numpy(x).flatten().float() # convert to float for training
@@ -226,7 +238,7 @@ class GenotypeDataset(Dataset):
 
         bed_path = os.path.join(
             self.bim_dir,
-            f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic.bed",
+            f"{self.bed_template.format(chrom=chrom)}.bed",
         )
         with open_bed(bed_path) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
