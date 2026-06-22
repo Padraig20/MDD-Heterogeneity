@@ -107,6 +107,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum number of individuals to use for training. Defaults to all individuals.",
     )
+    parser.add_argument(
+        "-gt", "--genotype-template",
+        type=str,
+        default="UKB",
+        choices=["OneK1K", "UKB"],
+        help="Template for genotype data files."
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -118,6 +125,9 @@ def setup_logging(verbosity: int) -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+ONEK1K_BED_TEMPLATE = "OneK1K.GrCH38_chr{chrom}.biallelic"
+UKB_BED_TEMPLATE = "ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
 
 def main() -> None:
     args = parse_args()
@@ -134,8 +144,14 @@ def main() -> None:
     bims = {}
     idx2ind = {}
 
+    bed_template = None
+    if args.genotype_template == "OneK1K":
+        bed_template = ONEK1K_BED_TEMPLATE
+    elif args.genotype_template == "UKB":
+        bed_template = UKB_BED_TEMPLATE
+
     for chrom in all_chromosomes:
-        chrom_name = f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
+        chrom_name = bed_template.format(chrom=chrom)
         bim_path = os.path.join(args.observations, f"{chrom_name}.bim")
         fam_path = os.path.join(args.observations, f"{chrom_name}.fam")
         if not os.path.exists(bim_path) or not os.path.exists(fam_path):
@@ -186,6 +202,7 @@ def main() -> None:
             select_genes=args.select_genes,
             normalize=args.norm_targets,
             max_individuals=args.max_individuals,
+            bed_template=bed_template
         )
         model = LR(
             model_name=args.model_name,
