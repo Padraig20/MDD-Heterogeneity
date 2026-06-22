@@ -97,7 +97,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Increase verbosity."
     )
+    parser.add_argument(
+        "-gt", "--genotype-template",
+        type=str,
+        default="UKB",
+        choices=["OneK1K", "UKB"],
+        help="Template for genotype data files."
+    )
     return parser.parse_args()
+
+
+ONEK1K_BED_TEMPLATE = "OneK1K.GrCH38_chr{chrom}.biallelic"
+UKB_BED_TEMPLATE = "ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
 
 
 def setup_logging(verbosity: int) -> int:
@@ -109,13 +120,13 @@ def setup_logging(verbosity: int) -> int:
     return level
 
 
-def load_sample_ids_and_validate(input_dir: Path, chromosomes: list[str]) -> np.ndarray:
+def load_sample_ids_and_validate(input_dir: Path, chromosomes: list[str], bed_template: str) -> np.ndarray:
     sample_ids: np.ndarray | None = None
     beds = []
 
     try:
         for chrom in chromosomes:
-            chrom_name = f"ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
+            chrom_name = bed_template.format(chrom=chrom)
             bed_path   = input_dir / f"{chrom_name}.bed"
 
             bed = open_bed(str(bed_path))
@@ -360,10 +371,17 @@ def main() -> None:
     if args.log_dir is not None:
         args.log_dir.mkdir(parents=True, exist_ok=True)
 
+    genotype_template = None
+    if args.genotype_template == "OneK1K":
+        genotype_template = ONEK1K_BED_TEMPLATE
+    elif args.genotype_template == "UKB":
+        genotype_template = UKB_BED_TEMPLATE
+
     chromosomes = [str(c) for c in range(1, 23)]
     sample_ids  = load_sample_ids_and_validate(
         input_dir=args.input_dir,
         chromosomes=chromosomes,
+        bed_template=genotype_template
     )
 
     cell_type_files = sorted([f for f in os.listdir(args.model_dir) if f.endswith(".json")])
