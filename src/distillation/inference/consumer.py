@@ -250,8 +250,11 @@ def consumer_main(
                         active_items.extend(slot_active)
                         immediate_results.update(slot_immediate)
 
+                    genes_written_this_round = 0
+
                     for gene, pred in immediate_results.items():
                         _write_gene_row(out_f, gene, pred)
+                    genes_written_this_round += len(immediate_results)
 
                     if active_items:
                         if gpu_enabled:
@@ -264,8 +267,10 @@ def consumer_main(
 
                         for gene, pred in batch_preds.items():
                             _write_gene_row(out_f, gene, pred)
+                        genes_written_this_round += len(active_items)
 
-                        total_genes_processed += len(active_items)
+                    if genes_written_this_round:
+                        total_genes_processed += genes_written_this_round
                         LOGGER.info(
                             "UPDATE: Total genes processed: %d / %d",
                             total_genes_processed,
