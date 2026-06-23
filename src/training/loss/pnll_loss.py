@@ -24,6 +24,10 @@ class PNLLLoss(nn.Module):
         Returns:
             Computed loss value: poisson_nll
         """
+
+        if predictions.shape[-1] == 2: # (mu, var) from deep ensemble
+            predictions = predictions[..., 0]
+
         if predictions.shape != targets.shape:
             raise ValueError(
                 f"Shape mismatch: predictions {predictions.shape} vs targets {targets.shape}"

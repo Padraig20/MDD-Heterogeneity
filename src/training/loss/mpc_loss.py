@@ -40,6 +40,10 @@ class MPCLoss(nn.Module):
         Returns:
             Computed loss value: L_mpc
         """
+
+        if predictions.shape[-1] == 2: # (mu, var) from deep ensemble
+            predictions = predictions[..., 0]
+
         if predictions.shape != targets.shape:
             raise ValueError(
                 f"Shape mismatch: predictions {predictions.shape} vs targets {targets.shape}"

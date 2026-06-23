@@ -291,8 +291,6 @@ def main() -> None:
     if args.model_name == 'deep-ensemble':
         # for deep ensemble, we always add the Gaussian NLL loss for uncertainty estimation
         # we delete all other losses, since they don't work with the (mean, var) output format of the ensemble
-        loss_dict = {}
-        loss_lambda_dict = {}
         loss_dict['gnll'] = GaussianNLLLoss()
         loss_lambda_dict['gnll'] = 1.0 # TODO implement scale later, or not?
 
