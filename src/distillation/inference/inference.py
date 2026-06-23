@@ -104,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         choices=["OneK1K", "UKB"],
         help="Template for genotype data files."
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing output files."
+    )
     return parser.parse_args()
 
 
@@ -411,6 +416,10 @@ def main() -> None:
         
         out_path = args.output_dir / f"{ct_name}.predictions.tsv.gz"
         LOGGER.info("Streaming predictions to %s", out_path)
+
+        if out_path.exists() and not args.overwrite:
+            LOGGER.warning("Output file %s already exists; skipping cell type %s.", out_path, ct_name)
+            continue
 
         start = time.time()
 
