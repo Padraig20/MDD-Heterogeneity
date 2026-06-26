@@ -45,6 +45,7 @@ class GenotypeDataset(Dataset):
         normalize: str = "log",
         max_individuals: int | None = None,
         bed_template: str = DEFAULT_BED_TEMPLATE,
+        maf_threshold: float | None = None,
     ):
         """
         Args:
@@ -57,6 +58,9 @@ class GenotypeDataset(Dataset):
             normalize (str):              Normalization method for expression values. Options are "log" or "percentiles".
             max_individuals (int | None):  Maximum number of individuals to use. If None, use all individuals.
             bed_template (str):           Template for the PLINK fileset basename, with a `{chrom}` placeholder.
+            maf_threshold (float | None): Minimum minor allele frequency a SNP must have to be kept (e.g. 0.05
+                                          for MAF >= 5%). MAF is computed across the loaded cohort. If None,
+                                          no MAF filtering is applied.
         """
         self.bims         = bims
         self.bim_dir      = bim_dir
@@ -66,6 +70,7 @@ class GenotypeDataset(Dataset):
         self.normalize    = normalize
         self.max_individuals = max_individuals
         self.bed_template = bed_template
+        self.maf_threshold = maf_threshold
         if isinstance(y, Path) or isinstance(y, str):
             self.y    = pd.read_csv(y)
         else:
@@ -125,6 +130,10 @@ class GenotypeDataset(Dataset):
             ind_str = np.asarray(ind_arr).astype(str)
             self._ind_to_idx[chrom] = {ind: i for i, ind in enumerate(ind_str)}
 
+        # Cache of per-window MAF keep-masks so repeated reads (e.g. __getitem__
+        # over many individuals of the same gene) don't recompute allele freqs.
+        self._maf_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
+
         # Per-gene: metadata + the row-individuals/expression vectors.
         self._gene_meta: dict[str, tuple[str, int, np.ndarray, np.ndarray]] = {}
         if "gene" in self.y.columns and len(self.y) > 0:
@@ -147,6 +156,44 @@ class GenotypeDataset(Dataset):
         )
         return y_df
 
+    @staticmethod
+    def _maf_from_genotypes(X: np.ndarray) -> np.ndarray:
+        """
+        Compute per-SNP minor allele frequency from a genotype matrix.
+
+        Args:
+            X: shape (n_individuals, n_snps), allele dosages in {0, 1, 2}. Missing
+               values (bed_reader returns -127 for int8 / NaN for float) are ignored.
+
+        Returns:
+            maf: shape (n_snps,) with the minor allele frequency of each SNP.
+        """
+        Xf = X.astype(np.float64, copy=True)
+        Xf[Xf < 0] = np.nan  # bed_reader missing sentinel (-127 for int8)
+        with np.errstate(invalid="ignore"):
+            p = np.nanmean(Xf, axis=0) / 2.0
+        p = np.where(np.isnan(p), 0.0, p)  # all-missing SNP -> MAF 0 (gets filtered out)
+        return np.minimum(p, 1.0 - p)
+
+    def _window_maf_mask(self, chrom: str, var_idx: np.ndarray) -> np.ndarray:
+        """
+        Boolean keep-mask (len == len(var_idx)) for SNPs in a window whose MAF,
+        computed across the whole loaded cohort, is >= ``self.maf_threshold``.
+
+        Results are cached per (chrom, first_var, last_var) window.
+        """
+        key = (chrom, int(var_idx[0]), int(var_idx[-1]))
+        cached = self._maf_mask_cache.get(key)
+        if cached is not None:
+            return cached
+
+        bed_path = os.path.join(self.bim_dir, f"{self.bed_template.format(chrom=chrom)}.bed")
+        with open_bed(bed_path) as bed:
+            genotypes = bed.read(index=np.s_[:, var_idx], dtype="int8")
+        mask = self._maf_from_genotypes(genotypes) >= self.maf_threshold
+        self._maf_mask_cache[key] = mask
+        return mask
+
     def split_by_chromosome(self, chroms: list[str]) -> Dataset:
         # filter y and chroms to only include rows with chrom in chroms
         y_filtered       = self.y[self.y["chrom"].astype(str).isin(chroms)].copy()
@@ -162,6 +209,7 @@ class GenotypeDataset(Dataset):
             normalize=self.normalize,
             max_individuals=self.max_individuals,
             bed_template=self.bed_template,
+            maf_threshold=self.maf_threshold,
         )
     
     def __len__(self) -> int:
@@ -184,6 +232,9 @@ class GenotypeDataset(Dataset):
 
         mask = (bim["chrom"] == chrom) & (bim["bp"] >= start) & (bim["bp"] <= end)
         var_idx = np.flatnonzero(mask.to_numpy())
+
+        if self.maf_threshold is not None and var_idx.size > 0:
+            var_idx = var_idx[self._window_maf_mask(chrom, var_idx)]
 
         bed_path = os.path.join(self.bim_dir, f"{self.bed_template.format(chrom=chrom)}.bed")
         with open_bed(bed_path) as bed:
@@ -242,6 +293,11 @@ class GenotypeDataset(Dataset):
         )
         with open_bed(bed_path) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
+
+        if self.maf_threshold is not None and X.shape[1] > 0:
+            keep_snp = self._maf_from_genotypes(X) >= self.maf_threshold
+            X       = X[:, keep_snp]
+            snp_ids = snp_ids[keep_snp]
 
         return X, y, snp_ids, chrom
 

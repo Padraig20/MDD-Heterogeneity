@@ -114,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         choices=["OneK1K", "UKB"],
         help="Template for genotype data files."
     )
+    parser.add_argument(
+        "--maf-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Minimum minor allele frequency to keep a SNP (e.g. 0.05 for MAF >= 5%%). "
+            "MAF is computed across the loaded cohort. Defaults to no MAF filtering."
+        ),
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -203,7 +212,8 @@ def main() -> None:
             select_genes=args.select_genes,
             normalize=args.norm_targets,
             max_individuals=args.max_individuals,
-            bed_template=bed_template
+            bed_template=bed_template,
+            maf_threshold=args.maf_threshold,
         )
         model = LR(
             model_name=args.model_name,
