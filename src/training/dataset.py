@@ -43,6 +43,35 @@ class MddDataset(Dataset):
 
         self.normalize     = normalize
         self.norm_features = None
+
+        # The gene axis is decided by y (its columns), not by X. Restrict and
+        # order X to the genes present in y, dropping any X genes that have no
+        # target row. Genes in y without features cannot be served and are
+        # reported.
+        self._align_genes_to_y()
+
+    def _align_genes_to_y(self) -> None:
+        """Align the gene axis (X_*) to the genes in y so the gene count is
+        decided by y rather than by X."""
+        y_genes = self.y.columns.to_numpy().astype(str)
+        x_ensids = self.X_ensids.astype(str)
+
+        x_pos = {g: i for i, g in enumerate(x_ensids)}
+        order = np.fromiter(
+            (x_pos[g] for g in y_genes if g in x_pos),
+            dtype=np.int64,
+        )
+
+        n_missing = len(y_genes) - len(order)
+        if n_missing:
+            logging.warning(
+                "%d / %d genes in y have no feature row in X and cannot be "
+                "served.", n_missing, len(y_genes),
+            )
+
+        self.X_feats  = self.X_feats[order]
+        self.X_ensids = self.X_ensids[order]
+        self.X_chroms = self.X_chroms[order]
     
     def split_by_chromosome(self, chrom: list[str]) -> Dataset:
         """Return a new MddDataset containing only data from the specified chromosomes."""
