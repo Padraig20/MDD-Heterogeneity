@@ -133,6 +133,17 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for integer-based sampling from the VCF header.",
     )
     parser.add_argument(
+        "--maf-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Minimum minor allele frequency for a SNP to be substituted into the "
+            "Enformer input sequence (e.g. 0.05 for MAF >= 5%%). MAF is computed "
+            "across the selected individuals. Only applies to the personalized "
+            "'enformer' backbone. Defaults to no MAF filtering."
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="count",
         default=0,
@@ -315,7 +326,7 @@ def select_individual_ids(samples: List[str], selection: str, seed: int) -> List
     return chosen
 
 
-def collect_window_alt_edits(vcf: "pysam.VariantFile", chrom: str, start0: int, end0: int, sampled_ids: List[str], ref_seq: np.ndarray) -> List[List[tuple[int, int]]]:
+def collect_window_alt_edits(vcf: "pysam.VariantFile", chrom: str, start0: int, end0: int, sampled_ids: List[str], ref_seq: np.ndarray, maf_threshold: Optional[float] = None) -> List[List[tuple[int, int]]]:
     edits_per_individual = [[] for _ in sampled_ids]
     fetch_chrom          = chrom[3:]
 
@@ -346,12 +357,44 @@ def collect_window_alt_edits(vcf: "pysam.VariantFile", chrom: str, start0: int, 
             )
 
         rec_samples = rec.samples
-        for i, sid in enumerate(sampled_ids):
-            gt = rec_samples[sid]["GT"]
+        gts = [rec_samples[sid]["GT"] for sid in sampled_ids]
+
+        # Optionally drop low-frequency SNPs. MAF is computed across the selected
+        # cohort (sampled_ids) from the called alleles of this record.
+        if maf_threshold is not None and not _passes_maf(gts, maf_threshold):
+            continue
+
+        for i, gt in enumerate(gts):
             if gt and any(a is not None and a > 0 for a in gt):
                 edits_per_individual[i].append((rel_pos, alt_code))
 
     return edits_per_individual
+
+
+def _passes_maf(gts: List[Any], maf_threshold: float) -> bool:
+    """Return True if the minor allele frequency across the given genotypes is >= maf_threshold.
+
+    `gts` is a list of per-individual GT tuples (e.g. (0, 1)); None alleles are
+    ignored. Records with no called alleles are treated as failing the filter.
+    """
+    alt_alleles   = 0
+    total_alleles = 0
+    for gt in gts:
+        if not gt:
+            continue
+        for allele in gt:
+            if allele is None:
+                continue
+            total_alleles += 1
+            if allele > 0:
+                alt_alleles += 1
+
+    if total_alleles == 0:
+        return False
+
+    p   = alt_alleles / total_alleles
+    maf = min(p, 1.0 - p)
+    return maf >= maf_threshold
 
 
 def apply_variants_to_sequence(ref_seq: str, variants, individual_idx: int) -> str:
@@ -378,7 +421,7 @@ def apply_variants_to_sequence(ref_seq: str, variants, individual_idx: int) -> s
     return "".join(seq_chars)
 
 
-def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.VariantFile"], sampled_ids: List[str], skip_input_rows: int = 0, skip_within_expanded_row: int = 0) -> Iterator[Dict[str, Any]]:
+def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.VariantFile"], sampled_ids: List[str], skip_input_rows: int = 0, skip_within_expanded_row: int = 0, maf_threshold: Optional[float] = None) -> Iterator[Dict[str, Any]]:
     """Expand each input row into gene x sampled-individual rows with SNP-personalized sequences."""
     for row_idx, row in enumerate(iter_autosomal_rows_csv(input_path, skip_rows=skip_input_rows)):
         ref_seq = dna_seq_to_array(row["sequence"].upper())
@@ -396,6 +439,7 @@ def iter_personalized_rows(input_path: Path, chrom_to_vcf: Dict[str, "pysam.Vari
             end0=end0,
             sampled_ids=sampled_ids,
             ref_seq=ref_seq,
+            maf_threshold=maf_threshold,
         )
 
         start_i = skip_within_expanded_row if row_idx == 0 else 0
@@ -517,6 +561,14 @@ def extract_variantformer_features(
 
     num_samples = len(sample_ids)
 
+    # Per-job directory for intermediate subset VCFs. Deriving this from the
+    # job's own output path (rather than the shared --vcf-dir) keeps concurrent
+    # jobs from clobbering each other's chr*.subset.vcf.gz, which otherwise
+    # causes corrupt-BGZF / tabix failures under parallel cluster runs.
+    subset_vcf_dir = output_path.parent / f"{output_path.name}.vcf_subsets"
+    if personalized:
+        subset_vcf_dir.mkdir(parents=True, exist_ok=True)
+
     logging.info("Loading VariantFormer model and checkpoint...")
     model, ckpt_path, trainer = vcf_processor.load_model()
 
@@ -586,8 +638,14 @@ def extract_variantformer_features(
                     logging.warning("Missing %s; skipping %d genes on chr%s.", chrom_vcf, len(gene_ids), chrom)
                     continue
                 logging.info("  chr%s: %d genes", chrom, len(gene_ids))
+                # Reused per chromosome within this job; individuals are
+                # processed sequentially so it is safe to overwrite each pass.
+                subset_vcf_path = str(subset_vcf_dir / f"chr{chrom}.subset.vcf.gz")
                 vcf_dataset, dataloader = vcf_processor.create_data(
-                    str(chrom_vcf), build_query_df(gene_ids), sample_ids=[sample]
+                    str(chrom_vcf),
+                    build_query_df(gene_ids),
+                    sample_ids=[sample],
+                    subset_output_path=subset_vcf_path,
                 )
                 pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
                 write_predictions(pred_df, s_idx, sample)
@@ -618,11 +676,16 @@ def extract_variantformer_features(
     logging.info("VariantFormer embeddings successfully extracted to %s", feats_mm_path)
 
 
-def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000, tissue: Optional[str] = None, vf_model_class: str = "v4_pcg") -> None:
+def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000, tissue: Optional[str] = None, vf_model_class: str = "v4_pcg", maf_threshold: Optional[float] = None) -> None:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
 
     if "variantformer" in model_name:
+        if maf_threshold is not None:
+            logging.warning(
+                "--maf-threshold is only applied to the 'enformer' backbone; ignoring it "
+                "for VariantFormer, which handles variants internally."
+            )
         extract_variantformer_features(
             data_path=data_path,
             output_path=output_path,
@@ -698,6 +761,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
                     sampled_ids=sampled_ids,
                     skip_input_rows=skip_input_rows,
                     skip_within_expanded_row=skip_within_expanded_row,
+                    maf_threshold=maf_threshold,
                 )
             else:
                 row_iter = iter_autosomal_rows_csv(data_path, skip_rows=start_idx)
@@ -789,6 +853,7 @@ def main() -> None:
         checkpoint_every=args.checkpoint_every,
         tissue=args.tissue,
         vf_model_class="v4_pcg" if args.model_name == "variantformer-pcg" else "v4_ag",
+        maf_threshold=args.maf_threshold,
     )
 
     logging.info("Done.")
