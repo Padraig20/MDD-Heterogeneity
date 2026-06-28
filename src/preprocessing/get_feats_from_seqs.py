@@ -89,10 +89,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Optional directory containing chromosome-level VCF files "
-            "(e.g. chr1.vcf.gz ... chr22.vcf.gz). Used for personalization by both "
-            "the 'enformer' (SNP substitution) and 'variantformer' (applied "
-            "internally per chromosome) backbones. Omit if personalization not needed."
+            "Optional directory of VCF files used for personalization. The "
+            "expected layout depends on the backbone: the 'enformer' backbone "
+            "reads chromosome-level multi-sample VCFs (chr1.vcf.gz ... "
+            "chr22.vcf.gz), while the 'variantformer' backbone reads one "
+            "single-sample, whole-genome VCF per individual named "
+            "'<individual>.vcf.gz' (bgzipped + tabix-indexed, e.g. produced by "
+            "`bcftools +split`). Omit if personalization not needed."
         )
     )
     parser.add_argument(
@@ -123,7 +126,9 @@ def parse_args() -> argparse.Namespace:
             "Individuals to use from the VCF files when --vcf-dir is provided. "
             "Use an integer to randomly sample that many individuals, 'all' to "
             "use every individual, or 'K/N' to process split K of N contiguous "
-            "splits from the VCF header order (1-based)."
+            "splits (1-based). Individuals are ordered by VCF header order for "
+            "the 'enformer' backbone and by per-individual VCF filename for the "
+            "'variantformer' backbone."
         )
     )
     parser.add_argument(
@@ -269,6 +274,33 @@ def get_vcf_samples(vcf_path: Path) -> List[str]:
         return list(vf.header.samples)
     finally:
         vf.close()
+
+
+def discover_individual_vcfs(vcf_dir: Path) -> Dict[str, Path]:
+    """Map individual ID -> per-individual VCF path for the VariantFormer backbone.
+
+    Expects ``vcf_dir`` to contain one single-sample, whole-genome VCF per
+    individual (e.g. produced by ``bcftools +split``), bgzipped and tabix-indexed
+    as ``<individual>.vcf(.bgz|.gz)``. The individual ID is the filename with the
+    VCF suffix stripped and is assumed to match the sample name inside the file.
+    """
+    suffixes = (".vcf.gz", ".vcf.bgz")
+    mapping: Dict[str, Path] = {}
+    for path in sorted(vcf_dir.iterdir()):
+        if not path.is_file():
+            continue
+        name = path.name
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                mapping[name[: -len(suffix)]] = path
+                break
+    if not mapping:
+        raise FileNotFoundError(
+            f"No per-individual VCFs (*.vcf.gz / *.vcf.bgz) found in {vcf_dir}. "
+            "The VariantFormer backbone expects one single-sample VCF per "
+            "individual (e.g. from `bcftools +split`)."
+        )
+    return mapping
 
 
 def select_individual_ids(samples: List[str], selection: str, seed: int) -> List[str]:
@@ -527,47 +559,33 @@ def extract_variantformer_features(
     num_genes = len(ordered_gene_ids)
     gene_row_offset = {gid: i for i, gid in enumerate(ordered_gene_ids)}
 
-    # group genes by chromosome
-    genes_by_chrom: Dict[str, List[str]] = {}
-    for gid in ordered_gene_ids:
-        genes_by_chrom.setdefault(gene_meta_by_id[gid]["chrom"], []).append(gid)
-
     def build_query_df(gene_ids: List[str]) -> "pd.DataFrame":
         return pd.DataFrame(
             {"gene_id": gene_ids, "tissues": [tissue] * len(gene_ids)}
         )
 
-    # specific individuals to process
+    # Specific individuals to process. In personalized mode --vcf-dir holds one
+    # single-sample, whole-genome VCF per individual (named "<individual>.vcf.gz"
+    # and tabix-indexed, e.g. produced by `bcftools +split`). Because each file
+    # already spans every chromosome, each individual is processed in a single
+    # prediction pass over all genes (no per-chromosome loop).
     personalized = vcf_dir is not None
+    individual_to_vcf: Dict[str, Path] = {}
     if personalized:
-        header_vcf = None
-        for chrom in genes_by_chrom:
-            candidate = vcf_dir / f"chr{chrom}.vcf.gz"
-            if candidate.exists():
-                header_vcf = candidate
-                break
-        if header_vcf is None:
-            raise FileNotFoundError(
-                f"No chromosome VCFs (chrN.vcf.gz) found in {vcf_dir} for the query genes."
-            )
-        all_samples = get_vcf_samples(header_vcf)
+        individual_to_vcf = discover_individual_vcfs(vcf_dir)
+        all_individuals = list(individual_to_vcf.keys())
         sample_ids: List[Optional[str]] = list(
-            select_individual_ids(all_samples, num_individuals, sample_seed)
+            select_individual_ids(all_individuals, num_individuals, sample_seed)
         )
-        logging.info("Personalized mode: %d individuals from %s", len(sample_ids), vcf_dir)
+        logging.info(
+            "Personalized mode: %d of %d per-individual VCFs from %s",
+            len(sample_ids), len(all_individuals), vcf_dir,
+        )
     else:
         sample_ids = [None]
         logging.info("Reference-sequence mode (no --vcf-dir provided).")
 
     num_samples = len(sample_ids)
-
-    # Per-job directory for intermediate subset VCFs. Deriving this from the
-    # job's own output path (rather than the shared --vcf-dir) keeps concurrent
-    # jobs from clobbering each other's chr*.subset.vcf.gz, which otherwise
-    # causes corrupt-BGZF / tabix failures under parallel cluster runs.
-    subset_vcf_dir = output_path.parent / f"{output_path.name}.vcf_subsets"
-    if personalized:
-        subset_vcf_dir.mkdir(parents=True, exist_ok=True)
 
     logging.info("Loading VariantFormer model and checkpoint...")
     model, ckpt_path, trainer = vcf_processor.load_model()
@@ -631,24 +649,20 @@ def extract_variantformer_features(
         logging.info("Processing individual %d/%d: %s", s_idx + 1, num_samples, sample_label)
 
         if personalized:
-            # one prediction pass per chromosome!
-            for chrom, gene_ids in genes_by_chrom.items():
-                chrom_vcf = vcf_dir / f"chr{chrom}.vcf.gz"
-                if not chrom_vcf.exists():
-                    logging.warning("Missing %s; skipping %d genes on chr%s.", chrom_vcf, len(gene_ids), chrom)
-                    continue
-                logging.info("  chr%s: %d genes", chrom, len(gene_ids))
-                # Reused per chromosome within this job; individuals are
-                # processed sequentially so it is safe to overwrite each pass.
-                subset_vcf_path = str(subset_vcf_dir / f"chr{chrom}.subset.vcf.gz")
-                vcf_dataset, dataloader = vcf_processor.create_data(
-                    str(chrom_vcf),
-                    build_query_df(gene_ids),
-                    sample_ids=[sample],
-                    subset_output_path=subset_vcf_path,
-                )
-                pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
-                write_predictions(pred_df, s_idx, sample)
+            # Single prediction pass over all genes/chromosomes for this
+            # individual. The VCF is already single-sample and whole-genome, so
+            # we feed it directly: no sample subsetting is needed (the file is
+            # one individual) and bcftools consensus seeks to each gene/CRE
+            # window via the tabix index, so pre-restricting regions is
+            # unnecessary. The VCF must be bgzipped and tabix-indexed.
+            ind_vcf = individual_to_vcf[sample]
+            vcf_dataset, dataloader = vcf_processor.create_data(
+                str(ind_vcf),
+                build_query_df(ordered_gene_ids),
+                sample_ids=None,
+            )
+            pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
+            write_predictions(pred_df, s_idx, sample)
         else:
             vcf_dataset, dataloader = vcf_processor.create_data(
                 None, build_query_df(ordered_gene_ids), sample_ids=None
