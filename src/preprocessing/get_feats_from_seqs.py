@@ -138,6 +138,29 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for integer-based sampling from the VCF header.",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help=(
+            "Override the number of DataLoader workers for the VariantFormer "
+            "backbone. Sequence extraction is data-loading bound (one indexed "
+            "`bcftools consensus` call per CRE/gene window), so more workers "
+            "parallelize this across genes. Defaults to the value in "
+            "variantformer/configs/vcfloader.yaml (currently 4). A good starting "
+            "point is the number of physical CPU cores."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=None,
+        help=(
+            "Override the DataLoader prefetch_factor (batches preloaded per "
+            "worker) for the VariantFormer backbone. Only used when "
+            "--num-workers > 0. Defaults to the vcfloader.yaml value (currently 4)."
+        ),
+    )
+    parser.add_argument(
         "--maf-threshold",
         type=float,
         default=None,
@@ -509,6 +532,8 @@ def extract_variantformer_features(
     vcf_dir: Optional[Path] = None,
     num_individuals: str = "0",
     sample_seed: int = 42,
+    num_workers: Optional[int] = None,
+    prefetch_factor: Optional[int] = None,
 ) -> None:
     if tissue is None:
         raise ValueError("--tissue is required when using the 'variantformer' backbone.")
@@ -559,10 +584,13 @@ def extract_variantformer_features(
     num_genes = len(ordered_gene_ids)
     gene_row_offset = {gid: i for i, gid in enumerate(ordered_gene_ids)}
 
-    def build_query_df(gene_ids: List[str]) -> "pd.DataFrame":
-        return pd.DataFrame(
-            {"gene_id": gene_ids, "tissues": [tissue] * len(gene_ids)}
-        )
+    # One query row per gene, each conditioned on the requested tissue. The
+    # VCFDataset filters this against VariantFormer's gencode v24 and tissue
+    # vocabulary, and the comma-separated "tissues" string is parsed internally.
+    # The same query is reused for every individual.
+    query_df = pd.DataFrame(
+        {"gene_id": ordered_gene_ids, "tissues": [tissue] * num_genes}
+    )
 
     # Specific individuals to process. In personalized mode --vcf-dir holds one
     # single-sample, whole-genome VCF per individual (named "<individual>.vcf.gz"
@@ -586,6 +614,17 @@ def extract_variantformer_features(
         logging.info("Reference-sequence mode (no --vcf-dir provided).")
 
     num_samples = len(sample_ids)
+
+    # Optional DataLoader overrides forwarded to VCFProcessor.create_data (which
+    # passes **kwargs straight to torch's DataLoader). Sequence extraction is the
+    # bottleneck, so raising num_workers usually gives a near-linear speedup.
+    loader_overrides: Dict[str, Any] = {}
+    if num_workers is not None:
+        loader_overrides["num_workers"] = num_workers
+    if prefetch_factor is not None:
+        loader_overrides["prefetch_factor"] = prefetch_factor
+    if loader_overrides:
+        logging.info("Overriding VariantFormer DataLoader config: %s", loader_overrides)
 
     logging.info("Loading VariantFormer model and checkpoint...")
     model, ckpt_path, trainer = vcf_processor.load_model()
@@ -648,27 +687,18 @@ def extract_variantformer_features(
         sample_label = sample if sample is not None else "REFERENCE"
         logging.info("Processing individual %d/%d: %s", s_idx + 1, num_samples, sample_label)
 
-        if personalized:
-            # Single prediction pass over all genes/chromosomes for this
-            # individual. The VCF is already single-sample and whole-genome, so
-            # we feed it directly: no sample subsetting is needed (the file is
-            # one individual) and bcftools consensus seeks to each gene/CRE
-            # window via the tabix index, so pre-restricting regions is
-            # unnecessary. The VCF must be bgzipped and tabix-indexed.
-            ind_vcf = individual_to_vcf[sample]
-            vcf_dataset, dataloader = vcf_processor.create_data(
-                str(ind_vcf),
-                build_query_df(ordered_gene_ids),
-                sample_ids=None,
-            )
-            pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
-            write_predictions(pred_df, s_idx, sample)
-        else:
-            vcf_dataset, dataloader = vcf_processor.create_data(
-                None, build_query_df(ordered_gene_ids), sample_ids=None
-            )
-            pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
-            write_predictions(pred_df, s_idx, sample)
+        # In personalized mode every individual has exactly one single-sample,
+        # whole-genome VCF ("<individual>.vcf.gz", bgzipped + tabix-indexed).
+        # We hand that file straight to VariantFormer, which runs
+        # `bcftools consensus` to splice the individual's variants into each
+        # gene/CRE window (seeking via the tabix index). In reference mode we
+        # pass vcf_path=None so VariantFormer uses the unmodified reference
+        # genome. A single prediction pass covers all genes and chromosomes for
+        # the individual.
+        vcf_path = str(individual_to_vcf[sample]) if personalized else None
+        vcf_dataset, dataloader = vcf_processor.create_data(vcf_path, query_df, **loader_overrides)
+        pred_df = vcf_processor.predict(model, ckpt_path, trainer, dataloader, vcf_dataset)
+        write_predictions(pred_df, s_idx, sample)
 
         # checkpoint after each individual
         feats_mm.flush()
@@ -690,7 +720,7 @@ def extract_variantformer_features(
     logging.info("VariantFormer embeddings successfully extracted to %s", feats_mm_path)
 
 
-def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000, tissue: Optional[str] = None, vf_model_class: str = "v4_pcg", maf_threshold: Optional[float] = None) -> None:
+def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000, tissue: Optional[str] = None, vf_model_class: str = "v4_pcg", maf_threshold: Optional[float] = None, num_workers: Optional[int] = None, prefetch_factor: Optional[int] = None) -> None:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
 
@@ -708,6 +738,8 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
             vcf_dir=vcf_dir,
             num_individuals=num_individuals,
             sample_seed=sample_seed,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
         )
         return
 
@@ -868,6 +900,8 @@ def main() -> None:
         tissue=args.tissue,
         vf_model_class="v4_pcg" if args.model_name == "variantformer-pcg" else "v4_ag",
         maf_threshold=args.maf_threshold,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
     )
 
     logging.info("Done.")
