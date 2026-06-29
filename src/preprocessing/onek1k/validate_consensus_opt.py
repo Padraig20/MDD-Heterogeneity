@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import statistics
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -66,6 +68,43 @@ def select_gene_ids(vcf_processor: VCFProcessor, num_genes: int, explicit: Optio
         return explicit
     genes_df = vcf_processor.get_genes()
     return [str(g) for g in genes_df["gene_id"].tolist()[: num_genes * 3]]
+
+
+def get_gene_info(vcf_processor: VCFProcessor, gene_id: str) -> Optional[dict]:
+    """Look up a gene's row from the gencode table (chromosome/start/end/strand)."""
+    genes_df = vcf_processor.get_genes()
+    rows = genes_df[genes_df["gene_id"] == gene_id]
+    if len(rows) == 0:
+        return None
+    return rows.iloc[0].to_dict()
+
+
+def benchmark_gene(
+    cre_extractor: ExtractSeqFromBed,
+    gene_extractor: ExtractSeqFromBed,
+    vcf_path: Optional[str],
+    variant_type: Optional[str],
+    bed_regions,
+    gene_info: Optional[dict],
+) -> tuple[int, float, float]:
+    """Time only the optimized batched path for one gene.
+
+    Returns (num_cre_regions, cre_seconds, gene_window_seconds).
+    """
+    regions = [region for _, region in bed_regions.iterrows()]
+    region_strs = [cre_extractor._region_to_str(region) for region in regions]
+
+    t0 = time.perf_counter()
+    cre_extractor._extract_sequences_batched(region_strs, vcf_path, variant_type)
+    cre_seconds = time.perf_counter() - t0
+
+    gene_seconds = 0.0
+    if gene_info is not None:
+        t0 = time.perf_counter()
+        gene_extractor.process_gene(gene_info, vcf_path, variant_type=variant_type)
+        gene_seconds = time.perf_counter() - t0
+
+    return len(regions), cre_seconds, gene_seconds
 
 
 def compare_gene(
@@ -146,7 +185,93 @@ def parse_args() -> argparse.Namespace:
         choices=["v4_pcg", "v4_ag"],
         help="VariantFormer model class (selects gencode/CRE config).",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Time ONLY the optimized batched path (no per-region ground truth) "
+        "and project per-individual runtime. Use this to gauge real speed.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=28,
+        help="DataLoader worker count assumed for the per-individual projection "
+        "in --benchmark mode (default: 28).",
+    )
+    parser.add_argument(
+        "--total-genes",
+        type=int,
+        default=None,
+        help="Total genes per individual assumed for the projection in "
+        "--benchmark mode (default: the full gencode gene count).",
+    )
     return parser.parse_args()
+
+
+def run_benchmark(vcf_processor, cre_extractor, fasta_path, candidate_gene_ids, args) -> None:
+    """Time the optimized batched path and project per-individual runtime."""
+    ds = vcf_processor.model_config.dataset
+    gene_extractor = ExtractSeqFromBed(
+        neighbour_hood=ds.gene_downstream_neighbour_hood,
+        ref_fasta=fasta_path,
+        upstream_neighbour_hood=ds.gene_upstream_neighbour_hood,
+    )
+
+    per_gene_seconds: List[float] = []
+    cre_seconds_all: List[float] = []
+    gene_seconds_all: List[float] = []
+    region_counts: List[int] = []
+    genes_done = 0
+
+    for gene_id in candidate_gene_ids:
+        if genes_done >= args.num_genes:
+            break
+        bed_regions = build_bed_regions(vcf_processor, gene_id)
+        if bed_regions is None or len(bed_regions) == 0:
+            log.info("Skipping %s (no CRE map / empty)", gene_id)
+            continue
+        gene_info = get_gene_info(vcf_processor, gene_id)
+
+        n, cre_s, gene_s = benchmark_gene(
+            cre_extractor, gene_extractor, args.vcf, args.variant_type, bed_regions, gene_info
+        )
+        per_gene_seconds.append(cre_s + gene_s)
+        cre_seconds_all.append(cre_s)
+        gene_seconds_all.append(gene_s)
+        region_counts.append(n)
+        genes_done += 1
+        log.info(
+            "Gene %s: %d CREs | CRE batch %.2fs | gene window %.2fs | total %.2fs",
+            gene_id, n, cre_s, gene_s, cre_s + gene_s,
+        )
+
+    if genes_done == 0:
+        log.error("No genes were benchmarked; check gene selection / CRE manifest.")
+        sys.exit(2)
+
+    total_genes = args.total_genes or len(vcf_processor.get_genes())
+    mean_gene = statistics.mean(per_gene_seconds)
+    median_gene = statistics.median(per_gene_seconds)
+
+    log.info("--- Benchmark summary (batched path only, %s) ---",
+             "personalized" if args.vcf else "reference")
+    log.info("Genes timed: %d | mean CREs/gene: %.0f",
+             genes_done, statistics.mean(region_counts))
+    log.info("Per gene: mean %.2fs (CRE %.2fs + gene %.2fs), median %.2fs",
+             mean_gene, statistics.mean(cre_seconds_all),
+             statistics.mean(gene_seconds_all), median_gene)
+
+    serial_h = mean_gene * total_genes / 3600.0
+    parallel_h = serial_h / max(1, args.workers)
+    log.info(
+        "Projection for %d genes/individual: ~%.1f h single-threaded, "
+        "~%.1f h with %d workers (CPU side only; GPU overlaps).",
+        total_genes, serial_h, parallel_h, args.workers,
+    )
+    log.info(
+        "Note: this ignores GPU/BPE/collate time, which overlap with data "
+        "loading; treat it as the data-loading ceiling per individual."
+    )
 
 
 def main() -> None:
@@ -163,6 +288,10 @@ def main() -> None:
     extractor = ExtractSeqFromBed(neighbour_hood=cre_neighbour_hood, ref_fasta=fasta_path)
 
     candidate_gene_ids = select_gene_ids(vcf_processor, args.num_genes, args.genes)
+
+    if args.benchmark:
+        run_benchmark(vcf_processor, extractor, fasta_path, candidate_gene_ids, args)
+        return
 
     total_regions = 0
     total_mismatched = 0
