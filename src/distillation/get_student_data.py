@@ -28,6 +28,7 @@ into subdirectories:
 output_dir/preds/*.csv       (predicted mean expression)
 output_dir/aleatoric/*.csv   (aleatoric uncertainty / data noise)
 output_dir/epistemic/*.csv   (epistemic uncertainty / model uncertainty)
+output_dir/totvar/*.csv      (total predictive variance: aleatoric + epistemic)
 """
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -175,6 +176,7 @@ def main() -> None:
     ct_to_pred = empty_ct_matrices()
     ct_to_aleatoric = empty_ct_matrices() if is_ensemble else None
     ct_to_epistemic = empty_ct_matrices() if is_ensemble else None
+    ct_to_totvar = empty_ct_matrices() if is_ensemble else None
 
     # now perform inference for each person, place into correct row in each matrix based on key
     for person_idx, person in enumerate(persons):
@@ -215,6 +217,9 @@ def main() -> None:
                 if is_ensemble:
                     ct_to_aleatoric[ct][row, person_idx] = aleatoric[i, ct_idx]
                     ct_to_epistemic[ct][row, person_idx] = epistemic[i, ct_idx]
+                    ct_to_totvar[ct][row, person_idx] = (
+                        aleatoric[i, ct_idx] + epistemic[i, ct_idx]
+                    )
 
     if args.norm_targets == "log":
         # undo log normalization on the predicted means. The uncertainties are
@@ -230,6 +235,8 @@ def main() -> None:
         write_csvs(args.output_dir / "aleatoric", ct_to_aleatoric, idx2ct, persons,
                    master_ensids, master_chroms, master_tss)
         write_csvs(args.output_dir / "epistemic", ct_to_epistemic, idx2ct, persons,
+                   master_ensids, master_chroms, master_tss)
+        write_csvs(args.output_dir / "totvar", ct_to_totvar, idx2ct, persons,
                    master_ensids, master_chroms, master_tss)
     else:
         print(f"Writing output CSVs to {args.output_dir}...")
