@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from src.training.dataset import MddDataset, MultiIndividualMddDataset
+from src.training.dataset import MddDataset, ReferencePopulationMddDataset
 from src.training.utils import get_train_test_dataset, EarlyStopping
 
 from src.training.models.mlp import MLPPredictor
@@ -43,11 +43,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help=(
-            "Either: (a) the common name (without extension) of a single-individual "
-            "observation set with sibling files <name>.features.npy, <name>.ensids.npy, "
-            "<name>.chroms.npy; or (b) a directory whose subdirectories are named after "
-            "individual IDs and each contain features.npy / ensids.npy / chroms.npy. "
-            "Detected automatically from whether the path is a directory."
+            "The common name (without extension) of an observation set with sibling "
+            "files <name>.features.npy, <name>.ensids.npy, <name>.chroms.npy."
         )
     )
     parser.add_argument(
@@ -56,8 +53,8 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Path to the target file. Either a CSV (single-individual targets, rows = "
-            "cell types, columns = ENSIDs) or a pseudo-bulk .h5ad produced by "
-            "get_ge_per_ind.py (multi-individual). Detected automatically from extension."
+            "cell types, columns = ENSIDs) or a pseudo-bulk population .h5ad. "
+            "Detected automatically from extension."
         )
     )
     parser.add_argument(
@@ -65,9 +62,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "When using a multi-individual h5ad target, optionally restrict to a single "
-            "cell type label. Otherwise all cell types in obs are used (output_dim = "
-            "n_cell_types)."
+            "When using a population h5ad target, optionally restrict to a single cell "
+            "type label. Otherwise all cell types in obs are used (output_dim = n_cell_types)."
         )
     )
     parser.add_argument(
@@ -194,13 +190,16 @@ def main() -> None:
     setup_logging(args.verbose)
     logging.debug("Arguments: %s", args)
 
-    if args.observations.is_dir() and args.targets.suffix == ".h5ad":
+    if args.targets.suffix == ".h5ad":
         logging.info(
-            "Detected multi-individual setup: -X is a directory and -y is .h5ad. "
-            "Using MultiIndividualMddDataset."
+            "Detected reference-population setup: -X is a single (reference) "
+            "feature set and -y is .h5ad. Using ReferencePopulationMddDataset "
+            "(shared reference features, per-individual targets)."
         )
-        dataset = MultiIndividualMddDataset(
-            X_dir=args.observations,
+        dataset = ReferencePopulationMddDataset(
+            X_feats=args.observations.with_suffix(".features.npy"),
+            X_ensids=args.observations.with_suffix(".ensids.npy"),
+            X_chroms=args.observations.with_suffix(".chroms.npy"),
             y=args.targets,
             normalize=args.norm_targets,
             cell_type=args.cell_type,
@@ -208,7 +207,7 @@ def main() -> None:
     else:
         if args.cell_type is not None:
             logging.warning(
-                "--cell-type is only used with multi-individual h5ad targets; ignoring."
+                "--cell-type is only used with population h5ad targets; ignoring."
             )
         dataset = MddDataset(
             X_feats=args.observations.with_suffix(".features.npy"),
@@ -398,7 +397,12 @@ def main() -> None:
         }, args.output)
         logging.info(f"Model saved to {args.output}.")
 
-        idx2ct = np.asarray(dataset.y.index.astype(str).tolist(), dtype=object)
+        if hasattr(dataset, "y") and isinstance(dataset.y, pd.DataFrame):
+            cell_types = dataset.y.index.astype(str).tolist()
+        else:
+            # ReferencePopulation datasets expose `cell_types`.
+            cell_types = [str(ct) for ct in dataset.cell_types]
+        idx2ct = np.asarray(cell_types, dtype=object)
 
         mapping_path = args.output.with_suffix(".idx2ct.npy")
         np.save(mapping_path, idx2ct)
