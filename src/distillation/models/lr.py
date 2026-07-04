@@ -1,10 +1,12 @@
 import json
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import ElasticNetCV, RidgeCV
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
@@ -12,7 +14,7 @@ from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
-from src.distillation.utils import ld_prune
+from src.distillation.utils import ld_prune, train_test_indices
 
 
 @dataclass
@@ -34,7 +36,12 @@ class LRStruct:
     y_mean_:  float
     y_scale_: float
 
-    train_r2_: Optional[float] = None
+    # R^2 on held-out individuals (per-gene 20% split); the fair comparison metric.
+    heldout_r2_:  Optional[float] = None
+    # in-sample R^2 of the held-out model on its own train fold (overfitting gap).
+    insample_r2_: Optional[float] = None
+    n_train_: int = 0
+    n_test_:  int = 0
 
 
 class LR:
@@ -70,17 +77,39 @@ class LR:
                 gcv_mode="auto",
             )
         elif self.model_name == "elasticnet":
+            # Let ElasticNetCV build the alpha path *from the data*: it computes
+            # alpha_max (the smallest penalty that zeros all coefficients) and
+            # logspaces down by `eps`. This is far better conditioned than a fixed
+            # 1e-6..1e6 grid, whose tiny alphas leave the coordinate-descent solver
+            # thrashing against max_iter (slow + ConvergenceWarnings) with almost no
+            # regularization. `selection="random"` also speeds up convergence.
             return ElasticNetCV(
                 l1_ratio=self.l1_ratio,
                 cv=self.cv,
-                alphas=np.logspace(-6, 6, self.alphas),
+                n_alphas=self.alphas,
                 max_iter=self.max_iter,
                 fit_intercept=True,
                 random_state=self.seed,
+                selection="random",
                 n_jobs=1,
             )
         else:
             raise ValueError(f"Unknown model name: {self.model_name}")
+
+    def _fit_scaled(self, X: np.ndarray, y: np.ndarray):
+        """Fit X/y standardizers + the (CV) linear model on the given rows."""
+        x_scaler = StandardScaler().fit(X)
+        X_scaled = x_scaler.transform(X)
+        y_scaler = StandardScaler().fit(y.reshape(-1, 1))
+        y_scaled = y_scaler.transform(y.reshape(-1, 1)).reshape(-1)
+        enet = self._make_model()
+        enet.fit(X_scaled, y_scaled)
+        return x_scaler, y_scaler, enet
+
+    @staticmethod
+    def _predict_scaled(x_scaler, y_scaler, enet, X: np.ndarray) -> np.ndarray:
+        y_hat_scaled = enet.predict(x_scaler.transform(X))
+        return y_scaler.inverse_transform(y_hat_scaled.reshape(-1, 1)).reshape(-1)
 
     def fit_gene_matrix(
         self,
@@ -105,19 +134,23 @@ class LR:
             # perform LD pruning
             X, snp_ids = ld_prune(X, snp_ids)
 
-        x_scaler = StandardScaler()
-        X_scaled = x_scaler.fit_transform(X)
+        # Held-out evaluation: fit on a per-gene 80% split of the individuals and
+        # score R^2 on the remaining 20%, so the number is comparable to any model
+        # evaluated out-of-sample (and exposes overfitting for p >> n cis windows).
+        # The saved coefficients below are refit on *all* individuals.
+        train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
+        if test_idx is not None:
+            xs, ys, enet_h = self._fit_scaled(X[train_idx], y[train_idx])
+            heldout_r2  = float(r2_score(y[test_idx], self._predict_scaled(xs, ys, enet_h, X[test_idx])))
+            insample_r2 = float(r2_score(y[train_idx], self._predict_scaled(xs, ys, enet_h, X[train_idx])))
+            n_train, n_test = int(train_idx.size), int(test_idx.size)
+        else:
+            # too few individuals to hold out: no honest generalization estimate
+            heldout_r2, insample_r2 = float("nan"), float("nan")
+            n_train, n_test = int(y.size), 0
 
-        y_scaler = StandardScaler()
-        y_scaled = y_scaler.fit_transform(y.reshape(-1, 1)).reshape(-1)
-
-        enet = self._make_model()
-        enet.fit(X_scaled, y_scaled)
-
-        # predict in standardized space, then invert to original y space
-        y_hat_scaled = enet.predict(X_scaled)
-        y_hat        = y_scaler.inverse_transform(y_hat_scaled.reshape(-1, 1)).reshape(-1)
-        train_r2     = r2_score(y, y_hat)
+        # Final model refit on all individuals -> these are the persisted coefficients.
+        x_scaler, y_scaler, enet = self._fit_scaled(X, y)
 
         model = LRStruct(
             model_name=self.model_name,
@@ -132,7 +165,10 @@ class LR:
             x_scale_=x_scaler.scale_.copy(),
             y_mean_=y_scaler.mean_[0],
             y_scale_=y_scaler.scale_[0],
-            train_r2_=train_r2,
+            heldout_r2_=heldout_r2,
+            insample_r2_=insample_r2,
+            n_train_=n_train,
+            n_test_=n_test,
         )
         self.models_[gene] = model
         return model
@@ -155,7 +191,8 @@ class LR:
                 nnz = int(np.sum(model.coef_ != 0))
                 print(
                     f"[{i}/{n}] fit {gene}: "
-                    f"nonzero={nnz}, r2={model.train_r2_:.4f}"
+                    f"nonzero={nnz}, heldout_r2={model.heldout_r2_:.4f} "
+                    f"(insample={model.insample_r2_:.4f}, n_test={model.n_test_})"
                 )
             return model
         except Exception as e:
@@ -171,6 +208,10 @@ class LR:
         genes = list(dataset.genes)
         n     = len(genes)
         n_jobs = max(1, int(self.n_jobs))
+
+        # A handful of ill-conditioned cis-windows may still hit max_iter even with
+        # the data-driven alpha path; silence those so the progress bar stays clean.
+        warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
         if n_jobs == 1:
             for i, gene in enumerate(genes, start=1):
@@ -209,7 +250,10 @@ class LR:
             rows.append(
                 {
                     "gene": gene,
-                    "r2": model.train_r2_,
+                    "r2": model.heldout_r2_,          # held-out (per-gene 20%) R^2
+                    "insample_r2": model.insample_r2_,
+                    "n_train": model.n_train_,
+                    "n_test": model.n_test_,
                     "nonzero_weights": int(np.sum(model.coef_ != 0)),
                     "alpha": model.alpha_,
                     "l1_ratio": model.l1_ratio_,

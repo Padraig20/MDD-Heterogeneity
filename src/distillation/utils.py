@@ -1,7 +1,41 @@
 import random
+import zlib
+
 import numpy as np
 
 from src.distillation.dataset import GenotypeDataset
+
+
+def train_test_indices(
+    n: int,
+    seed: int = 42,
+    test_frac: float = 0.2,
+    key: str | None = None,
+    min_train: int = 3,
+    min_test: int = 2,
+):
+    """
+    Reproducible per-gene split of `n` individuals into (train_idx, test_idx).
+
+    A stable per-gene offset (crc32 of `key`) is folded into the seed so that each
+    gene gets its own split, yet the whole run stays deterministic across processes
+    and parallel workers (crc32 is stable, unlike the randomized built-in `hash`).
+
+    Returns two sorted index arrays, or ``(None, None)`` when `n` is too small to
+    hold out a meaningful test fold (fewer than `min_train + min_test` individuals).
+    Callers should then fall back to an in-sample fit and report held-out metrics as
+    NaN so tiny-sample genes don't masquerade as generalization estimates.
+    """
+    if n is None or n < min_train + min_test:
+        return None, None
+    offset = 0 if key is None else zlib.crc32(str(key).encode("utf-8")) % 100000
+    rng    = np.random.default_rng(seed + offset)
+    perm   = rng.permutation(n)
+    n_test = int(round(n * test_frac))
+    n_test = max(min_test, min(n_test, n - min_train))
+    test_idx  = np.sort(perm[:n_test])
+    train_idx = np.sort(perm[n_test:])
+    return train_idx, test_idx
 
 # taken from scPrediXcan tutorial
 # https://github.com/hakyimlab/scPrediXcan/blob/master/Scripts/ctPred/Tutorial.ipynb
