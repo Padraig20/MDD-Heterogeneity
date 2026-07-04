@@ -6,9 +6,11 @@ from pathlib import Path
 import os
 import numpy as np
 import pandas as pd
+import torch
 from tqdm import tqdm
 
 from src.distillation.models.lr import LR
+from src.distillation.models.ensemble_lr import EnsembleLR
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.wandb_logger import WandBLogger
 
@@ -52,13 +54,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-mi", "--max_iter",
         type=int,
-        default=10000,
+        default=2000,
         help="Maximum number of iterations for training."
     )
     parser.add_argument(
         "-a", "--alphas",
         type=int,
-        default=5,
+        default=15,
         help="Number of alpha values to try for CV."
     )
     parser.add_argument(
@@ -123,7 +125,76 @@ def parse_args() -> argparse.Namespace:
             "MAF is computed across the loaded cohort. Defaults to no MAF filtering."
         ),
     )
+    parser.add_argument(
+        "--variance",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a directory of teacher target *variances* (one CSV per cell type, "
+            "same names/format as --targets, e.g. the 'totvar' output of get_student_data.py). "
+            "When provided, a probabilistic linear deep ensemble is distilled by matching the "
+            "teacher's (mean, variance) Gaussians via the 2-Wasserstein metric, instead of a "
+            "point-estimate elasticnet/ridge model."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-size",
+        type=int,
+        default=5,
+        help="Number of linear ensemble members for probabilistic distillation (--variance).",
+    )
+    parser.add_argument(
+        "--prob-epochs",
+        type=int,
+        default=300,
+        help="Number of full-batch gradient steps per gene for probabilistic distillation.",
+    )
+    parser.add_argument(
+        "--prob-lr",
+        type=float,
+        default=1e-2,
+        help="Learning rate for the probabilistic (deep-ensemble LR) distillation.",
+    )
+    parser.add_argument(
+        "--prob-weight-decay",
+        type=float,
+        default=0.25,
+        help="Weight decay (L2) for the probabilistic (deep-ensemble LR) distillation.",
+    )
+    parser.add_argument(
+        "--prob-l1",
+        type=float,
+        default=0.75,
+        help=(
+            "Group-lasso strength on the mean head for probabilistic distillation "
+            "(--variance). Groups the ensemble members sharing each SNP and applies a "
+            "proximal step so whole SNP columns are driven to exactly zero, inducing "
+            "elastic-net-style sparsity. 0 disables (dense L2-only fit); increase it to "
+            "reduce the nonzero-weight count."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help=(
+            "Torch device for probabilistic distillation (--variance), e.g. 'cpu', 'cuda', "
+            "or 'cuda:0'. Use 'auto' to pick 'cuda' when available. Ignored for the "
+            "elasticnet/ridge (sklearn, CPU) path."
+        ),
+    )
     return parser.parse_args()
+
+def resolve_device(device: str) -> torch.device:
+    """Resolve a --device string to a torch.device, warning + falling back to CPU
+    if CUDA was requested but is unavailable."""
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        logging.warning("CUDA requested via --device '%s' but not available; using CPU.", device)
+        return torch.device("cpu")
+    return dev
 
 def setup_logging(verbosity: int) -> None:
     """Configure basic logging based on verbosity level."""
@@ -200,9 +271,32 @@ def main() -> None:
     jobs = max(1, args.jobs)
     logging.info("Fitting genes per cell type with %d parallel workers.", jobs)
 
+    probabilistic = args.variance is not None
+    prob_device = "cpu"
+    if probabilistic:
+        prob_device = resolve_device(args.device)
+        if prob_device.type == "cuda" and jobs > 1:
+            logging.info(
+                "Using CUDA for probabilistic distillation; gene fits share the GPU, "
+                "so the %d workers mainly overlap CPU-side data prep with GPU compute.",
+                jobs,
+            )
+        logging.info(
+            "Probabilistic distillation enabled on device '%s': fitting a linear deep "
+            "ensemble against teacher (mean, variance) Gaussians via the 2-Wasserstein metric.",
+            prob_device,
+        )
+
     for ct_file in tqdm(cell_type_files, desc="Processing cell types"):
         ct_name = ct_file[:-4]  # remove .csv extension
         logging.info("Processing cell type: %s", ct_name)
+
+        y_var = os.path.join(args.variance, ct_file) if probabilistic else None
+        if probabilistic and not os.path.exists(y_var):
+            logging.warning(
+                "No variance file for cell type '%s' at %s; skipping.", ct_name, y_var
+            )
+            continue
 
         dataset = GenotypeDataset(
             bims=bims,
@@ -214,14 +308,27 @@ def main() -> None:
             max_individuals=args.max_individuals,
             bed_template=bed_template,
             maf_threshold=args.maf_threshold,
+            y_var=y_var,
         )
-        model = LR(
-            model_name=args.model_name,
-            max_iter=args.max_iter,
-            alphas=args.alphas,
-            seed=args.seed,
-            n_jobs=jobs,
-        )
+        if probabilistic:
+            model = EnsembleLR(
+                n_models=args.ensemble_size,
+                epochs=args.prob_epochs,
+                lr=args.prob_lr,
+                weight_decay=args.prob_weight_decay,
+                l1=args.prob_l1,
+                seed=args.seed,
+                n_jobs=jobs,
+                device=prob_device,
+            )
+        else:
+            model = LR(
+                model_name=args.model_name,
+                max_iter=args.max_iter,
+                alphas=args.alphas,
+                seed=args.seed,
+                n_jobs=jobs,
+            )
         model.fit_dataset(dataset, verbose=args.verbose > 0)
 
         if args.output_dir is not None:
@@ -229,8 +336,9 @@ def main() -> None:
             path = os.path.join(args.output_dir, f"{ct_path}.json")
             model.save_coefficients(path)
 
+        model_label = "Linear Deep Ensemble" if probabilistic else args.model_name.capitalize()
         df = model.summarize_models()
-        wb_logger.log_celltype_diagnostics(df, cell_type=ct_name)
+        wb_logger.log_celltype_diagnostics(df, cell_type=ct_name, model_label=model_label)
 
     wb_logger.finish()
 

@@ -46,6 +46,7 @@ class GenotypeDataset(Dataset):
         max_individuals: int | None = None,
         bed_template: str = DEFAULT_BED_TEMPLATE,
         maf_threshold: float | None = None,
+        y_var: Path | pd.DataFrame | None = None,
     ):
         """
         Args:
@@ -61,6 +62,13 @@ class GenotypeDataset(Dataset):
             maf_threshold (float | None): Minimum minor allele frequency a SNP must have to be kept (e.g. 0.05
                                           for MAF >= 5%). MAF is computed across the loaded cohort. If None,
                                           no MAF filtering is applied.
+            y_var (Path | pd.DataFrame | None): Optional per-(gene, individual) target *variances* in the same
+                                          wide format as `y` (gene,chrom,tss,individual1,...). Used for
+                                          probabilistic distillation, where the teacher provides a Gaussian
+                                          (mean, variance) per target. The variances are taken as-is (no
+                                          normalization is applied) since they live in the model's output space,
+                                          which matches the log-transformed mean targets. If None, no variance
+                                          targets are attached.
         """
         self.bims         = bims
         self.bim_dir      = bim_dir
@@ -92,6 +100,8 @@ class GenotypeDataset(Dataset):
                 self.y["expression"] = np.log1p(self.y["expression"])
             else:
                 raise ValueError(f"Invalid normalization method: {self.normalize}")
+            if y_var is not None:
+                self.y = self._attach_variance(self.y, y_var)
         elif self.max_individuals is not None:
             selected_individuals = self.y["individual"].drop_duplicates().head(self.max_individuals)
             self.y = self.y[self.y["individual"].isin(selected_individuals)].copy()
@@ -134,16 +144,49 @@ class GenotypeDataset(Dataset):
         # over many individuals of the same gene) don't recompute allele freqs.
         self._maf_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
 
-        # Per-gene: metadata + the row-individuals/expression vectors.
-        self._gene_meta: dict[str, tuple[str, int, np.ndarray, np.ndarray]] = {}
+        # Per-gene: metadata + the row-individuals/expression (and optional variance) vectors.
+        self.has_variance = "variance" in self.y.columns
+        self._gene_meta: dict[str, tuple[str, int, np.ndarray, np.ndarray, np.ndarray | None]] = {}
         if "gene" in self.y.columns and len(self.y) > 0:
             for gene, group in self.y.groupby("gene", sort=False):
+                variance = (
+                    group["variance"].to_numpy() if self.has_variance else None
+                )
                 self._gene_meta[gene] = (
                     str(group["chrom"].iloc[0]),
                     int(group["tss"].iloc[0]),
                     group["individual"].astype(str).to_numpy(),
                     group["expression"].to_numpy(),
+                    variance,
                 )
+
+    @staticmethod
+    def _attach_variance(y_df: pd.DataFrame, y_var: Path | pd.DataFrame | str) -> pd.DataFrame:
+        """
+        Melt the wide variance table and merge a `variance` column onto the (already
+        melted) `y_df` by (gene, chrom, tss, individual).
+
+        Variances are kept in the teacher's output space (no log/percentile transform),
+        which is consistent with the log-transformed mean targets used for distillation.
+        """
+        if isinstance(y_var, (Path, str)):
+            var_df = pd.read_csv(y_var)
+        else:
+            var_df = y_var.copy()
+
+        if "individual" not in var_df.columns:
+            var_df = var_df.melt(
+                id_vars=["gene", "chrom", "tss"],
+                var_name="individual",
+                value_name="variance",
+            )
+
+        merged = y_df.merge(
+            var_df[["gene", "chrom", "tss", "individual", "variance"]],
+            on=["gene", "chrom", "tss", "individual"],
+            how="left",
+        )
+        return merged
 
     @staticmethod
     def to_percentiles(y_df: pd.DataFrame) -> pd.DataFrame:
@@ -245,25 +288,37 @@ class GenotypeDataset(Dataset):
 
         return x, y
     
-    def get_gene_matrix(self, gene: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    def get_gene_matrix(
+        self, gene: str, return_variance: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
         """
         Build the full design matrix for one gene.
 
         Uses pre-built caches from `_build_caches`:
         - per-chromosome sorted bp + searchsorted for the cis window (O(log M))
         - per-chromosome individual -> BED row dict (O(1) lookup)
-        - per-gene (chrom, tss, individuals, expression) tuple (O(1) lookup)
+        - per-gene (chrom, tss, individuals, expression, variance) tuple (O(1) lookup)
+
+        Args:
+            return_variance: if True, also return the per-individual target variances
+                (requires the dataset to have been built with `y_var`).
 
         Returns:
             X       : shape (n_individuals_for_gene, n_snps_in_window)
             y       : shape (n_individuals_for_gene,)
+            [y_var] : shape (n_individuals_for_gene,)  (only if return_variance=True)
             snp_ids : shape (n_snps_in_window,)
             chrom   : chromosome name
         """
         meta = self._gene_meta.get(gene)
         if meta is None:
             raise ValueError(f"No data found for gene {gene}")
-        chrom, tss, row_individuals, y = meta
+        chrom, tss, row_individuals, y, y_var = meta
+
+        if return_variance and y_var is None:
+            raise ValueError(
+                "Variance targets requested but this dataset was built without `y_var`."
+            )
 
         # Cis window via sorted-bp searchsorted (BIM is bp-sorted by chrom in plink output).
         bps      = self._chrom_bps[chrom]
@@ -286,6 +341,8 @@ class GenotypeDataset(Dataset):
         if not keep.all():
             individual_idx = individual_idx[keep]
             y = y[keep]
+            if y_var is not None:
+                y_var = y_var[keep]
 
         bed_path = os.path.join(
             self.bim_dir,
@@ -299,6 +356,8 @@ class GenotypeDataset(Dataset):
             X       = X[:, keep_snp]
             snp_ids = snp_ids[keep_snp]
 
+        if return_variance:
+            return X, y, y_var, snp_ids, chrom
         return X, y, snp_ids, chrom
 
 if __name__ == "__main__":
