@@ -181,11 +181,17 @@ class GenotypeDataset(Dataset):
                 value_name="variance",
             )
 
-        merged = y_df.merge(
-            var_df[["gene", "chrom", "tss", "individual", "variance"]],
-            on=["gene", "chrom", "tss", "individual"],
-            how="left",
-        )
+        merge_keys = ["gene", "chrom", "tss", "individual"]
+        tmp_keys   = [f"__merge_{key}" for key in merge_keys]
+
+        y_df = y_df.copy()
+        var_df = var_df[merge_keys + ["variance"]].copy()
+        for key, tmp_key in zip(merge_keys, tmp_keys):
+            y_df[tmp_key] = y_df[key].astype(str)
+            var_df[tmp_key] = var_df[key].astype(str)
+
+        merged = y_df.merge(var_df[tmp_keys + ["variance"]], on=tmp_keys, how="left")
+        merged = merged.drop(columns=tmp_keys)
         return merged
 
     @staticmethod
@@ -330,6 +336,12 @@ class GenotypeDataset(Dataset):
         var_idx  = np.arange(left, right, dtype=np.int64)
         snp_ids  = all_snps[left:right]
 
+        # MAF filtering (if enabled) happens before subsetting
+        if self.maf_threshold is not None and var_idx.size > 0:
+            maf_keep = self._window_maf_mask(chrom, var_idx)
+            var_idx  = var_idx[maf_keep]
+            snp_ids  = snp_ids[maf_keep]
+
         # Map individuals to BED/FAM row indices via cached dict.
         ind_to_idx = self._ind_to_idx[chrom]
         individual_idx = np.fromiter(
@@ -350,11 +362,6 @@ class GenotypeDataset(Dataset):
         )
         with open_bed(bed_path) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
-
-        if self.maf_threshold is not None and X.shape[1] > 0:
-            keep_snp = self._maf_from_genotypes(X) >= self.maf_threshold
-            X       = X[:, keep_snp]
-            snp_ids = snp_ids[keep_snp]
 
         if return_variance:
             return X, y, y_var, snp_ids, chrom

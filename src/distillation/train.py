@@ -39,6 +39,17 @@ def parse_args() -> argparse.Namespace:
         help="Path to target directory; should contain a CSV file for each cell-type."
     )
     parser.add_argument(
+        "-yt", "--targets-test",
+        type=Path,
+        default=None,
+        help=(
+            "Path to an optional held-out target directory (same format/filenames as "
+            "--targets, one CSV per cell-type, disjoint individuals). If provided, models "
+            "are trained on *all* individuals in --targets and evaluated on the "
+            "individuals found here, instead of the automatic per-gene 80:20 split."
+        ),
+    )
+    parser.add_argument(
         "-o", "--output-dir",
         type=Path,
         default=None,
@@ -135,6 +146,19 @@ def parse_args() -> argparse.Namespace:
             "When provided, a probabilistic linear deep ensemble is distilled by matching the "
             "teacher's (mean, variance) Gaussians via the 2-Wasserstein metric, instead of a "
             "point-estimate elasticnet/ridge model."
+        ),
+    )
+    parser.add_argument(
+        "--variance-test",
+        type=Path,
+        default=None,
+        help=(
+            "Path to an optional directory of teacher target *variances* for the "
+            "held-out test set (used together with --targets-test), same format/"
+            "filenames as --variance. Only relevant for probabilistic distillation "
+            "(--variance). If omitted while --targets-test is set, the held-out "
+            "evaluation reuses --variance, matched by individual, which is only "
+            "correct if that file also covers the test individuals."
         ),
     )
     parser.add_argument(
@@ -265,6 +289,13 @@ def main() -> None:
     cell_type_files = os.listdir(args.targets)
     logging.info(f"Found {len(cell_type_files)} cell types!")
 
+    use_external_test = args.targets_test is not None
+    if use_external_test:
+        logging.info(
+            "Using held-out target directory '%s' for evaluation instead of the "
+            "automatic 80:20 split.", args.targets_test,
+        )
+
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 
@@ -310,6 +341,40 @@ def main() -> None:
             maf_threshold=args.maf_threshold,
             y_var=y_var,
         )
+
+        test_dataset = None
+        if use_external_test:
+            test_path = os.path.join(args.targets_test, ct_file)
+            if not os.path.exists(test_path):
+                logging.warning(
+                    "No held-out target file for cell type '%s' at %s; falling back "
+                    "to the automatic 80:20 split for this cell type.", ct_name, test_path,
+                )
+            else:
+                y_var_test = y_var
+                if probabilistic and args.variance_test is not None:
+                    candidate = os.path.join(args.variance_test, ct_file)
+                    if os.path.exists(candidate):
+                        y_var_test = candidate
+                    else:
+                        logging.warning(
+                            "No held-out variance file for cell type '%s' at %s; falling "
+                            "back to --variance (%s) for the held-out evaluation.",
+                            ct_name, candidate, y_var,
+                        )
+                test_dataset = GenotypeDataset(
+                    bims=bims,
+                    idx2ind=idx2ind,
+                    y=test_path,
+                    bim_dir=args.observations,
+                    select_genes=args.select_genes,
+                    normalize=args.norm_targets,
+                    max_individuals=None,
+                    bed_template=bed_template,
+                    maf_threshold=args.maf_threshold,
+                    y_var=y_var_test,
+                )
+
         if probabilistic:
             model = EnsembleLR(
                 n_models=args.ensemble_size,
@@ -329,7 +394,7 @@ def main() -> None:
                 seed=args.seed,
                 n_jobs=jobs,
             )
-        model.fit_dataset(dataset, verbose=args.verbose > 0)
+        model.fit_dataset(dataset, test_dataset=test_dataset, verbose=args.verbose > 0)
 
         if args.output_dir is not None:
             ct_path = ct_name.replace(" ", "_")

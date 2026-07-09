@@ -6,6 +6,23 @@ import numpy as np
 from src.distillation.dataset import GenotypeDataset
 
 
+def safe_pearson(a, b) -> float:
+    """
+    Pearson correlation that never triggers numpy's divide-by-zero warnings.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    mask = np.isfinite(a) & np.isfinite(b)
+    if int(mask.sum()) < 2:
+        return float("nan")
+    a = a[mask]; b = b[mask]
+    a = a - a.mean(); b = b - b.mean()
+    denom = np.sqrt(float(a @ a) * float(b @ b))
+    if not np.isfinite(denom) or denom <= 1e-12:
+        return float("nan")
+    return float((a @ b) / denom)
+
+
 def train_test_indices(
     n: int,
     seed: int = 42,
@@ -56,7 +73,8 @@ def ld_prune(
     X: np.ndarray,
     snp_ids: np.ndarray,
     threshold: float = 0.1,
-) -> tuple[np.ndarray, np.ndarray]:
+    align: list[np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
     """
     Simple greedy LD pruning based on pairwise column correlation.
     Keeps the first SNP, then removes later SNPs with r^2 >= threshold
@@ -65,9 +83,20 @@ def ld_prune(
 
     snp_ids = np.atleast_1d(np.asarray(snp_ids))
 
+    def _finish(X_, snp_ids_, keep_var_, keep_):
+        if align is None:
+            return X_, snp_ids_
+        aligned = []
+        for a in align:
+            a = a[:, keep_var_]
+            if keep_ is not None:
+                a = a[:, keep_]
+            aligned.append(a)
+        return X_, snp_ids_, aligned
+
     _, n_snps = X.shape
     if n_snps <= 1:
-        return X, snp_ids
+        return _finish(X, snp_ids, slice(None), None)
 
     # remove zero-variance SNPs first
     var      = X.var(axis=0)
@@ -77,7 +106,7 @@ def ld_prune(
 
     n_snps = X.shape[1]
     if n_snps <= 1:
-        return X, snp_ids
+        return _finish(X, snp_ids, keep_var, None)
 
     keep = []
 
@@ -98,4 +127,4 @@ def ld_prune(
             keep.append(j)
 
     keep = np.asarray(keep, dtype=int)
-    return X[:, keep], snp_ids[keep]
+    return _finish(X[:, keep], snp_ids[keep], keep_var, keep)

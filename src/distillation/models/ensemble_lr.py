@@ -47,35 +47,12 @@ from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
-from src.distillation.utils import train_test_indices
+from src.distillation.utils import safe_pearson, train_test_indices
 
 
 # --------------------------------------------------------------------------- #
 # ----------------------------- Wasserstein loss ---------------------------- #
 # --------------------------------------------------------------------------- #
-
-def _safe_pearson(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Pearson correlation that never triggers numpy's divide-by-zero warnings.
-
-    Restricts to jointly-finite entries and only divides when the denominator is
-    finite and strictly positive; returns NaN otherwise (e.g. a (near-)constant
-    input, for which the correlation is undefined).
-    """
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    mask = np.isfinite(a) & np.isfinite(b)
-    if int(mask.sum()) < 2:
-        return float("nan")
-    a = a[mask]
-    b = b[mask]
-    a = a - a.mean()
-    b = b - b.mean()
-    denom = np.sqrt(float(a @ a) * float(b @ b))
-    if not np.isfinite(denom) or denom <= 1e-12:
-        return float("nan")
-    return float((a @ b) / denom)
-
 
 def gaussian_w2_loss(
     mean_pred: torch.Tensor,
@@ -179,6 +156,7 @@ class EnsembleLRStruct:
     n_train_:           int = 0
     n_test_:            int = 0
     pearson_r_:         Optional[float] = None  # held-out Pearson r of the means (bounded [-1, 1])
+    insample_pearson_r_: Optional[float] = None  # in-sample Pearson r on the train fold
     train_w2_:          Optional[float] = None  # held-out mean 2-Wasserstein distance (mean + std parts)
     mean_w2_:           Optional[float] = None  # mean-matching part of the Wasserstein
     std_w2_:            Optional[float] = None  # std/variance-matching part (variance-fit error, lower is better)
@@ -361,13 +339,13 @@ class EnsembleLR:
             return metrics
 
         metrics["r2"]        = float(r2_score(y, mu_np))
-        metrics["pearson_r"] = _safe_pearson(mu_np, y)
+        metrics["pearson_r"] = safe_pearson(mu_np, y)
         # Wasserstein split into its mean and std (variance) contributions
         metrics["mean_w2"]   = float(np.mean((mu_np - y) ** 2))
         metrics["std_w2"]    = float(np.mean((total_std - std_native) ** 2))
         metrics["w2"]        = metrics["mean_w2"] + metrics["std_w2"]
         # How well does the predicted per-individual std track the target std?
-        metrics["std_corr"]  = _safe_pearson(total_std, std_native)
+        metrics["std_corr"]  = safe_pearson(total_std, std_native)
         denom                = float(np.mean(std_native))
         metrics["std_ratio"] = float(np.mean(total_std) / denom) if denom > 1e-12 else nan
         metrics["pred_std"]  = float(np.mean(total_std))
@@ -381,6 +359,9 @@ class EnsembleLR:
         y_var: np.ndarray,
         snp_ids: np.ndarray,
         chr: int,
+        X_test: Optional[np.ndarray] = None,
+        y_test: Optional[np.ndarray] = None,
+        y_var_test: Optional[np.ndarray] = None,
     ) -> EnsembleLRStruct:
         X     = np.asarray(X, dtype=np.float32)
         y     = np.asarray(y, dtype=np.float32)
@@ -401,30 +382,66 @@ class EnsembleLR:
         # teacher variances must be non-negative; clamp tiny negatives from noise.
         y_var = np.clip(y_var, 0.0, None)
 
-        # Held-out evaluation: train on a per-gene 80% split of the individuals and
-        # score every distribution-matching metric on the remaining 20%, so the
-        # numbers are comparable to the point-estimate LR (also held-out) and expose
-        # overfitting for p >> n cis windows. The persisted coefficients are refit on
-        # all individuals afterwards.
-        train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
-        if test_idx is not None:
-            model_h, scalers_h = self._fit_ensemble(
-                gene, X[train_idx], y[train_idx], y_var[train_idx]
-            )
-            metrics     = self._evaluate(model_h, scalers_h, X[test_idx], y[test_idx], y_var[test_idx])
-            insample    = self._evaluate(model_h, scalers_h, X[train_idx], y[train_idx], y_var[train_idx])
-            insample_r2 = insample["r2"]
-            n_train, n_test = int(train_idx.size), int(test_idx.size)
+        has_external_test = X_test is not None and y_test is not None and y_var_test is not None
+        if has_external_test:
+            X_test     = np.asarray(X_test, dtype=np.float32)
+            y_test     = np.asarray(y_test, dtype=np.float32)
+            y_var_test = np.asarray(y_var_test, dtype=np.float32)
+            valid_test = ~np.isnan(y_test) & ~np.isnan(y_var_test)
+            if not valid_test.all():
+                X_test     = X_test[valid_test]
+                y_test     = y_test[valid_test]
+                y_var_test = y_var_test[valid_test]
+            y_var_test = np.clip(y_var_test, 0.0, None)
+
+        if has_external_test:
+            # Held-out evaluation on a user-supplied, disjoint test set: train on
+            # *all* individuals from `X`/`y`/`y_var` (no internal split) and evaluate
+            # on `X_test`/`y_test`/`y_var_test`.
+            if y_test.size > 0:
+                model_h, scalers_h = self._fit_ensemble(gene, X, y, y_var)
+                metrics     = self._evaluate(model_h, scalers_h, X_test, y_test, y_var_test)
+                insample    = self._evaluate(model_h, scalers_h, X, y, y_var)
+                insample_r2 = insample["r2"]
+                insample_pearson_r = insample["pearson_r"]
+                n_train, n_test = int(y.size), int(y_test.size)
+            else:
+                metrics = {
+                    "r2": float("nan"), "pearson_r": float("nan"), "w2": float("nan"),
+                    "mean_w2": float("nan"), "std_w2": float("nan"), "std_corr": float("nan"),
+                    "std_ratio": float("nan"), "pred_std": float("nan"),
+                    "target_std": float(np.mean(np.sqrt(y_var))), "diverged": False,
+                }
+                insample_r2 = float("nan")
+                insample_pearson_r = float("nan")
+                n_train, n_test = int(y.size), 0
         else:
-            # too few individuals to hold out: no honest generalization estimate
-            metrics = {
-                "r2": float("nan"), "pearson_r": float("nan"), "w2": float("nan"),
-                "mean_w2": float("nan"), "std_w2": float("nan"), "std_corr": float("nan"),
-                "std_ratio": float("nan"), "pred_std": float("nan"),
-                "target_std": float(np.mean(np.sqrt(y_var))), "diverged": False,
-            }
-            insample_r2 = float("nan")
-            n_train, n_test = int(y.size), 0
+            # Held-out evaluation: train on a per-gene 80% split of the individuals and
+            # score every distribution-matching metric on the remaining 20%, so the
+            # numbers are comparable to the point-estimate LR (also held-out) and expose
+            # overfitting for p >> n cis windows. The persisted coefficients are refit on
+            # all individuals afterwards.
+            train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
+            if test_idx is not None:
+                model_h, scalers_h = self._fit_ensemble(
+                    gene, X[train_idx], y[train_idx], y_var[train_idx]
+                )
+                metrics     = self._evaluate(model_h, scalers_h, X[test_idx], y[test_idx], y_var[test_idx])
+                insample    = self._evaluate(model_h, scalers_h, X[train_idx], y[train_idx], y_var[train_idx])
+                insample_r2 = insample["r2"]
+                insample_pearson_r = insample["pearson_r"]
+                n_train, n_test = int(train_idx.size), int(test_idx.size)
+            else:
+                # too few individuals to hold out: no honest generalization estimate
+                metrics = {
+                    "r2": float("nan"), "pearson_r": float("nan"), "w2": float("nan"),
+                    "mean_w2": float("nan"), "std_w2": float("nan"), "std_corr": float("nan"),
+                    "std_ratio": float("nan"), "pred_std": float("nan"),
+                    "target_std": float(np.mean(np.sqrt(y_var))), "diverged": False,
+                }
+                insample_r2 = float("nan")
+                insample_pearson_r = float("nan")
+                n_train, n_test = int(y.size), 0
 
         # Final model refit on all individuals -> these are the persisted coefficients.
         model, _ = self._fit_ensemble(gene, X, y, y_var)
@@ -457,6 +474,7 @@ class EnsembleLR:
             n_train_=n_train,
             n_test_=n_test,
             pearson_r_=metrics["pearson_r"],
+            insample_pearson_r_=insample_pearson_r,
             train_w2_=metrics["w2"],
             mean_w2_=metrics["mean_w2"],
             std_w2_=metrics["std_w2"],
@@ -469,9 +487,27 @@ class EnsembleLR:
         self.models_[gene] = struct
         return struct
 
-    def fit_gene_from_dataset(self, dataset: GenotypeDataset, gene: str) -> EnsembleLRStruct:
+    def fit_gene_from_dataset(
+        self,
+        dataset: GenotypeDataset,
+        gene: str,
+        test_dataset: Optional[GenotypeDataset] = None,
+    ) -> EnsembleLRStruct:
         X, y, y_var, snp_ids, chr = dataset.get_gene_matrix(gene, return_variance=True)
-        return self.fit_gene_matrix(gene, X, y, y_var, snp_ids, chr)
+        X_test, y_test, y_var_test = None, None, None
+        if test_dataset is not None:
+            try:
+                X_test, y_test, y_var_test, _, _ = test_dataset.get_gene_matrix(gene, return_variance=True)
+            except ValueError:
+                # Gene has no rows in the external test set; train on all of `X`/`y`/`y_var`
+                # but report held-out metrics as NaN (see fit_gene_matrix).
+                X_test = np.empty((0, X.shape[1]), dtype=X.dtype)
+                y_test = np.empty(0, dtype=y.dtype)
+                y_var_test = np.empty(0, dtype=y_var.dtype)
+        return self.fit_gene_matrix(
+            gene, X, y, y_var, snp_ids, chr,
+            X_test=X_test, y_test=y_test, y_var_test=y_var_test,
+        )
 
     def _fit_one(
         self,
@@ -480,14 +516,17 @@ class EnsembleLR:
         i: int,
         n: int,
         verbose: bool,
+        test_dataset: Optional[GenotypeDataset] = None,
     ) -> Optional[EnsembleLRStruct]:
         try:
-            model = self.fit_gene_from_dataset(dataset, gene)
+            model = self.fit_gene_from_dataset(dataset, gene, test_dataset=test_dataset)
             if verbose:
                 print(
                     f"[{i}/{n}] fit {gene}: "
-                    f"heldout_r2={model.train_r2_:.4f} (insample={model.insample_r2_:.4f}, "
-                    f"n_test={model.n_test_}), W2={model.train_w2_:.4f}, "
+                    f"heldout_r2={model.train_r2_:.4f}, heldout_pearson_r={model.pearson_r_:.4f} "
+                    f"(insample_r2={model.insample_r2_:.4f}, "
+                    f"insample_pearson_r={model.insample_pearson_r_:.4f}, n_test={model.n_test_}), "
+                    f"W2={model.train_w2_:.4f}, "
                     f"pred_std={model.mean_pred_std_:.3f}, target_std={model.mean_target_std_:.3f}"
                 )
             return model
@@ -500,11 +539,17 @@ class EnsembleLR:
         self,
         dataset: GenotypeDataset,
         verbose: bool = True,
+        test_dataset: Optional[GenotypeDataset] = None,
     ) -> Dict[str, EnsembleLRStruct]:
         if not getattr(dataset, "has_variance", False):
             raise ValueError(
                 "EnsembleLR requires a dataset built with variance targets (`y_var`). "
                 "Pass --variance to train.py."
+            )
+        if test_dataset is not None and not getattr(test_dataset, "has_variance", False):
+            raise ValueError(
+                "EnsembleLR requires the held-out test dataset to also carry variance "
+                "targets (`y_var`); pass --variance to train.py."
             )
 
         genes  = list(dataset.genes)
@@ -513,7 +558,7 @@ class EnsembleLR:
 
         if n_jobs == 1:
             for i, gene in enumerate(genes, start=1):
-                self._fit_one(dataset, gene, i, n, verbose)
+                self._fit_one(dataset, gene, i, n, verbose, test_dataset=test_dataset)
             return self.models_
 
         # Parallel path: thread pool over genes. torch releases the GIL during the
@@ -524,7 +569,7 @@ class EnsembleLR:
         try:
             with ThreadPoolExecutor(max_workers=n_jobs) as ex:
                 futures = {
-                    ex.submit(self._fit_one, dataset, gene, i, n, verbose): gene
+                    ex.submit(self._fit_one, dataset, gene, i, n, verbose, test_dataset): gene
                     for i, gene in enumerate(genes, start=1)
                 }
                 iterator = as_completed(futures)
@@ -572,7 +617,8 @@ class EnsembleLR:
                     "insample_r2": model.insample_r2_,
                     "n_train": model.n_train_,
                     "n_test": model.n_test_,
-                    "pearson_r": model.pearson_r_,   # bounded [-1, 1] mean-fit correlation
+                    "pearson_r": model.pearson_r_,   # held-out, bounded [-1, 1] mean-fit correlation
+                    "insample_pearson_r": model.insample_pearson_r_,
                     "wasserstein": model.train_w2_,
                     "mean_w2": model.mean_w2_,
                     "std_w2": model.std_w2_,          # variance-fit error (lower is better)
@@ -590,7 +636,11 @@ class EnsembleLR:
         if df.empty:
             return df
 
-        df = df.sort_values("r2", ascending=True).reset_index(drop=True)
+        # sort by Pearson r (bounded [-1, 1], so a more intuitive fit-quality
+        # ranking than R^2, which is unbounded below); fall back to R^2 if
+        # pearson_r is unavailable for some reason.
+        sort_key = "pearson_r" if "pearson_r" in df.columns else "r2"
+        df = df.sort_values(sort_key, ascending=True).reset_index(drop=True)
         df["rank"] = np.arange(1, len(df) + 1)
         return df
 

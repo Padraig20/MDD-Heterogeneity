@@ -5,6 +5,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from src.distillation.utils import safe_pearson
+
 ENTITY  = "your-entity"
 PROJECT = "your-project"
 
@@ -51,55 +53,112 @@ class WandBLogger:
         mean_nnz   = float(df["nonzero_weights"].mean())
         median_nnz = float(df["nonzero_weights"].median())
 
-        # plot R2 vs rank (i.e. sorted by R2 ascending). For the *illustration* we cap
-        # R² at 0: a handful of badly-fit genes have hugely negative R².
-        # The logged mean_r2 / median_r2 scalars below remain the true, uncapped values.
-        r2_capped = df["r2"].clip(lower=0.0)
-        mean_r2_capped   = float(r2_capped.mean())
-        median_r2_capped = float(r2_capped.median())
-
-        # in-sample R² (train fold of the same held-out split), for the overfitting gap
+        # in-sample (train fold of the same held-out split), for the overfitting gap
         has_insample  = "insample_r2" in df.columns
         mean_insample = float(df["insample_r2"].mean()) if has_insample else float("nan")
 
-        fig_r2, ax = plt.subplots(figsize=(8, 5))
-        ax.scatter(df["rank"], r2_capped, s=4, alpha=0.5)
-        ax.set_title(f"{cell_type} — {model_label} held-out R² (per-gene 20% individuals)")
-        ax.set_xlabel("Gene rank (sorted by R² ascending)")
-        ax.set_ylabel("Held-out R² (capped at 0 for display)")
-        annot = f"mean_R² = {mean_r2_capped:.3f}\nmedian_R² = {median_r2_capped:.3f}"
-        if has_insample:
-            annot += f"\nmean in-sample_R² = {mean_insample:.3f}"
-        ax.text(0.03, 0.95, annot, transform=ax.transAxes, va="top")
-        fig_r2.tight_layout()
+        has_pearson = "pearson_r" in df.columns
+        if has_pearson:
+            mean_pearson_r   = float(df["pearson_r"].mean())
+            median_pearson_r = float(df["pearson_r"].median())
+            has_insample_pearson  = "insample_pearson_r" in df.columns
+            mean_insample_pearson = (
+                float(df["insample_pearson_r"].mean()) if has_insample_pearson else float("nan")
+            )
 
-        # plot nonzero weights vs same rank
-        # is model complexity (nonzero weights) correlated with performance (R2)?
-        fig_nnz, ax = plt.subplots(figsize=(8, 5))
-        ax.scatter(df["rank"], df["nonzero_weights"], s=4, alpha=0.5)
-        ax.set_title(f"{cell_type} — Nonzero weights")
-        ax.set_xlabel("Gene rank (sorted by R² ascending)")
-        ax.set_ylabel("Number of nonzero weights")
-        ax.text(
-            0.03, 0.95,
-            f"mean_nnz = {mean_nnz:.2f}\nmedian_nnz = {median_nnz:.2f}",
-            transform=ax.transAxes,
-            va="top"
-        )
-        fig_nnz.tight_layout()
+        # We report R² and Pearson r as two fully independent pairs of plots
+        df_by_r2 = df.dropna(subset=["r2"])
+        df_by_r2 = df_by_r2[df_by_r2["r2"] >= 0].sort_values("r2", ascending=True).reset_index(drop=True)
+        n_dropped_r2 = len(df) - len(df_by_r2)
+
+        fig_r2 = None
+        fig_nnz_r2 = None
+        if not df_by_r2.empty:
+            rank_r2 = np.arange(1, len(df_by_r2) + 1)
+
+            fig_r2, ax = plt.subplots(figsize=(8, 5))
+            ax.scatter(rank_r2, df_by_r2["r2"], s=4, alpha=0.5)
+            ax.set_title(f"{cell_type} — {model_label} held-out R² (per-gene)")
+            ax.set_xlabel("Gene rank (sorted by R² ascending)")
+            ax.set_ylabel("Held-out R²")
+            annot = f"mean_R² = {mean_r2:.3f}\nmedian_R² = {median_r2:.3f}"
+            if has_insample:
+                annot += f"\nmean in-sample_R² = {mean_insample:.3f}"
+            if n_dropped_r2:
+                annot += f"\n({n_dropped_r2} gene(s) with undefined/negative R² excluded)"
+            ax.text(0.03, 0.95, annot, transform=ax.transAxes, va="top")
+            fig_r2.tight_layout()
+
+            mean_nnz_r2   = float(df_by_r2["nonzero_weights"].mean())
+            median_nnz_r2 = float(df_by_r2["nonzero_weights"].median())
+            fig_nnz_r2, ax = plt.subplots(figsize=(8, 5))
+            ax.scatter(rank_r2, df_by_r2["nonzero_weights"], s=4, alpha=0.5)
+            ax.set_title(f"{cell_type} — Nonzero weights (ranked by R²)")
+            ax.set_xlabel("Gene rank (sorted by R² ascending)")
+            ax.set_ylabel("Number of nonzero weights")
+            ax.text(
+                0.03, 0.95,
+                f"mean_nnz = {mean_nnz_r2:.2f}\nmedian_nnz = {median_nnz_r2:.2f}",
+                transform=ax.transAxes,
+                va="top",
+            )
+            fig_nnz_r2.tight_layout()
+
+        fig_pearson = None
+        fig_nnz_pearson = None
+        n_dropped_pearson = 0
+        if has_pearson:
+            df_by_pearson = df.dropna(subset=["pearson_r"]).sort_values("pearson_r", ascending=True).reset_index(drop=True)
+            n_dropped_pearson = len(df) - len(df_by_pearson)
+
+            if not df_by_pearson.empty:
+                rank_pearson = np.arange(1, len(df_by_pearson) + 1)
+
+                fig_pearson, ax = plt.subplots(figsize=(8, 5))
+                ax.scatter(rank_pearson, df_by_pearson["pearson_r"], s=4, alpha=0.5)
+                ax.axhline(0.0, color="grey", linestyle=":", linewidth=1)
+                ax.set_ylim(-1.05, 1.05)
+                ax.set_title(f"{cell_type} — {model_label} held-out Pearson r (per-gene)")
+                ax.set_xlabel("Gene rank (sorted by Pearson r ascending)")
+                ax.set_ylabel("Held-out Pearson r")
+                annot = f"mean_r = {mean_pearson_r:.3f}\nmedian_r = {median_pearson_r:.3f}"
+                if has_insample_pearson:
+                    annot += f"\nmean in-sample_r = {mean_insample_pearson:.3f}"
+                if n_dropped_pearson:
+                    annot += f"\n({n_dropped_pearson} gene(s) with undefined r excluded)"
+                ax.text(0.03, 0.95, annot, transform=ax.transAxes, va="top")
+                fig_pearson.tight_layout()
+
+                mean_nnz_pearson   = float(df_by_pearson["nonzero_weights"].mean())
+                median_nnz_pearson = float(df_by_pearson["nonzero_weights"].median())
+                fig_nnz_pearson, ax = plt.subplots(figsize=(8, 5))
+                ax.scatter(rank_pearson, df_by_pearson["nonzero_weights"], s=4, alpha=0.5)
+                ax.set_title(f"{cell_type} — Nonzero weights (ranked by Pearson r)")
+                ax.set_xlabel("Gene rank (sorted by Pearson r ascending)")
+                ax.set_ylabel("Number of nonzero weights")
+                ax.text(
+                    0.03, 0.95,
+                    f"mean_nnz = {mean_nnz_pearson:.2f}\nmedian_nnz = {median_nnz_pearson:.2f}",
+                    transform=ax.transAxes,
+                    va="top",
+                )
+                fig_nnz_pearson.tight_layout()
 
         # table for wandb inspection
         table = wandb.Table(dataframe=df)
 
         log_data = {
             f"{cell_type}/summary_table": table,
-            f"{cell_type}/r2_plot": wandb.Image(fig_r2),
-            f"{cell_type}/nonzero_plot": wandb.Image(fig_nnz),
             f"{cell_type}/mean_r2": mean_r2,
             f"{cell_type}/median_r2": median_r2,
             f"{cell_type}/mean_nonzero_weights": mean_nnz,
             f"{cell_type}/median_nonzero_weights": median_nnz,
+            f"{cell_type}/n_genes_excluded_r2": n_dropped_r2,
         }
+        if fig_r2 is not None:
+            log_data[f"{cell_type}/r2_plot"] = wandb.Image(fig_r2)
+        if fig_nnz_r2 is not None:
+            log_data[f"{cell_type}/nonzero_plot_by_r2"] = wandb.Image(fig_nnz_r2)
 
         # Held-out split bookkeeping: the overfitting gap (in-sample minus held-out)
         # and how many individuals / genes actually got a held-out fold.
@@ -111,9 +170,17 @@ class WandBLogger:
             log_data[f"{cell_type}/mean_n_test"]        = float(df["n_test"].mean())
             log_data[f"{cell_type}/n_genes_no_holdout"] = int((df["n_test"] == 0).sum())
 
-        if "pearson_r" in df.columns:
-            log_data[f"{cell_type}/mean_pearson_r"] = float(df["pearson_r"].mean())
-            log_data[f"{cell_type}/median_pearson_r"] = float(df["pearson_r"].median())
+        if has_pearson:
+            log_data[f"{cell_type}/mean_pearson_r"]            = mean_pearson_r
+            log_data[f"{cell_type}/median_pearson_r"]          = median_pearson_r
+            log_data[f"{cell_type}/n_genes_undefined_pearson_r"] = n_dropped_pearson
+            if has_insample_pearson:
+                log_data[f"{cell_type}/mean_insample_pearson_r"]  = mean_insample_pearson
+                log_data[f"{cell_type}/mean_pearson_overfit_gap"] = mean_insample_pearson - mean_pearson_r
+            if fig_pearson is not None:
+                log_data[f"{cell_type}/pearson_plot"] = wandb.Image(fig_pearson)
+            if fig_nnz_pearson is not None:
+                log_data[f"{cell_type}/nonzero_plot_by_pearson"] = wandb.Image(fig_nnz_pearson)
 
         # We produce two separate std-correlation plots (they measure different things):
         #   * across-gene: per-gene mean predicted vs target std (calibration scatter)
@@ -136,23 +203,9 @@ class WandBLogger:
         else:
             wandb.log(log_data)
 
-        plt.close(fig_r2)
-        plt.close(fig_nnz)
-        if fig_across is not None:
-            plt.close(fig_across)
-        if fig_within is not None:
-            plt.close(fig_within)
-
-    @staticmethod
-    def _pearson(a: pd.Series, b: pd.Series) -> float:
-        """NaN-robust Pearson correlation without numpy divide-by-zero warnings."""
-        m = a.notna() & b.notna()
-        if int(m.sum()) < 2:
-            return float("nan")
-        av = a[m].to_numpy(dtype=float); bv = b[m].to_numpy(dtype=float)
-        av = av - av.mean(); bv = bv - bv.mean()
-        denom = float(np.sqrt((av @ av) * (bv @ bv)))
-        return float((av @ bv) / denom) if denom > 1e-12 else float("nan")
+        for fig in (fig_r2, fig_nnz_r2, fig_pearson, fig_nnz_pearson, fig_across, fig_within):
+            if fig is not None:
+                plt.close(fig)
 
     def _variance_diagnostics(self, df: pd.DataFrame, cell_type: str, model_label: str) -> dict:
         """
@@ -170,7 +223,7 @@ class WandBLogger:
         Aggregated across genes (NaNs from failed fits are skipped).
         """
         diverged = int(df["diverged"].sum()) if "diverged" in df.columns else 0
-        across_gene_corr = self._pearson(df["pred_std"], df["target_std"])
+        across_gene_corr = safe_pearson(df["pred_std"], df["target_std"])
         return {
             f"{cell_type}/mean_std_w2": float(df["std_w2"].mean()),
             f"{cell_type}/median_std_w2": float(df["std_w2"].median()),
@@ -193,7 +246,7 @@ class WandBLogger:
         if sub.empty:
             return None
 
-        across_corr = self._pearson(sub["pred_std"], sub["target_std"])
+        across_corr = safe_pearson(sub["pred_std"], sub["target_std"])
 
         fig, ax = plt.subplots(figsize=(6, 6))
         ax.scatter(sub["target_std"], sub["pred_std"], s=4, alpha=0.4)
