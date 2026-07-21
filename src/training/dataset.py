@@ -158,6 +158,48 @@ def _build_population_y_tensor(
     return y_full, present
 
 
+def _impute_missing_population_rows(
+    y_tensor: np.ndarray,
+    present: np.ndarray,
+    normalize: str,
+) -> np.ndarray:
+    """Fill missing (individual, cell_type) pseudo-bulk rows with the
+    cross-individual mean for that cell type (computed only from the
+    individuals that DO have data for it), in the same space training
+    actually operates in ("log" -> log1p-space, "percentiles"/"none" -> raw
+    scale, since percentile ranks are computed from the raw scale afterwards).
+
+    This keeps every individual in the dataset (rather than dropping any
+    individual missing even one cell type) while staying unbiased: inserting
+    a group's own mean back into that group does not change the group's mean,
+    so `ReferencePopulationMddDataset.to_population_mean()` is unaffected by
+    which individuals happened to have real data for a given cell type.
+    """
+    n_ind, n_ct, n_genes = y_tensor.shape
+    if present.all():
+        return y_tensor
+
+    space = np.log1p(y_tensor) if normalize == "log" else y_tensor
+    imputed = space.copy()
+
+    for j in range(n_ct):
+        missing_rows = np.flatnonzero(~present[:, j])
+        if missing_rows.size == 0:
+            continue
+        present_rows = np.flatnonzero(present[:, j])
+        if present_rows.size == 0:
+            raise RuntimeError(
+                f"Cell type index {j} has no individuals with observed data; "
+                "cannot impute a population mean for it."
+            )
+        imputed[missing_rows, j, :] = space[present_rows, j, :].mean(axis=0)
+
+    if normalize == "log":
+        imputed = np.expm1(imputed)
+
+    return imputed.astype(np.float32, copy=False)
+
+
 class ReferencePopulationMddDataset(Dataset):
     """
     Reference-feature inputs paired with per-individual (population) targets.
@@ -241,19 +283,23 @@ class ReferencePopulationMddDataset(Dataset):
         complete_mask = present.all(axis=1)
         if not complete_mask.all():
             incomplete = [self.individuals[i] for i, ok in enumerate(complete_mask) if not ok]
+            n_missing_entries = int((~present).sum())
             logging.warning(
-                "%d individuals are missing at least one cell type and will be "
-                "dropped: %s%s",
+                "%d / %d individuals are missing at least one cell type "
+                "(%d total missing (individual, cell_type) pseudo-bulk rows): "
+                "%s%s. All individuals are kept -- missing rows are imputed "
+                "with the cross-individual mean for that cell type (computed "
+                "from the individuals that do have it), which leaves "
+                "to_population_mean() unbiased.",
                 len(incomplete),
+                len(self.individuals),
+                n_missing_entries,
                 incomplete[:5],
                 "..." if len(incomplete) > 5 else "",
             )
-            keep = np.flatnonzero(complete_mask)
-            self.individuals = [self.individuals[i] for i in keep]
-            y_tensor_full = y_tensor_full[keep]
 
         if not self.individuals:
-            raise RuntimeError("No individuals with complete cell-type coverage in y.")
+            raise RuntimeError("No individuals found in y.")
 
         # Align genes: intersect the reference feature genes with y var, keeping
         # the reference feature ordering. `gene_indices` indexes rows of X_feats.
@@ -283,6 +329,7 @@ class ReferencePopulationMddDataset(Dataset):
             count=len(kept_ensids),
         )
         y_tensor = y_tensor_full[:, :, y_idx_for_each_X].astype(np.float32, copy=False)
+        y_tensor = _impute_missing_population_rows(y_tensor, present, normalize)
 
         if normalize == "percentiles":
             n_genes_y = y_tensor.shape[2]
@@ -297,6 +344,9 @@ class ReferencePopulationMddDataset(Dataset):
         self.y_tensor: np.ndarray = y_tensor
         self.normalize: str = normalize
         self.norm_features: torch.Tensor | None = None
+        # (n_individuals, n_cell_types) bool: True where the pseudo-bulk row
+        # was actually observed, False where it was mean-imputed above.
+        self.observed_mask: np.ndarray = present
 
         logging.info(
             "ReferencePopulationMddDataset: %d individuals x %d cell types x %d "
@@ -323,6 +373,9 @@ class ReferencePopulationMddDataset(Dataset):
             "y_tensor": self.y_tensor[:, :, mask],
             "normalize": self.normalize,
             "norm_features": self.norm_features,
+            # observed_mask is per (individual, cell_type), independent of
+            # the gene axis, so it carries over unchanged.
+            "observed_mask": self.observed_mask,
         }
         return ReferencePopulationMddDataset(_state=state)
 
@@ -371,6 +424,8 @@ class ReferencePopulationMddDataset(Dataset):
             "y_tensor": mean_y,
             "normalize": "none",
             "norm_features": self.norm_features,
+            # the aggregated row is a real (computed) statistic, not a gap.
+            "observed_mask": np.ones((1, len(self.cell_types)), dtype=bool),
         }
         return ReferencePopulationMddDataset(_state=state)
 
