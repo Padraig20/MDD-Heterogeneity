@@ -231,6 +231,31 @@ def main() -> None:
     logging.debug(f"Test dataset size:  {len(test_dataset)}")
     logging.debug(f"Total dataset size: {len(dataset)}")
 
+    # For the reference-population setup, every individual shares the same x
+    # (reference features) per gene but has a different y. Under MSE-style
+    # training the model converges to the population mean of y at that x, so
+    # loss/Pearson evaluation should compare against that same mean rather
+    # than any single individual's value. We keep the original per-individual
+    # datasets around as "calibration" datasets, since uncertainty
+    # calibration (ENCE / uncertainty-error Spearman, deep-ensemble only)
+    # needs the real inter-individual spread to be meaningful.
+    eval_calibration_dataset = None
+    test_calibration_dataset = None
+    selected_calibration_dataset = None
+    if isinstance(dataset, ReferencePopulationMddDataset):
+        logging.info(
+            "Reference-population dataset detected: loss/Pearson evaluation "
+            "will use the per-gene population mean target (what MSE-style "
+            "training converges to) instead of any single individual's value."
+        )
+        eval_calibration_dataset = eval_dataset
+        test_calibration_dataset = test_dataset
+        eval_dataset = eval_dataset.to_population_mean()
+        test_dataset = test_dataset.to_population_mean()
+        if args.select_genes is not None:
+            selected_calibration_dataset = selected_dataset
+            selected_dataset = selected_dataset.to_population_mean()
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True
     )
@@ -240,12 +265,24 @@ def main() -> None:
     test_loader = torch.utils.data.DataLoader(
         test_dataset, batch_size=args.batch_size, shuffle=False
     )
+    eval_calibration_loader = (
+        torch.utils.data.DataLoader(eval_calibration_dataset, batch_size=args.batch_size, shuffle=False)
+        if eval_calibration_dataset is not None else None
+    )
+    test_calibration_loader = (
+        torch.utils.data.DataLoader(test_calibration_dataset, batch_size=args.batch_size, shuffle=False)
+        if test_calibration_dataset is not None else None
+    )
 
     if args.norm_inputs:
         logging.debug("Applying log-transform to input features...")
         train_dataset.apply_feature_log_transform()
         eval_dataset.norm_features = train_dataset.norm_features
         test_dataset.norm_features = train_dataset.norm_features
+        if eval_calibration_dataset is not None:
+            eval_calibration_dataset.norm_features = train_dataset.norm_features
+        if test_calibration_dataset is not None:
+            test_calibration_dataset.norm_features = train_dataset.norm_features
 
     input_dim  = train_dataset[0][0].shape[0]
     output_dim = train_dataset[0][1].shape[0]
@@ -320,7 +357,8 @@ def main() -> None:
             wb_logger=wb_logger,
             early_stopping=early_stopping,
             epochs=args.epochs,
-            device=device
+            device=device,
+            eval_calibration_loader=eval_calibration_loader
         )
 
         logging.info("Training done, starting evaluation...")
@@ -332,11 +370,16 @@ def main() -> None:
             loss_lambda_dict=loss_lambda_dict,
             device=device,
             wb_logger=wb_logger,
-            mode="test"
+            mode="test",
+            calibration_loader=test_calibration_loader
         )
 
         if args.select_genes is not None:
             logging.info(f"Starting separate evaluation on selected genes...")
+            selected_calibration_loader = (
+                torch.utils.data.DataLoader(selected_calibration_dataset, batch_size=args.batch_size, shuffle=False)
+                if selected_calibration_dataset is not None else None
+            )
             evaluate_ensemble_model(
                 model=model,
                 eval_loader=torch.utils.data.DataLoader(selected_dataset, batch_size=args.batch_size, shuffle=False),
@@ -344,7 +387,8 @@ def main() -> None:
                 loss_lambda_dict=loss_lambda_dict,
                 device=device,
                 wb_logger=wb_logger,
-                mode="test_selected_genes"
+                mode="test_selected_genes",
+                calibration_loader=selected_calibration_loader
             )
     else:
         train_single_model(

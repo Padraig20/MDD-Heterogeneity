@@ -336,6 +336,44 @@ class ReferencePopulationMddDataset(Dataset):
         mask = np.isin(self.X_ensids, list(gene_set))
         return self._clone_with_gene_subset(mask)
 
+    def to_population_mean(self) -> "ReferencePopulationMddDataset":
+        """Collapse the individual axis to the per-gene population mean target.
+
+        Under an MSE-style loss, a model trained on many (x, y_individual) pairs
+        that all share the same x (one reference feature vector per gene,
+        broadcast across individuals) converges its prediction to the mean of
+        the *already-normalized* targets across individuals -- not to any
+        single individual's value. Evaluation should therefore compare against
+        that same population mean, otherwise metrics are inflated by
+        irreducible inter-individual variance the model was never asked (and
+        cannot be expected) to predict from x alone.
+        """
+        if self.normalize == "log":
+            # __getitem__ applies log1p per-sample; average in that same space
+            # so the mean matches what MSE training actually converges to.
+            # NOT the same as log1p(mean(y)).
+            transformed = np.log1p(self.y_tensor)
+        else:
+            # "percentiles" is already computed on the transformed scale
+            # (ranks over the full population), and "none" needs no transform
+            # either way -- both are already in the space the model is trained on.
+            transformed = self.y_tensor
+
+        mean_y = transformed.mean(axis=0, keepdims=True).astype(np.float32, copy=False)
+
+        state = {
+            "X_feats": self.X_feats,
+            "individuals": ["population_mean"],
+            "cell_types": list(self.cell_types),
+            "gene_indices": self.gene_indices,
+            "X_ensids": self.X_ensids,
+            "X_chroms": self.X_chroms,
+            "y_tensor": mean_y,
+            "normalize": "none",
+            "norm_features": self.norm_features,
+        }
+        return ReferencePopulationMddDataset(_state=state)
+
     def apply_feature_log_transform(self, threshold: float = 1.0) -> None:
         """Decide which feature columns to log-transform based on per-column skew,
         estimated over the in-scope (reference) gene rows."""

@@ -218,7 +218,8 @@ def train_ensemble_model(
     wb_logger: WandBLogger,
     early_stopping: EarlyStopping,
     epochs: int = 10,
-    device: torch.device = torch.device("cpu")
+    device: torch.device = torch.device("cpu"),
+    eval_calibration_loader: torch.utils.data.DataLoader | None = None,
 ) -> None:
     """Train the ensemble model. Evaluate after each epoch."""
 
@@ -285,7 +286,8 @@ def train_ensemble_model(
                         wb_logger=wb_logger,
                         device=device,
                         epoch=epoch,
-                        mode="eval"
+                        mode="eval",
+                        calibration_loader=eval_calibration_loader,
         )
 
         if early_stopping is not None:
@@ -303,8 +305,19 @@ def evaluate_ensemble_model(
     device: torch.device = torch.device("cpu"),
     mode : str = "eval", # eval or test
     epoch: int = 0,
+    calibration_loader: torch.utils.data.DataLoader | None = None,
 ) -> float:
-    """Evaluate the ensemble model."""
+    """Evaluate the ensemble model.
+
+    `eval_loader` drives the loss/Pearson metrics (and the aleatoric/epistemic
+    averages, which are a deterministic function of x and thus unaffected by
+    which loader is used). If `calibration_loader` is given, it is used
+    instead for uncertainty calibration (ENCE, uncertainty-error Spearman) --
+    this lets callers evaluate accuracy against a population-mean target
+    while still calibrating predicted variance against real per-individual
+    targets. If `calibration_loader` is None, calibration falls back to
+    `eval_loader` (previous behaviour).
+    """
 
     log_dict = {
         f"{mode}/epoch": epoch,
@@ -339,8 +352,11 @@ def evaluate_ensemble_model(
             aleatoric_uncertainties.append(aleatoric_unc.mean(dim=0)) # avg aleatoric uncertainty across cells
             epistemic_uncertainties.append(epistemic_unc.mean(dim=0)) # avg epistemic uncertainty across cells
 
-            # total predictive variance = aleatoric + epistemic (for calibration)
-            calibration.update(prediction, aleatoric_unc + epistemic_unc, targets)
+            if calibration_loader is None:
+                # no separate per-individual pass available; fall back to
+                # calibrating against whatever targets eval_loader provides.
+                # total predictive variance = aleatoric + epistemic
+                calibration.update(prediction, aleatoric_unc + epistemic_unc, targets)
 
             outputs = torch.stack([prediction, aleatoric_unc], dim=2) # shape (batch_size, output_dim, 2)
             composite_loss = torch.tensor(0.0, device=device)
@@ -352,6 +368,16 @@ def evaluate_ensemble_model(
             log_dict[f"{mode}/loss"] += composite_loss.item()
             metric_cells.update(prediction, targets)
             metric_genes.update(prediction, targets)
+
+    if calibration_loader is not None:
+        with torch.no_grad():
+            for batch in tqdm(calibration_loader, desc="Calibrating"):
+                inputs, targets = batch
+                inputs, targets = inputs.to(device), targets.to(device)
+
+                prediction, aleatoric_unc, epistemic_unc = model(inputs)
+                # total predictive variance = aleatoric + epistemic
+                calibration.update(prediction, aleatoric_unc + epistemic_unc, targets)
 
     log_dict[f"{mode}/loss"] /= len(eval_loader)
     log_dict[f"{mode}/pearson_cells"] = metric_cells.compute().nanmean().item()
