@@ -2,6 +2,7 @@ import random
 import zlib
 
 import numpy as np
+from scipy import stats
 
 from src.distillation.dataset import GenotypeDataset
 
@@ -21,6 +22,46 @@ def safe_pearson(a, b) -> float:
     if not np.isfinite(denom) or denom <= 1e-12:
         return float("nan")
     return float((a @ b) / denom)
+
+
+def safe_spearman(a, b) -> float:
+    """
+    Spearman rank correlation, implemented as the Pearson correlation of the ranks
+    (via `safe_pearson`) so it inherits the same divide-by-zero-safe, degenerate-input
+    behavior (NaN whenever there are fewer than 2 finite paired observations, or
+    either input is constant after ranking).
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    mask = np.isfinite(a) & np.isfinite(b)
+    if int(mask.sum()) < 2:
+        return float("nan")
+    a = a[mask]; b = b[mask]
+    return safe_pearson(stats.rankdata(a), stats.rankdata(b))
+
+
+def pearson_pvalue(r, n) -> np.ndarray:
+    """
+    Two-sided p-value for a Pearson correlation coefficient `r` computed from `n`
+    paired observations, via the standard t-test (equivalent to what
+    ``scipy.stats.pearsonr`` returns as its p-value, but computable from a
+    precomputed `r` and `n` alone, without the underlying samples).
+
+    Vectorized over `r`/`n` (broadcastable array-likes or scalars). Returns NaN
+    wherever `r` is NaN/undefined or `n` gives fewer than 1 degree of freedom
+    (n < 3); a perfect |r| == 1 correlation is reported as p = 0.
+    """
+    r = np.atleast_1d(np.asarray(r, dtype=np.float64))
+    n = np.atleast_1d(np.asarray(n, dtype=np.float64))
+    dof = n - 2
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        t = r * np.sqrt(dof) / np.sqrt(1.0 - r ** 2)
+        p = 2.0 * stats.t.sf(np.abs(t), dof)
+
+    p = np.where(np.abs(r) >= 1.0, 0.0, p)
+    p = np.where((dof < 1) | ~np.isfinite(r), np.nan, p)
+    return p
 
 
 def train_test_indices(

@@ -14,7 +14,7 @@ from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
-from src.distillation.utils import ld_prune, safe_pearson, train_test_indices
+from src.distillation.utils import ld_prune, safe_pearson, safe_spearman, train_test_indices
 
 
 def build_linear_model(
@@ -93,6 +93,10 @@ class LRStruct:
     # unbounded below for a badly-fit gene).
     heldout_pearson_r_:  Optional[float] = None
     insample_pearson_r_: Optional[float] = None
+    # Spearman rank correlation counterparts: rank-based, so robust to outliers/
+    # nonlinear-but-monotonic fits (unlike Pearson r / R^2).
+    heldout_spearman_r_:  Optional[float] = None
+    insample_spearman_r_: Optional[float] = None
 
 
 class LR:
@@ -184,10 +188,13 @@ class LR:
                 insample_r2 = float(r2_score(y, pred_train))
                 heldout_pearson_r  = safe_pearson(y_test, pred_test)
                 insample_pearson_r = safe_pearson(y, pred_train)
+                heldout_spearman_r  = safe_spearman(y_test, pred_test)
+                insample_spearman_r = safe_spearman(y, pred_train)
                 n_train, n_test = int(y.size), int(y_test.size)
             else:
                 heldout_r2, insample_r2 = float("nan"), float("nan")
                 heldout_pearson_r, insample_pearson_r = float("nan"), float("nan")
+                heldout_spearman_r, insample_spearman_r = float("nan"), float("nan")
                 n_train, n_test = int(y.size), 0
         else:
             # Held-out evaluation: fit on a per-gene 80% split of the individuals and
@@ -203,11 +210,14 @@ class LR:
                 insample_r2 = float(r2_score(y[train_idx], pred_train))
                 heldout_pearson_r  = safe_pearson(y[test_idx], pred_test)
                 insample_pearson_r = safe_pearson(y[train_idx], pred_train)
+                heldout_spearman_r  = safe_spearman(y[test_idx], pred_test)
+                insample_spearman_r = safe_spearman(y[train_idx], pred_train)
                 n_train, n_test = int(train_idx.size), int(test_idx.size)
             else:
                 # too few individuals to hold out: no honest generalization estimate
                 heldout_r2, insample_r2 = float("nan"), float("nan")
                 heldout_pearson_r, insample_pearson_r = float("nan"), float("nan")
+                heldout_spearman_r, insample_spearman_r = float("nan"), float("nan")
                 n_train, n_test = int(y.size), 0
 
         # Final model refit on all individuals -> these are the persisted coefficients.
@@ -232,6 +242,8 @@ class LR:
             n_test_=n_test,
             heldout_pearson_r_=heldout_pearson_r,
             insample_pearson_r_=insample_pearson_r,
+            heldout_spearman_r_=heldout_spearman_r,
+            insample_spearman_r_=insample_spearman_r,
         )
         self.models_[gene] = model
         return model
@@ -269,9 +281,11 @@ class LR:
                 print(
                     f"[{i}/{n}] fit {gene}: "
                     f"nonzero={nnz}, heldout_r2={model.heldout_r2_:.4f}, "
-                    f"heldout_pearson_r={model.heldout_pearson_r_:.4f} "
+                    f"heldout_pearson_r={model.heldout_pearson_r_:.4f}, "
+                    f"heldout_spearman_r={model.heldout_spearman_r_:.4f} "
                     f"(insample_r2={model.insample_r2_:.4f}, "
-                    f"insample_pearson_r={model.insample_pearson_r_:.4f}, n_test={model.n_test_})"
+                    f"insample_pearson_r={model.insample_pearson_r_:.4f}, "
+                    f"insample_spearman_r={model.insample_spearman_r_:.4f}, n_test={model.n_test_})"
                 )
             return model
         except Exception as e:
@@ -336,6 +350,8 @@ class LR:
                     "n_test": model.n_test_,
                     "pearson_r": model.heldout_pearson_r_,   # held-out, bounded [-1, 1]
                     "insample_pearson_r": model.insample_pearson_r_,
+                    "spearman_r": model.heldout_spearman_r_,   # held-out, rank-based, bounded [-1, 1]
+                    "insample_spearman_r": model.insample_spearman_r_,
                     "nonzero_weights": int(np.sum(model.coef_ != 0)),
                     "alpha": model.alpha_,
                     "l1_ratio": model.l1_ratio_,

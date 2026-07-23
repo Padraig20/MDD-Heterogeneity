@@ -24,7 +24,7 @@ from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.models.lr import LR
-from src.distillation.utils import ld_prune, safe_pearson, train_test_indices
+from src.distillation.utils import ld_prune, safe_pearson, safe_spearman, train_test_indices
 
 
 @dataclass
@@ -77,6 +77,8 @@ class ProbabilisticLRStruct:
     n_test_:             int = 0
     pearson_r_:          Optional[float] = None  # held-out Pearson r of the mean (bounded [-1, 1])
     insample_pearson_r_: Optional[float] = None  # in-sample Pearson r on the train fold
+    spearman_r_:          Optional[float] = None  # held-out Spearman r of the mean (rank-based, bounded [-1, 1])
+    insample_spearman_r_: Optional[float] = None  # in-sample Spearman r on the train fold
     train_w2_:           Optional[float] = None  # held-out mean 2-Wasserstein distance (mean + std parts)
     mean_w2_:            Optional[float] = None  # mean-matching part of the Wasserstein
     std_w2_:             Optional[float] = None  # std/variance-matching part (variance-fit error, lower is better)
@@ -85,6 +87,19 @@ class ProbabilisticLRStruct:
     mean_pred_std_:      Optional[float] = None  # avg predicted total std (aleatoric + epistemic)
     mean_target_std_:    Optional[float] = None  # avg target std (teacher's aleatoric + epistemic)
     diverged_:           bool = False            # True if the per-gene fit blew up (metrics are NaN)
+
+    # Per-source breakdown of the same diagnostics, so aleatoric and epistemic
+    # uncertainty can each be judged on their own (not just via their sum above).
+    aleatoric_w2_:         Optional[float] = None  # mean((pred_aleatoric_std - target_aleatoric_std)^2)
+    aleatoric_std_corr_:   Optional[float] = None  # within-gene corr(pred, target) aleatoric std, across individuals
+    aleatoric_std_ratio_:  Optional[float] = None  # mean(pred_aleatoric_std) / mean(target_aleatoric_std)
+    aleatoric_pred_std_:   Optional[float] = None  # avg predicted aleatoric std
+    aleatoric_target_std_: Optional[float] = None  # avg target aleatoric std
+    epistemic_w2_:         Optional[float] = None  # mean((pred_epistemic_std - target_epistemic_std)^2)
+    epistemic_std_corr_:   Optional[float] = None  # within-gene corr(pred, target) epistemic std, across individuals
+    epistemic_std_ratio_:  Optional[float] = None  # mean(pred_epistemic_std) / mean(target_epistemic_std)
+    epistemic_pred_std_:   Optional[float] = None  # avg predicted epistemic std
+    epistemic_target_std_: Optional[float] = None  # avg target epistemic std
 
 
 class ProbabilisticLR:
@@ -151,12 +166,20 @@ class ProbabilisticLR:
 
     @staticmethod
     def _nan_metrics(y_aleatoric: np.ndarray, y_epistemic: np.ndarray) -> dict:
-        target_std = np.sqrt(np.clip(y_aleatoric, 0.0, None) + np.clip(y_epistemic, 0.0, None))
+        aleatoric_std = np.sqrt(np.clip(y_aleatoric, 0.0, None))
+        epistemic_std = np.sqrt(np.clip(y_epistemic, 0.0, None))
+        target_std    = np.sqrt(np.clip(y_aleatoric, 0.0, None) + np.clip(y_epistemic, 0.0, None))
         nan = float("nan")
         return {
-            "r2": nan, "pearson_r": nan, "w2": nan, "mean_w2": nan, "std_w2": nan,
+            "r2": nan, "pearson_r": nan, "spearman_r": nan, "w2": nan, "mean_w2": nan, "std_w2": nan,
             "std_corr": nan, "std_ratio": nan, "pred_std": nan,
             "target_std": float(np.mean(target_std)) if target_std.size else nan,
+            "aleatoric_w2": nan, "aleatoric_std_corr": nan, "aleatoric_std_ratio": nan,
+            "aleatoric_pred_std": nan,
+            "aleatoric_target_std": float(np.mean(aleatoric_std)) if aleatoric_std.size else nan,
+            "epistemic_w2": nan, "epistemic_std_corr": nan, "epistemic_std_ratio": nan,
+            "epistemic_pred_std": nan,
+            "epistemic_target_std": float(np.mean(epistemic_std)) if epistemic_std.size else nan,
             "diverged": False,
         }
 
@@ -170,21 +193,28 @@ class ProbabilisticLR:
     ) -> dict:
         """
         Run fitted (mean, aleatoric, epistemic) heads on rows (X, y, y_aleatoric,
-        y_epistemic) and return native-space distribution-matching metrics, combining
-        the two variance heads into a single total predictive std comparable to the
-        teacher's own (aleatoric + epistemic) total.
+        y_epistemic) and return native-space distribution-matching metrics: both the
+        combined total predictive std (comparable to the teacher's own aleatoric +
+        epistemic total) *and* the same set of diagnostics for each uncertainty
+        source individually, so aleatoric and epistemic can each be judged on their
+        own rather than only via their sum.
         """
         mean_head,      mean_xs,      _ = heads["mean"]
         aleatoric_head, aleatoric_xs, _ = heads["aleatoric"]
         epistemic_head, epistemic_xs, _ = heads["epistemic"]
 
-        mu             = mean_head.predict(mean_xs.transform(X))
-        aleatoric_pred = aleatoric_head.predict(aleatoric_xs.transform(X))
-        epistemic_pred = epistemic_head.predict(epistemic_xs.transform(X))
-        total_std      = np.sqrt(aleatoric_pred + epistemic_pred)
+        mu                 = mean_head.predict(mean_xs.transform(X))
+        aleatoric_pred      = aleatoric_head.predict(aleatoric_xs.transform(X))
+        epistemic_pred      = epistemic_head.predict(epistemic_xs.transform(X))
+        aleatoric_std_pred  = np.sqrt(aleatoric_pred)
+        epistemic_std_pred  = np.sqrt(epistemic_pred)
+        total_std           = np.sqrt(aleatoric_pred + epistemic_pred)
 
-        target_var_native  = np.clip(y_aleatoric, 0.0, None) + np.clip(y_epistemic, 0.0, None)
-        target_std_native  = np.sqrt(target_var_native)
+        aleatoric_var_native  = np.clip(y_aleatoric, 0.0, None)
+        epistemic_var_native  = np.clip(y_epistemic, 0.0, None)
+        aleatoric_std_native  = np.sqrt(aleatoric_var_native)
+        epistemic_std_native  = np.sqrt(epistemic_var_native)
+        target_std_native     = np.sqrt(aleatoric_var_native + epistemic_var_native)
 
         # Detect a diverged / failed fit. Native log-expression means are a few units
         # and target stds are <~0.3, so predictions many orders of magnitude larger mean
@@ -199,16 +229,23 @@ class ProbabilisticLR:
 
         nan = float("nan")
         metrics = {
-            "r2": nan, "pearson_r": nan, "w2": nan, "mean_w2": nan, "std_w2": nan,
+            "r2": nan, "pearson_r": nan, "spearman_r": nan, "w2": nan, "mean_w2": nan, "std_w2": nan,
             "std_corr": nan, "std_ratio": nan, "pred_std": nan,
             "target_std": float(np.mean(target_std_native)) if target_std_native.size else nan,
+            "aleatoric_w2": nan, "aleatoric_std_corr": nan, "aleatoric_std_ratio": nan,
+            "aleatoric_pred_std": nan,
+            "aleatoric_target_std": float(np.mean(aleatoric_std_native)) if aleatoric_std_native.size else nan,
+            "epistemic_w2": nan, "epistemic_std_corr": nan, "epistemic_std_ratio": nan,
+            "epistemic_pred_std": nan,
+            "epistemic_target_std": float(np.mean(epistemic_std_native)) if epistemic_std_native.size else nan,
             "diverged": bool(diverged),
         }
         if diverged or y.size <= 1:
             return metrics
 
-        metrics["r2"]        = float(r2_score(y, mu))
-        metrics["pearson_r"] = safe_pearson(mu, y)
+        metrics["r2"]         = float(r2_score(y, mu))
+        metrics["pearson_r"]  = safe_pearson(mu, y)
+        metrics["spearman_r"] = safe_spearman(mu, y)
         # Wasserstein split into its mean and std (variance) contributions
         metrics["mean_w2"]   = float(np.mean((mu - y) ** 2))
         metrics["std_w2"]    = float(np.mean((total_std - target_std_native) ** 2))
@@ -218,6 +255,25 @@ class ProbabilisticLR:
         denom                = float(np.mean(target_std_native))
         metrics["std_ratio"] = float(np.mean(total_std) / denom) if denom > 1e-12 else nan
         metrics["pred_std"]  = float(np.mean(total_std))
+
+        # Per-source breakdown: same diagnostics, computed separately for the
+        # aleatoric and epistemic heads (not just their combined total above).
+        metrics["aleatoric_w2"]       = float(np.mean((aleatoric_std_pred - aleatoric_std_native) ** 2))
+        metrics["aleatoric_std_corr"] = safe_pearson(aleatoric_std_pred, aleatoric_std_native)
+        denom_al                      = float(np.mean(aleatoric_std_native))
+        metrics["aleatoric_std_ratio"] = (
+            float(np.mean(aleatoric_std_pred) / denom_al) if denom_al > 1e-12 else nan
+        )
+        metrics["aleatoric_pred_std"] = float(np.mean(aleatoric_std_pred))
+
+        metrics["epistemic_w2"]       = float(np.mean((epistemic_std_pred - epistemic_std_native) ** 2))
+        metrics["epistemic_std_corr"] = safe_pearson(epistemic_std_pred, epistemic_std_native)
+        denom_ep                      = float(np.mean(epistemic_std_native))
+        metrics["epistemic_std_ratio"] = (
+            float(np.mean(epistemic_std_pred) / denom_ep) if denom_ep > 1e-12 else nan
+        )
+        metrics["epistemic_pred_std"] = float(np.mean(epistemic_std_pred))
+
         return metrics
 
     def fit_gene_matrix(
@@ -294,11 +350,13 @@ class ProbabilisticLR:
                 insample    = self._evaluate(heads_h, X, y, y_aleatoric, y_epistemic)
                 insample_r2 = insample["r2"]
                 insample_pearson_r = insample["pearson_r"]
+                insample_spearman_r = insample["spearman_r"]
                 n_train, n_test = int(y.size), int(y_test.size)
             else:
                 metrics = self._nan_metrics(y_aleatoric, y_epistemic)
                 insample_r2 = float("nan")
                 insample_pearson_r = float("nan")
+                insample_spearman_r = float("nan")
                 n_train, n_test = int(y.size), 0
         else:
             # Held-out evaluation: train on a per-gene 80% split of the individuals and
@@ -319,12 +377,14 @@ class ProbabilisticLR:
                 )
                 insample_r2 = insample["r2"]
                 insample_pearson_r = insample["pearson_r"]
+                insample_spearman_r = insample["spearman_r"]
                 n_train, n_test = int(train_idx.size), int(test_idx.size)
             else:
                 # too few individuals to hold out: no honest generalization estimate
                 metrics = self._nan_metrics(y_aleatoric, y_epistemic)
                 insample_r2 = float("nan")
                 insample_pearson_r = float("nan")
+                insample_spearman_r = float("nan")
                 n_train, n_test = int(y.size), 0
 
         # Final heads refit on all individuals -> these are the persisted coefficients.
@@ -349,6 +409,8 @@ class ProbabilisticLR:
             n_test_=n_test,
             pearson_r_=metrics["pearson_r"],
             insample_pearson_r_=insample_pearson_r,
+            spearman_r_=metrics["spearman_r"],
+            insample_spearman_r_=insample_spearman_r,
             train_w2_=metrics["w2"],
             mean_w2_=metrics["mean_w2"],
             std_w2_=metrics["std_w2"],
@@ -357,6 +419,16 @@ class ProbabilisticLR:
             mean_pred_std_=metrics["pred_std"],
             mean_target_std_=metrics["target_std"],
             diverged_=bool(metrics["diverged"]),
+            aleatoric_w2_=metrics["aleatoric_w2"],
+            aleatoric_std_corr_=metrics["aleatoric_std_corr"],
+            aleatoric_std_ratio_=metrics["aleatoric_std_ratio"],
+            aleatoric_pred_std_=metrics["aleatoric_pred_std"],
+            aleatoric_target_std_=metrics["aleatoric_target_std"],
+            epistemic_w2_=metrics["epistemic_w2"],
+            epistemic_std_corr_=metrics["epistemic_std_corr"],
+            epistemic_std_ratio_=metrics["epistemic_std_ratio"],
+            epistemic_pred_std_=metrics["epistemic_pred_std"],
+            epistemic_target_std_=metrics["epistemic_target_std"],
         )
         self.models_[gene] = struct
         return struct
@@ -404,9 +476,11 @@ class ProbabilisticLR:
             if verbose:
                 print(
                     f"[{i}/{n}] fit {gene}: "
-                    f"heldout_r2={model.train_r2_:.4f}, heldout_pearson_r={model.pearson_r_:.4f} "
+                    f"heldout_r2={model.train_r2_:.4f}, heldout_pearson_r={model.pearson_r_:.4f}, "
+                    f"heldout_spearman_r={model.spearman_r_:.4f} "
                     f"(insample_r2={model.insample_r2_:.4f}, "
-                    f"insample_pearson_r={model.insample_pearson_r_:.4f}, n_test={model.n_test_}), "
+                    f"insample_pearson_r={model.insample_pearson_r_:.4f}, "
+                    f"insample_spearman_r={model.insample_spearman_r_:.4f}, n_test={model.n_test_}), "
                     f"W2={model.train_w2_:.4f}, "
                     f"pred_std={model.mean_pred_std_:.3f}, target_std={model.mean_target_std_:.3f}"
                 )
@@ -493,6 +567,8 @@ class ProbabilisticLR:
                     "n_test": model.n_test_,
                     "pearson_r": model.pearson_r_,   # held-out, bounded [-1, 1] mean-fit correlation
                     "insample_pearson_r": model.insample_pearson_r_,
+                    "spearman_r": model.spearman_r_,  # held-out, rank-based, bounded [-1, 1]
+                    "insample_spearman_r": model.insample_spearman_r_,
                     "wasserstein": model.train_w2_,
                     "mean_w2": model.mean_w2_,
                     "std_w2": model.std_w2_,          # variance-fit error (lower is better)
@@ -505,6 +581,18 @@ class ProbabilisticLR:
                     "mean_alpha": model.mean_.alpha_,
                     "aleatoric_alpha": model.aleatoric_.alpha_,
                     "epistemic_alpha": model.epistemic_.alpha_,
+                    # Per-source breakdown (not just the combined total above), so
+                    # aleatoric/epistemic uncertainty can each be judged on their own.
+                    "aleatoric_w2": model.aleatoric_w2_,
+                    "aleatoric_std_corr": model.aleatoric_std_corr_,
+                    "aleatoric_std_ratio": model.aleatoric_std_ratio_,
+                    "aleatoric_pred_std": model.aleatoric_pred_std_,
+                    "aleatoric_target_std": model.aleatoric_target_std_,
+                    "epistemic_w2": model.epistemic_w2_,
+                    "epistemic_std_corr": model.epistemic_std_corr_,
+                    "epistemic_std_ratio": model.epistemic_std_ratio_,
+                    "epistemic_pred_std": model.epistemic_pred_std_,
+                    "epistemic_target_std": model.epistemic_target_std_,
                 }
             )
 
