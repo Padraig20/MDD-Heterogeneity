@@ -17,6 +17,53 @@ from src.distillation.dataset import GenotypeDataset
 from src.distillation.utils import ld_prune, safe_pearson, train_test_indices
 
 
+def build_linear_model(
+    model_name: str,
+    l1_ratio: float,
+    cv: int,
+    alphas: int,
+    max_iter: int,
+    seed: int,
+):
+    """
+    Construct a (CV-tuned) linear model, shared by `LR` and `ProbabilisticLR` so both
+    point-estimate and probabilistic (mean/aleatoric/epistemic) fits use the exact same
+    ElasticNet/Ridge construction (alpha path, solver settings, etc.) rather than each
+    approximating it independently.
+
+    Inner CV is small (e.g. cv=3, alphas=5), so spawning a joblib pool per ENCV.fit
+    usually costs more than it saves. Outer parallelism over genes (see `fit_dataset`)
+    does the heavy lifting instead.
+    """
+    if model_name == "ridge":
+        return RidgeCV(
+            cv=cv,
+            alphas=np.logspace(-6, 6, alphas),
+            fit_intercept=True,
+            scoring="r2",
+            gcv_mode="auto",
+        )
+    elif model_name == "elasticnet":
+        # Let ElasticNetCV build the alpha path *from the data*: it computes
+        # alpha_max (the smallest penalty that zeros all coefficients) and
+        # logspaces down by `eps`. This is far better conditioned than a fixed
+        # 1e-6..1e6 grid, whose tiny alphas leave the coordinate-descent solver
+        # thrashing against max_iter (slow + ConvergenceWarnings) with almost no
+        # regularization. `selection="random"` also speeds up convergence.
+        return ElasticNetCV(
+            l1_ratio=l1_ratio,
+            cv=cv,
+            n_alphas=alphas,
+            max_iter=max_iter,
+            fit_intercept=True,
+            random_state=seed,
+            selection="random",
+            n_jobs=1,
+        )
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+
+
 @dataclass
 class LRStruct:
     model_name: str
@@ -53,7 +100,7 @@ class LR:
         self,
         model_name: str = "elasticnet",
         l1_ratio: float = 0.5,  # scPrediXcan has 0.5
-        cv: int         = 3,
+        cv: int         = 5,
         alphas: int     = 100,
         max_iter: int   = 10000,
         seed: int       = 42,
@@ -69,36 +116,9 @@ class LR:
         self.models_: Dict[str, LRStruct] = {}
 
     def _make_model(self):
-        # Inner CV is small (e.g. cv=3, alphas=5), so spawning a joblib pool per
-        # ENCV.fit usually costs more than it saves. Outer parallelism over
-        # genes (see fit_dataset) does the heavy lifting instead.
-        if self.model_name == "ridge":
-            return RidgeCV(
-                cv=self.cv,
-                alphas=np.logspace(-6, 6, self.alphas),
-                fit_intercept=True,
-                scoring="r2",
-                gcv_mode="auto",
-            )
-        elif self.model_name == "elasticnet":
-            # Let ElasticNetCV build the alpha path *from the data*: it computes
-            # alpha_max (the smallest penalty that zeros all coefficients) and
-            # logspaces down by `eps`. This is far better conditioned than a fixed
-            # 1e-6..1e6 grid, whose tiny alphas leave the coordinate-descent solver
-            # thrashing against max_iter (slow + ConvergenceWarnings) with almost no
-            # regularization. `selection="random"` also speeds up convergence.
-            return ElasticNetCV(
-                l1_ratio=self.l1_ratio,
-                cv=self.cv,
-                n_alphas=self.alphas,
-                max_iter=self.max_iter,
-                fit_intercept=True,
-                random_state=self.seed,
-                selection="random",
-                n_jobs=1,
-            )
-        else:
-            raise ValueError(f"Unknown model name: {self.model_name}")
+        return build_linear_model(
+            self.model_name, self.l1_ratio, self.cv, self.alphas, self.max_iter, self.seed
+        )
 
     def _fit_scaled(self, X: np.ndarray, y: np.ndarray):
         """Fit X/y standardizers + the (CV) linear model on the given rows."""

@@ -46,7 +46,10 @@ class GenotypeDataset(Dataset):
         max_individuals: int | None = None,
         bed_template: str = DEFAULT_BED_TEMPLATE,
         maf_threshold: float | None = None,
-        y_var: Path | pd.DataFrame | None = None,
+        y_aleatoric: Path | pd.DataFrame | None = None,
+        y_epistemic: Path | pd.DataFrame | None = None,
+        min_detected_frac: float | None = None,
+        min_expr_std: float | None = None,
     ):
         """
         Args:
@@ -62,13 +65,34 @@ class GenotypeDataset(Dataset):
             maf_threshold (float | None): Minimum minor allele frequency a SNP must have to be kept (e.g. 0.05
                                           for MAF >= 5%). MAF is computed across the loaded cohort. If None,
                                           no MAF filtering is applied.
-            y_var (Path | pd.DataFrame | None): Optional per-(gene, individual) target *variances* in the same
-                                          wide format as `y` (gene,chrom,tss,individual1,...). Used for
-                                          probabilistic distillation, where the teacher provides a Gaussian
-                                          (mean, variance) per target. The variances are taken as-is (no
-                                          normalization is applied) since they live in the model's output space,
-                                          which matches the log-transformed mean targets. If None, no variance
-                                          targets are attached.
+            y_aleatoric (Path | pd.DataFrame | None): Optional per-(gene, individual) teacher *aleatoric*
+                                          variance targets, in the same wide format as `y`
+                                          (gene,chrom,tss,individual1,...), e.g. the 'aleatoric' output of
+                                          get_student_data.py. Used together with `y_epistemic` for
+                                          probabilistic distillation, where the teacher's total predictive
+                                          variance is distilled as two separate targets rather than one
+                                          combined number. Variances are taken as-is (no normalization),
+                                          since they live in the model's output space, matching the
+                                          log-transformed mean targets. Must be provided together with
+                                          `y_epistemic` (both or neither).
+            y_epistemic (Path | pd.DataFrame | None): Optional per-(gene, individual) teacher *epistemic*
+                                          variance targets, same format as `y_aleatoric` (e.g. the
+                                          'epistemic' output of get_student_data.py). Must be provided
+                                          together with `y_aleatoric` (both or neither).
+            min_detected_frac (float | None): Minimum fraction of individuals with nonzero raw expression a gene
+                                          must have to be kept (e.g. 0.2 requires >=20% of individuals to have
+                                          nonzero expression). Guards against near-all-zero, dropout-dominated
+                                          genes, whose Pearson r is fragile (a handful of nonzero points dominate
+                                          the covariance) even when their rank/Spearman correlation looks fine,
+                                          and which otherwise tend to produce degenerate "perfect" R^2 (both
+                                          prediction and truth collapse to 0). Computed on *all* individuals
+                                          present in `y`, before `max_individuals` truncation, so the decision of
+                                          which genes are usable doesn't change with a training-set-size ablation.
+                                          If None, no detection filtering is applied.
+            min_expr_std (float | None): Minimum standard deviation of log1p(expression) across individuals a
+                                          gene must have to be kept. Filters out near-constant genes (no signal
+                                          to predict at all). Computed the same way as `min_detected_frac`
+                                          (all individuals, pre-truncation). If None, no std filtering is applied.
         """
         self.bims         = bims
         self.bim_dir      = bim_dir
@@ -79,6 +103,12 @@ class GenotypeDataset(Dataset):
         self.max_individuals = max_individuals
         self.bed_template = bed_template
         self.maf_threshold = maf_threshold
+        self.min_detected_frac = min_detected_frac
+        self.min_expr_std = min_expr_std
+        if (y_aleatoric is None) != (y_epistemic is None):
+            raise ValueError(
+                "y_aleatoric and y_epistemic must be provided together (both or neither)."
+            )
         if isinstance(y, Path) or isinstance(y, str):
             self.y    = pd.read_csv(y)
         else:
@@ -88,9 +118,19 @@ class GenotypeDataset(Dataset):
         # we will denormalize this to have one row per gene-individual pair
         # with columns: gene, chrom, tss, individual, expression
         if "individual" not in self.y.columns:
+            metadata_cols = ["gene", "chrom", "tss"]
+            individual_cols = [col for col in self.y.columns if col not in metadata_cols]
+
+            # Expression-based gene filtering happens on *all* individual columns,
+            # before any `max_individuals` truncation, so the set of usable genes
+            # reflects the full population regardless of training-set-size ablations.
+            keep_genes = self._genes_passing_expression_filter(
+                self.y, individual_cols=individual_cols
+            )
+            if keep_genes is not None:
+                self.y = self.y[self.y["gene"].isin(keep_genes)].copy()
+
             if self.max_individuals is not None:
-                metadata_cols = ["gene", "chrom", "tss"]
-                individual_cols = [col for col in self.y.columns if col not in metadata_cols]
                 keep_cols = metadata_cols + individual_cols[:self.max_individuals]
                 self.y = self.y.loc[:, keep_cols].copy()
             self.y = self.y.melt(id_vars=["gene", "chrom", "tss"], var_name="individual", value_name="expression")
@@ -100,11 +140,17 @@ class GenotypeDataset(Dataset):
                 self.y["expression"] = np.log1p(self.y["expression"])
             else:
                 raise ValueError(f"Invalid normalization method: {self.normalize}")
-            if y_var is not None:
-                self.y = self._attach_variance(self.y, y_var)
-        elif self.max_individuals is not None:
-            selected_individuals = self.y["individual"].drop_duplicates().head(self.max_individuals)
-            self.y = self.y[self.y["individual"].isin(selected_individuals)].copy()
+            if y_aleatoric is not None:
+                self.y = self._attach_target(self.y, y_aleatoric, "aleatoric")
+            if y_epistemic is not None:
+                self.y = self._attach_target(self.y, y_epistemic, "epistemic")
+        else:
+            keep_genes = self._genes_passing_expression_filter(self.y, individual_cols=None)
+            if keep_genes is not None:
+                self.y = self.y[self.y["gene"].isin(keep_genes)].copy()
+            if self.max_individuals is not None:
+                selected_individuals = self.y["individual"].drop_duplicates().head(self.max_individuals)
+                self.y = self.y[self.y["individual"].isin(selected_individuals)].copy()
         
         # get all different genes
         self.genes = self.y["gene"].unique()
@@ -144,55 +190,110 @@ class GenotypeDataset(Dataset):
         # over many individuals of the same gene) don't recompute allele freqs.
         self._maf_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
 
-        # Per-gene: metadata + the row-individuals/expression (and optional variance) vectors.
-        self.has_variance = "variance" in self.y.columns
-        self._gene_meta: dict[str, tuple[str, int, np.ndarray, np.ndarray, np.ndarray | None]] = {}
+        # Per-gene: metadata + the row-individuals/expression (and optional aleatoric/
+        # epistemic uncertainty) vectors.
+        self.has_uncertainty = {"aleatoric", "epistemic"}.issubset(self.y.columns)
+        self._gene_meta: dict[
+            str, tuple[str, int, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]
+        ] = {}
         if "gene" in self.y.columns and len(self.y) > 0:
             for gene, group in self.y.groupby("gene", sort=False):
-                variance = (
-                    group["variance"].to_numpy() if self.has_variance else None
+                aleatoric = (
+                    group["aleatoric"].to_numpy() if self.has_uncertainty else None
+                )
+                epistemic = (
+                    group["epistemic"].to_numpy() if self.has_uncertainty else None
                 )
                 self._gene_meta[gene] = (
                     str(group["chrom"].iloc[0]),
                     int(group["tss"].iloc[0]),
                     group["individual"].astype(str).to_numpy(),
                     group["expression"].to_numpy(),
-                    variance,
+                    aleatoric,
+                    epistemic,
                 )
 
     @staticmethod
-    def _attach_variance(y_df: pd.DataFrame, y_var: Path | pd.DataFrame | str) -> pd.DataFrame:
+    def _attach_target(
+        y_df: pd.DataFrame, extra: Path | pd.DataFrame | str, col_name: str
+    ) -> pd.DataFrame:
         """
-        Melt the wide variance table and merge a `variance` column onto the (already
-        melted) `y_df` by (gene, chrom, tss, individual).
+        Melt a wide per-(gene, individual) target table and merge it onto the
+        (already melted) `y_df` as a new column named `col_name`, by (gene, chrom,
+        tss, individual).
 
-        Variances are kept in the teacher's output space (no log/percentile transform),
+        Values are kept in the teacher's output space (no log/percentile transform),
         which is consistent with the log-transformed mean targets used for distillation.
         """
-        if isinstance(y_var, (Path, str)):
-            var_df = pd.read_csv(y_var)
+        if isinstance(extra, (Path, str)):
+            extra_df = pd.read_csv(extra)
         else:
-            var_df = y_var.copy()
+            extra_df = extra.copy()
 
-        if "individual" not in var_df.columns:
-            var_df = var_df.melt(
+        if "individual" not in extra_df.columns:
+            extra_df = extra_df.melt(
                 id_vars=["gene", "chrom", "tss"],
                 var_name="individual",
-                value_name="variance",
+                value_name=col_name,
             )
 
         merge_keys = ["gene", "chrom", "tss", "individual"]
         tmp_keys   = [f"__merge_{key}" for key in merge_keys]
 
         y_df = y_df.copy()
-        var_df = var_df[merge_keys + ["variance"]].copy()
+        extra_df = extra_df[merge_keys + [col_name]].copy()
         for key, tmp_key in zip(merge_keys, tmp_keys):
             y_df[tmp_key] = y_df[key].astype(str)
-            var_df[tmp_key] = var_df[key].astype(str)
+            extra_df[tmp_key] = extra_df[key].astype(str)
 
-        merged = y_df.merge(var_df[tmp_keys + ["variance"]], on=tmp_keys, how="left")
+        merged = y_df.merge(extra_df[tmp_keys + [col_name]], on=tmp_keys, how="left")
         merged = merged.drop(columns=tmp_keys)
         return merged
+
+    def _genes_passing_expression_filter(
+        self,
+        df: pd.DataFrame,
+        individual_cols: list[str] | None,
+    ) -> set | None:
+        """
+        Compute the set of genes passing `min_detected_frac`/`min_expr_std`, using
+        *all* individuals present in `df` (i.e. before any `max_individuals`
+        truncation).
+
+        Args:
+            df: either the wide-format frame (one column per individual, selected
+                via `individual_cols`) or the already-melted long-format frame
+                (`gene`/`expression` columns; pass `individual_cols=None`).
+            individual_cols: individual column names in `df` (wide format), or
+                None to use the melted long format instead.
+
+        Returns:
+            The set of gene ids to keep, or None if neither filter is configured
+            (i.e. no filtering requested; caller should keep everything).
+        """
+        if self.min_detected_frac is None and self.min_expr_std is None:
+            return None
+
+        if individual_cols is not None:
+            expr  = df[individual_cols].to_numpy(dtype=np.float64)
+            genes = df["gene"].to_numpy()
+            detected_frac = np.mean(expr > 0, axis=1)
+            std = np.std(np.log1p(np.clip(expr, 0, None)), axis=1)
+        else:
+            grouped = df.groupby("gene")["expression"]
+            detected_frac = grouped.apply(lambda s: float(np.mean(s.to_numpy() > 0)))
+            std           = grouped.apply(lambda s: float(np.std(np.log1p(np.clip(s.to_numpy(), 0, None)))))
+            genes         = detected_frac.index.to_numpy()
+            detected_frac = detected_frac.to_numpy()
+            std           = std.to_numpy()
+
+        keep = np.ones(len(genes), dtype=bool)
+        if self.min_detected_frac is not None:
+            keep &= detected_frac >= self.min_detected_frac
+        if self.min_expr_std is not None:
+            keep &= std >= self.min_expr_std
+
+        return set(genes[keep])
 
     @staticmethod
     def to_percentiles(y_df: pd.DataFrame) -> pd.DataFrame:
@@ -259,6 +360,8 @@ class GenotypeDataset(Dataset):
             max_individuals=self.max_individuals,
             bed_template=self.bed_template,
             maf_threshold=self.maf_threshold,
+            min_detected_frac=self.min_detected_frac,
+            min_expr_std=self.min_expr_std,
         )
     
     def __len__(self) -> int:
@@ -295,35 +398,41 @@ class GenotypeDataset(Dataset):
         return x, y
     
     def get_gene_matrix(
-        self, gene: str, return_variance: bool = False
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
+        self, gene: str, return_uncertainty: bool = False
+    ) -> (
+        tuple[np.ndarray, np.ndarray, np.ndarray, str]
+        | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]
+    ):
         """
         Build the full design matrix for one gene.
 
         Uses pre-built caches from `_build_caches`:
         - per-chromosome sorted bp + searchsorted for the cis window (O(log M))
         - per-chromosome individual -> BED row dict (O(1) lookup)
-        - per-gene (chrom, tss, individuals, expression, variance) tuple (O(1) lookup)
+        - per-gene (chrom, tss, individuals, expression, aleatoric, epistemic) tuple (O(1) lookup)
 
         Args:
-            return_variance: if True, also return the per-individual target variances
-                (requires the dataset to have been built with `y_var`).
+            return_uncertainty: if True, also return the per-individual target
+                aleatoric/epistemic variances (requires the dataset to have been built
+                with both `y_aleatoric` and `y_epistemic`).
 
         Returns:
-            X       : shape (n_individuals_for_gene, n_snps_in_window)
-            y       : shape (n_individuals_for_gene,)
-            [y_var] : shape (n_individuals_for_gene,)  (only if return_variance=True)
-            snp_ids : shape (n_snps_in_window,)
-            chrom   : chromosome name
+            X           : shape (n_individuals_for_gene, n_snps_in_window)
+            y           : shape (n_individuals_for_gene,)
+            [y_aleatoric]: shape (n_individuals_for_gene,)  (only if return_uncertainty=True)
+            [y_epistemic]: shape (n_individuals_for_gene,)  (only if return_uncertainty=True)
+            snp_ids     : shape (n_snps_in_window,)
+            chrom       : chromosome name
         """
         meta = self._gene_meta.get(gene)
         if meta is None:
             raise ValueError(f"No data found for gene {gene}")
-        chrom, tss, row_individuals, y, y_var = meta
+        chrom, tss, row_individuals, y, y_aleatoric, y_epistemic = meta
 
-        if return_variance and y_var is None:
+        if return_uncertainty and (y_aleatoric is None or y_epistemic is None):
             raise ValueError(
-                "Variance targets requested but this dataset was built without `y_var`."
+                "Uncertainty targets requested but this dataset was built without "
+                "`y_aleatoric`/`y_epistemic`."
             )
 
         # Cis window via sorted-bp searchsorted (BIM is bp-sorted by chrom in plink output).
@@ -353,8 +462,10 @@ class GenotypeDataset(Dataset):
         if not keep.all():
             individual_idx = individual_idx[keep]
             y = y[keep]
-            if y_var is not None:
-                y_var = y_var[keep]
+            if y_aleatoric is not None:
+                y_aleatoric = y_aleatoric[keep]
+            if y_epistemic is not None:
+                y_epistemic = y_epistemic[keep]
 
         bed_path = os.path.join(
             self.bim_dir,
@@ -363,8 +474,8 @@ class GenotypeDataset(Dataset):
         with open_bed(bed_path) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
 
-        if return_variance:
-            return X, y, y_var, snp_ids, chrom
+        if return_uncertainty:
+            return X, y, y_aleatoric, y_epistemic, snp_ids, chrom
         return X, y, snp_ids, chrom
 
 if __name__ == "__main__":

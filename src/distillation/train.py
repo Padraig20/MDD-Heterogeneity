@@ -1,16 +1,16 @@
 from __future__ import annotations
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 import os
 import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
 
 from src.distillation.models.lr import LR
-from src.distillation.models.ensemble_lr import EnsembleLR
+from src.distillation.models.probabilistic_lr import ProbabilisticLR
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.wandb_logger import WandBLogger
 
@@ -50,6 +50,20 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cell-types",
+        type=str,
+        nargs="+",
+        default=None,
+        metavar="CELL_TYPE",
+        help=(
+            "Restrict training to one or more specific cell types, given by their "
+            "exact name (i.e. the CSV filename in --targets without the '.csv' "
+            "extension), e.g. --cell-types \"memory B cell\" \"erythrocyte\". "
+            "Defaults to training on every cell type found in --targets. Exits "
+            "with an error if any requested cell type cannot be found."
+        ),
+    )
+    parser.add_argument(
         "-o", "--output-dir",
         type=Path,
         default=None,
@@ -73,6 +87,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=15,
         help="Number of alpha values to try for CV."
+    )
+    parser.add_argument(
+        "-l1", "--l1-ratio",
+        type=float,
+        default=0.5,
+        help=(
+            "ElasticNet L1/L2 mixing ratio for the point-estimate model (--model-name "
+            "elasticnet); 1.0 is pure Lasso (sparser), 0.0 is pure Ridge (denser, more "
+            "shrinkage of correlated SNPs). scPrediXcan uses 0.5. Increase towards 1.0 "
+            "for sparser, more outlier-robust fits if Pearson r lags Spearman rho."
+        ),
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -137,88 +162,78 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--variance",
+        "--min-detected-frac",
+        type=float,
+        default=None,
+        help=(
+            "Minimum fraction of individuals with nonzero raw expression a gene must "
+            "have to be trained/evaluated (e.g. 0.2 for >=20%% detection). Filters out "
+            "near-all-zero, dropout-dominated genes, computed on *all* training "
+            "individuals *before* --max-individuals is applied (so the gene set is "
+            "stable across training-set-size ablations). Applied only to --targets "
+            "(never to --targets-test), so the held-out evaluation always covers "
+            "exactly the genes the model was trained on. Defaults to no filtering."
+        ),
+    )
+    parser.add_argument(
+        "--min-expr-std",
+        type=float,
+        default=None,
+        help=(
+            "Minimum standard deviation of log1p(expression) across individuals a gene "
+            "must have to be trained/evaluated. Filters out near-constant genes (no "
+            "signal to predict). Same population/timing semantics as "
+            "--min-detected-frac. Defaults to no filtering."
+        ),
+    )
+    parser.add_argument(
+        "--aleatoric",
         type=Path,
         default=None,
         help=(
-            "Path to a directory of teacher target *variances* (one CSV per cell type, "
-            "same names/format as --targets, e.g. the 'totvar' output of get_student_data.py). "
-            "When provided, a probabilistic linear deep ensemble is distilled by matching the "
-            "teacher's (mean, variance) Gaussians via the 2-Wasserstein metric, instead of a "
+            "Path to a directory of teacher target *aleatoric* variances (one CSV per "
+            "cell type, same names/format as --targets, e.g. the 'aleatoric' output of "
+            "get_student_data.py). When provided together with --epistemic, a "
+            "probabilistic model is distilled: three independent elastic-net/ridge "
+            "fits per gene (mean, aleatoric variance, epistemic variance) directly "
+            "against the teacher's own uncertainty decomposition, instead of a single "
             "point-estimate elasticnet/ridge model."
         ),
     )
     parser.add_argument(
-        "--variance-test",
+        "--epistemic",
         type=Path,
         default=None,
         help=(
-            "Path to an optional directory of teacher target *variances* for the "
+            "Path to a directory of teacher target *epistemic* variances, same format "
+            "as --aleatoric (e.g. the 'epistemic' output of get_student_data.py). Must "
+            "be provided together with --aleatoric."
+        ),
+    )
+    parser.add_argument(
+        "--aleatoric-test",
+        type=Path,
+        default=None,
+        help=(
+            "Path to an optional directory of teacher *aleatoric* variances for the "
             "held-out test set (used together with --targets-test), same format/"
-            "filenames as --variance. Only relevant for probabilistic distillation "
-            "(--variance). If omitted while --targets-test is set, the held-out "
-            "evaluation reuses --variance, matched by individual, which is only "
-            "correct if that file also covers the test individuals."
+            "filenames as --aleatoric. Only relevant for probabilistic distillation "
+            "(--aleatoric/--epistemic). If omitted while --targets-test is set, the "
+            "held-out evaluation reuses --aleatoric, matched by individual, which is "
+            "only correct if that file also covers the test individuals."
         ),
     )
     parser.add_argument(
-        "--ensemble-size",
-        type=int,
-        default=5,
-        help="Number of linear ensemble members for probabilistic distillation (--variance).",
-    )
-    parser.add_argument(
-        "--prob-epochs",
-        type=int,
-        default=300,
-        help="Number of full-batch gradient steps per gene for probabilistic distillation.",
-    )
-    parser.add_argument(
-        "--prob-lr",
-        type=float,
-        default=1e-2,
-        help="Learning rate for the probabilistic (deep-ensemble LR) distillation.",
-    )
-    parser.add_argument(
-        "--prob-weight-decay",
-        type=float,
-        default=0.25,
-        help="Weight decay (L2) for the probabilistic (deep-ensemble LR) distillation.",
-    )
-    parser.add_argument(
-        "--prob-l1",
-        type=float,
-        default=0.75,
+        "--epistemic-test",
+        type=Path,
+        default=None,
         help=(
-            "Group-lasso strength on the mean head for probabilistic distillation "
-            "(--variance). Groups the ensemble members sharing each SNP and applies a "
-            "proximal step so whole SNP columns are driven to exactly zero, inducing "
-            "elastic-net-style sparsity. 0 disables (dense L2-only fit); increase it to "
-            "reduce the nonzero-weight count."
-        ),
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help=(
-            "Torch device for probabilistic distillation (--variance), e.g. 'cpu', 'cuda', "
-            "or 'cuda:0'. Use 'auto' to pick 'cuda' when available. Ignored for the "
-            "elasticnet/ridge (sklearn, CPU) path."
+            "Path to an optional directory of teacher *epistemic* variances for the "
+            "held-out test set, same format/filenames as --epistemic. Same fallback "
+            "semantics as --aleatoric-test."
         ),
     )
     return parser.parse_args()
-
-def resolve_device(device: str) -> torch.device:
-    """Resolve a --device string to a torch.device, warning + falling back to CPU
-    if CUDA was requested but is unavailable."""
-    if device == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dev = torch.device(device)
-    if dev.type == "cuda" and not torch.cuda.is_available():
-        logging.warning("CUDA requested via --device '%s' but not available; using CPU.", device)
-        return torch.device("cpu")
-    return dev
 
 def setup_logging(verbosity: int) -> None:
     """Configure basic logging based on verbosity level."""
@@ -289,6 +304,21 @@ def main() -> None:
     cell_type_files = os.listdir(args.targets)
     logging.info(f"Found {len(cell_type_files)} cell types!")
 
+    if args.cell_types is not None:
+        available_cell_types = {f[:-4]: f for f in cell_type_files}
+        missing_cell_types = [ct for ct in args.cell_types if ct not in available_cell_types]
+        if missing_cell_types:
+            logging.error(
+                "Requested cell type(s) not found in '%s': %s. Available cell types: %s",
+                args.targets, missing_cell_types, sorted(available_cell_types.keys()),
+            )
+            sys.exit(1)
+        cell_type_files = [available_cell_types[ct] for ct in args.cell_types]
+        logging.info(
+            "Restricting training to %d requested cell type(s): %s",
+            len(cell_type_files), args.cell_types,
+        )
+
     use_external_test = args.targets_test is not None
     if use_external_test:
         logging.info(
@@ -302,30 +332,32 @@ def main() -> None:
     jobs = max(1, args.jobs)
     logging.info("Fitting genes per cell type with %d parallel workers.", jobs)
 
-    probabilistic = args.variance is not None
-    prob_device = "cpu"
+    probabilistic = args.aleatoric is not None or args.epistemic is not None
+    if probabilistic and (args.aleatoric is None or args.epistemic is None):
+        logging.error("--aleatoric and --epistemic must both be provided together.")
+        sys.exit(1)
     if probabilistic:
-        prob_device = resolve_device(args.device)
-        if prob_device.type == "cuda" and jobs > 1:
-            logging.info(
-                "Using CUDA for probabilistic distillation; gene fits share the GPU, "
-                "so the %d workers mainly overlap CPU-side data prep with GPU compute.",
-                jobs,
-            )
         logging.info(
-            "Probabilistic distillation enabled on device '%s': fitting a linear deep "
-            "ensemble against teacher (mean, variance) Gaussians via the 2-Wasserstein metric.",
-            prob_device,
+            "Probabilistic distillation enabled: fitting three independent elastic-net/"
+            "ridge regressions per gene (mean, aleatoric variance, epistemic variance) "
+            "directly against the teacher's own uncertainty decomposition.",
         )
+        if (args.aleatoric_test is None) != (args.epistemic_test is None):
+            logging.warning(
+                "Only one of --aleatoric-test/--epistemic-test was provided; ignoring "
+                "it and falling back to --aleatoric/--epistemic for held-out evaluation."
+            )
 
     for ct_file in tqdm(cell_type_files, desc="Processing cell types"):
         ct_name = ct_file[:-4]  # remove .csv extension
         logging.info("Processing cell type: %s", ct_name)
 
-        y_var = os.path.join(args.variance, ct_file) if probabilistic else None
-        if probabilistic and not os.path.exists(y_var):
+        y_aleatoric = os.path.join(args.aleatoric, ct_file) if probabilistic else None
+        y_epistemic = os.path.join(args.epistemic, ct_file) if probabilistic else None
+        if probabilistic and not (os.path.exists(y_aleatoric) and os.path.exists(y_epistemic)):
             logging.warning(
-                "No variance file for cell type '%s' at %s; skipping.", ct_name, y_var
+                "No aleatoric/epistemic file for cell type '%s' at %s / %s; skipping.",
+                ct_name, y_aleatoric, y_epistemic,
             )
             continue
 
@@ -339,8 +371,17 @@ def main() -> None:
             max_individuals=args.max_individuals,
             bed_template=bed_template,
             maf_threshold=args.maf_threshold,
-            y_var=y_var,
+            y_aleatoric=y_aleatoric,
+            y_epistemic=y_epistemic,
+            min_detected_frac=args.min_detected_frac,
+            min_expr_std=args.min_expr_std,
         )
+        if args.min_detected_frac is not None or args.min_expr_std is not None:
+            logging.info(
+                "Cell type '%s': %d genes pass expression filter "
+                "(min_detected_frac=%s, min_expr_std=%s).",
+                ct_name, len(dataset.genes), args.min_detected_frac, args.min_expr_std,
+            )
 
         test_dataset = None
         if use_external_test:
@@ -351,16 +392,21 @@ def main() -> None:
                     "to the automatic 80:20 split for this cell type.", ct_name, test_path,
                 )
             else:
-                y_var_test = y_var
-                if probabilistic and args.variance_test is not None:
-                    candidate = os.path.join(args.variance_test, ct_file)
-                    if os.path.exists(candidate):
-                        y_var_test = candidate
+                y_aleatoric_test = y_aleatoric
+                y_epistemic_test = y_epistemic
+                if probabilistic and args.aleatoric_test is not None and args.epistemic_test is not None:
+                    candidate_aleatoric = os.path.join(args.aleatoric_test, ct_file)
+                    candidate_epistemic = os.path.join(args.epistemic_test, ct_file)
+                    if os.path.exists(candidate_aleatoric) and os.path.exists(candidate_epistemic):
+                        y_aleatoric_test = candidate_aleatoric
+                        y_epistemic_test = candidate_epistemic
                     else:
                         logging.warning(
-                            "No held-out variance file for cell type '%s' at %s; falling "
-                            "back to --variance (%s) for the held-out evaluation.",
-                            ct_name, candidate, y_var,
+                            "No held-out aleatoric/epistemic file for cell type '%s' at "
+                            "%s / %s; falling back to --aleatoric/--epistemic (%s / %s) "
+                            "for the held-out evaluation.",
+                            ct_name, candidate_aleatoric, candidate_epistemic,
+                            y_aleatoric, y_epistemic,
                         )
                 test_dataset = GenotypeDataset(
                     bims=bims,
@@ -372,23 +418,23 @@ def main() -> None:
                     max_individuals=None,
                     bed_template=bed_template,
                     maf_threshold=args.maf_threshold,
-                    y_var=y_var_test,
+                    y_aleatoric=y_aleatoric_test,
+                    y_epistemic=y_epistemic_test,
                 )
 
         if probabilistic:
-            model = EnsembleLR(
-                n_models=args.ensemble_size,
-                epochs=args.prob_epochs,
-                lr=args.prob_lr,
-                weight_decay=args.prob_weight_decay,
-                l1=args.prob_l1,
+            model = ProbabilisticLR(
+                model_name=args.model_name,
+                l1_ratio=args.l1_ratio,
+                max_iter=args.max_iter,
+                alphas=args.alphas,
                 seed=args.seed,
                 n_jobs=jobs,
-                device=prob_device,
             )
         else:
             model = LR(
                 model_name=args.model_name,
+                l1_ratio=args.l1_ratio,
                 max_iter=args.max_iter,
                 alphas=args.alphas,
                 seed=args.seed,
@@ -401,7 +447,7 @@ def main() -> None:
             path = os.path.join(args.output_dir, f"{ct_path}.json")
             model.save_coefficients(path)
 
-        model_label = "Linear Deep Ensemble" if probabilistic else args.model_name.capitalize()
+        model_label = "Probabilistic Elastic Net" if probabilistic else args.model_name.capitalize()
         df = model.summarize_models()
         wb_logger.log_celltype_diagnostics(df, cell_type=ct_name, model_label=model_label)
 
