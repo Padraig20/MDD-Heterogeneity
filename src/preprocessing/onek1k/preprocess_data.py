@@ -37,7 +37,9 @@ applied. Two output flavours are available, selected with
     rows=cell types and columns=genes. Values are the cell-weighted mean
     expression across a donor subset (the additional aggregation across
     individuals). With --normalize, per-donor mean expression is min-max
-    normalized per gene before the additional donor aggregation.
+    normalized per gene before the additional donor aggregation. With
+    --percentiles, the mean expressions are instead ranked across genes within
+    each cell type after donor aggregation.
 
   * --population-h5ad -> population target. A per-(individual, cell type)
     pseudo-bulk .h5ad (obs: individual_id, cell_type, n_cells; var.index: gene
@@ -224,6 +226,17 @@ def parse_args() -> argparse.Namespace:
             "0-1 range before writing output. Disabled by default."
         ),
     )
+    parser.add_argument(
+        "--percentiles",
+        action="store_true",
+        help=(
+            "With --aggregate-across-individuals, convert the aggregated mean "
+            "expression values to percentile ranks across genes, separately "
+            "for each cell type. Donors are aggregated before ranks are "
+            "computed. Ties receive their average rank. Cannot be combined "
+            "with --normalize."
+        ),
+    )
 
     parser.add_argument(
         "--target-individual",
@@ -288,6 +301,12 @@ def parse_args() -> argparse.Namespace:
         )
     if args.all_individuals and args.target_individual is not None:
         parser.error("--all-individuals cannot be combined with --target-individual.")
+    if args.percentiles and not args.aggregate_across_individuals:
+        parser.error(
+            "--percentiles is only available with --aggregate-across-individuals."
+        )
+    if args.percentiles and args.normalize:
+        parser.error("--percentiles cannot be combined with --normalize.")
 
     return args
 
@@ -915,6 +934,15 @@ def select_individuals(
     return selected
 
 
+def rank_genes_within_cell_types(target: pd.DataFrame) -> pd.DataFrame:
+    """Convert expression to percentile ranks across genes within each row.
+
+    Missing genes remain missing and are excluded from the rank denominator.
+    Ties receive their average rank, yielding finite percentiles in ``(0, 1]``.
+    """
+    return target.rank(axis=1, method="average", pct=True).astype(np.float32)
+
+
 def write_target_vars(
     *,
     sums: sp.csr_matrix | np.ndarray,
@@ -927,6 +955,7 @@ def write_target_vars(
     drop_empty: bool,
     normalize: bool,
     overwrite: bool,
+    percentiles: bool = False,
 ) -> None:
     if output_path.exists() and not overwrite:
         raise FileExistsError(
@@ -1027,6 +1056,12 @@ def write_target_vars(
                 "All cell types/genes were dropped after filtering; nothing to "
                 "write. Loosen the filter thresholds or pass --keep-empty."
             )
+
+    if percentiles:
+        logging.info(
+            "Ranking aggregated mean expression across genes within each cell type"
+        )
+        target = rank_genes_within_cell_types(target)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     logging.info("Writing target-variable CSV with shape %s to %s", target.shape, output_path)
@@ -1136,6 +1171,7 @@ def main() -> None:
                 keep_by_ct=keep_by_ct,
                 drop_empty=not args.keep_empty,
                 normalize=args.normalize,
+                percentiles=args.percentiles,
                 overwrite=args.overwrite,
             )
         else:
