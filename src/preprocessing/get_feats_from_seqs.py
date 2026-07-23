@@ -35,6 +35,12 @@ individuals from the VCF headers and replacing SNPs in the sequence window.
 Note: only biallelic SNPs are substituted, and heterozygous genotypes are currently
 represented by ALT if any ALT allele is present.
 
+Note: for the 'variantformer' backbone, per-individual VCFs must use "chr"-prefixed
+chromosome names (e.g. "chr1"), matching VariantFormer's reference genome/gencode.
+Cohorts with bare chromosome names (e.g. OneK1K's "1".."22") must be regenerated
+first via `rename_vcf_chr_prefix.sh`; otherwise `bcftools consensus` silently
+applies zero variants for every individual (see `vcf_uses_chr_prefix`).
+
 https://huggingface.co/EleutherAI/enformer-official-rough
 """
 
@@ -95,7 +101,14 @@ def parse_args() -> argparse.Namespace:
             "chr22.vcf.gz), while the 'variantformer' backbone reads one "
             "single-sample, whole-genome VCF per individual named "
             "'<individual>.vcf.gz' (bgzipped + tabix-indexed, e.g. produced by "
-            "`bcftools +split`). Omit if personalization not needed."
+            "`bcftools +split`). For the 'variantformer' backbone, the VCFs' "
+            "CHROM column must use 'chr'-prefixed contigs (e.g. 'chr1'), matching "
+            "VariantFormer's reference genome/gencode; otherwise `bcftools "
+            "consensus` silently applies zero variants for every individual "
+            "(identical, reference-only embeddings for the whole cohort). Cohorts "
+            "with bare chromosome names (e.g. OneK1K's '1'..'22') must first be "
+            "regenerated via `src/preprocessing/rename_vcf_chr_prefix.sh`. Omit "
+            "--vcf-dir if personalization not needed."
         )
     )
     parser.add_argument(
@@ -299,6 +312,26 @@ def get_vcf_samples(vcf_path: Path) -> List[str]:
         vf.close()
 
 
+def vcf_uses_chr_prefix(vcf_path: Path) -> bool:
+    """Peek the first record's CHROM to detect 'chr1' vs '1' style contig naming.
+
+    VariantFormer's reference genome/gencode coordinates always use "chr"-prefixed
+    contigs (e.g. "chr1"), but some per-individual VCFs (e.g. OneK1K, split from
+    cohort VCFs with bare "1".."22" contigs) don't. Without a matching contig name,
+    `bcftools consensus` silently applies zero variants (exit code 0, no error) when
+    VariantFormer pipes it a "chrN:start-end" FASTA region -- personalization becomes
+    a silent no-op and every individual ends up with the same reference-only
+    embedding. See `rename_vcf_chr_prefix.sh` to fix a mismatched --vcf-dir.
+    """
+    vf = pysam.VariantFile(str(vcf_path))
+    try:
+        for rec in vf:
+            return str(rec.chrom).startswith("chr")
+    finally:
+        vf.close()
+    return True  # empty VCF; nothing to check
+
+
 def discover_individual_vcfs(vcf_dir: Path) -> Dict[str, Path]:
     """Map individual ID -> per-individual VCF path for the VariantFormer backbone.
 
@@ -306,6 +339,11 @@ def discover_individual_vcfs(vcf_dir: Path) -> Dict[str, Path]:
     individual (e.g. produced by ``bcftools +split``), bgzipped and tabix-indexed
     as ``<individual>.vcf(.bgz|.gz)``. The individual ID is the filename with the
     VCF suffix stripped and is assumed to match the sample name inside the file.
+
+    Each VCF's CHROM column must use "chr"-prefixed contigs (e.g. "chr1"), matching
+    VariantFormer's reference genome/gencode; see ``vcf_uses_chr_prefix`` and
+    ``rename_vcf_chr_prefix.sh`` for cohorts (e.g. OneK1K) that use bare chromosome
+    names instead.
     """
     suffixes = (".vcf.gz", ".vcf.bgz")
     mapping: Dict[str, Path] = {}
@@ -609,6 +647,23 @@ def extract_variantformer_features(
             "Personalized mode: %d of %d per-individual VCFs from %s",
             len(sample_ids), len(all_individuals), vcf_dir,
         )
+
+        # Fail fast if the VCFs use bare chromosome names (e.g. "1"): VariantFormer's
+        # reference genome/gencode always use "chr"-prefixed contigs (e.g. "chr1"),
+        # and bcftools consensus would otherwise silently apply zero variants for
+        # every individual -- burning hours of GPU time to produce embeddings that
+        # are all identical (reference-only) instead of raising an error.
+        probe_vcf = individual_to_vcf[sample_ids[0]]
+        if not vcf_uses_chr_prefix(probe_vcf):
+            raise ValueError(
+                f"VCF '{probe_vcf}' uses bare chromosome names (e.g. '1') but "
+                "VariantFormer's reference genome/gencode use 'chr'-prefixed contigs "
+                "(e.g. 'chr1'). bcftools consensus would silently apply zero variants "
+                "for every individual if run as-is, producing identical embeddings "
+                "across the whole cohort. Regenerate --vcf-dir with 'chr'-prefixed "
+                "contigs first, e.g. via "
+                "src/preprocessing/rename_vcf_chr_prefix.sh <in_dir> <out_dir>."
+            )
     else:
         sample_ids = [None]
         logging.info("Reference-sequence mode (no --vcf-dir provided).")
