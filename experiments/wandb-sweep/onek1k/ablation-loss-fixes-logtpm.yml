@@ -1,0 +1,61 @@
+# sweep.yaml
+program: src.training.train
+method: bayes
+metric:
+  name: eval/pearson
+  goal: maximize
+
+parameters:
+  learning-rate:
+    values: [5e-4, 5e-5, 5e-6]
+  batch-size:
+    values: [2048]
+  n-layers:
+    values: [1, 2, 3]
+  dropout:
+    values: [0.0, 0.05]
+  weight-decay:
+    values: [0.0005, 0.01]
+
+
+  cossim-lambda:
+    values: [0, 0.1, 0.5, 1.0]
+  mpc-lambda:
+    values: [0, 0.1, 0.5, 1.0]
+  mse-lambda:
+    values: [0, 0.1, 0.5, 1.0]
+  pnll-lambda:
+    values: [0, 0.1, 0.5, 1.0]
+
+
+  # booleans: sweep both; wandb will emit flags only when true
+  norm-inputs:
+    values: [true, false]
+  norm-targets:
+    values: ["log"]
+  norm-layer:
+    values: [true, false]
+
+  epochs:
+    value: 100
+
+  model-name: 
+    values: ["mlp"]
+
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - -m
+  - ${program}
+  - -X
+  - ./data/onek1k/enformer/X
+  - -y
+  - ./data/onek1k/y-all.csv
+  - --seed
+  - "0"
+  - -es
+  - --run-name
+  - "ablation-loss-fixes-logtpm"
+  - ${args_no_boolean_flags}
