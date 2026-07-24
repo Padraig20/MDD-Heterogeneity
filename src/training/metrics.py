@@ -20,6 +20,37 @@ import torch
 from torch import Tensor
 from torchmetrics import Metric
 
+
+def _pearson_from_sums(
+    sum_xy: Tensor,
+    sum_x: Tensor,
+    sum_y: Tensor,
+    sum_x2: Tensor,
+    sum_y2: Tensor,
+    n: float | Tensor,
+) -> Tensor:
+    """Compute Pearson correlations from float64 sufficient statistics.
+
+    The textbook one-pass variance expression can be slightly negative due to
+    cancellation when values have very little spread.  Mathematically these
+    variances are non-negative, so clamp round-off below zero and mark
+    genuinely constant/non-finite inputs as undefined.
+    """
+    cov = sum_xy - (sum_x * sum_y) / n
+    var_x = (sum_x2 - (sum_x * sum_x) / n).clamp_min(0.0)
+    var_y = (sum_y2 - (sum_y * sum_y) / n).clamp_min(0.0)
+    denom = torch.sqrt(var_x * var_y)
+
+    valid = (
+        denom.gt(0.0)
+        & torch.isfinite(denom)
+        & torch.isfinite(cov)
+    )
+    correlation = cov / denom
+    correlation = correlation.clamp(min=-1.0, max=1.0)
+    return torch.where(valid, correlation, torch.nan)
+
+
 class MeanCellPearson(Metric):
     """Pearson per cell (correlate across genes), then mean over cells."""
 
@@ -30,18 +61,22 @@ class MeanCellPearson(Metric):
     def __init__(self, n_cells: int, dist_sync_on_step: bool = False):
         super().__init__(dist_sync_on_step=dist_sync_on_step)
 
-        zeros = torch.zeros(n_cells, dtype=torch.float32)
+        # Float32 raw moments lose too much precision when predictions or
+        # targets are nearly constant (common for percentile targets).
+        zeros = torch.zeros(n_cells, dtype=torch.float64)
         self.add_state("sum_xy", default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_x",  default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_y",  default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_x2", default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_y2", default=zeros.clone(), dist_reduce_fx="sum")
-        self.add_state("n",      default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("n",      default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
 
     def update(self, pred: Tensor, target: Tensor) -> None:
         # pred/target: [B, n_cells]
         assert pred.shape == target.shape
 
+        pred = pred.to(dtype=torch.float64)
+        target = target.to(dtype=torch.float64)
         self.sum_xy += torch.sum(pred * target, dim=0)
         self.sum_x  += torch.sum(pred, dim=0)
         self.sum_y  += torch.sum(target, dim=0)
@@ -52,20 +87,14 @@ class MeanCellPearson(Metric):
     def compute(self) -> Tensor:
         assert self.n > 0.0, "No samples to compute metric!"
 
-        cov   = self.sum_xy - (self.sum_x * self.sum_y) / self.n
-        var_x = self.sum_x2 - (self.sum_x * self.sum_x) / self.n
-        var_y = self.sum_y2 - (self.sum_y * self.sum_y) / self.n
-
-        assert var_x.ge(0).all() and var_y.ge(0).all(), "Negative variance encountered in Pearson computation!"
-
-        denom = torch.sqrt(var_x) * torch.sqrt(var_y)
-
-        assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
-
-        ret = cov / (denom + 1e-12) # [n]; account for possible 0 division
-        ret = torch.where((ret < -1.0) | (ret > 1.0), torch.nan, ret)
-
-        return ret
+        return _pearson_from_sums(
+            self.sum_xy,
+            self.sum_x,
+            self.sum_y,
+            self.sum_x2,
+            self.sum_y2,
+            self.n,
+        )
 
 class MeanGenePearson(Metric):
     """Pearson per gene (across cells), then mean over genes."""
@@ -79,13 +108,13 @@ class MeanGenePearson(Metric):
         self.n_cells = float(n_cells)
         self.n_genes = n_genes
 
-        zeros = torch.zeros(n_genes, dtype=torch.float32)
+        zeros = torch.zeros(n_genes, dtype=torch.float64)
         self.add_state("sum_xy", default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_x",  default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_y",  default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_x2", default=zeros.clone(), dist_reduce_fx="sum")
         self.add_state("sum_y2", default=zeros.clone(), dist_reduce_fx="sum")
-        self.add_state("n",      default=torch.tensor(0.0), dist_reduce_fx="sum")
+        self.add_state("n",      default=torch.tensor(0.0, dtype=torch.float64), dist_reduce_fx="sum")
 
     def update(self, pred: Tensor, target: Tensor) -> None:
         # pred/target: [B, n_cells]
@@ -96,8 +125,12 @@ class MeanGenePearson(Metric):
         start = int(self.n.item())
         end   = min(start + B, self.n_genes)
 
-        self.sum_x[start:end]  += pred.sum(dim=1)
-        self.sum_y[start:end]  += target.sum(dim=1)
+        pred = pred.to(dtype=torch.float64)
+        target = target.to(dtype=torch.float64)
+        # Each row contains all cells for one gene, so it can be centered
+        # directly.  This avoids subtracting two nearly equal raw moments.
+        pred = pred - pred.mean(dim=1, keepdim=True)
+        target = target - target.mean(dim=1, keepdim=True)
         self.sum_xy[start:end] += (pred * target).sum(dim=1)
         self.sum_x2[start:end] += (pred * pred).sum(dim=1)
         self.sum_y2[start:end] += (target * target).sum(dim=1)
@@ -116,20 +149,14 @@ class MeanGenePearson(Metric):
 
         nc = self.n_cells  # num cells per gene
 
-        cov   = sum_xy - (sum_x * sum_y) / nc
-        var_x = sum_x2 - (sum_x * sum_x) / nc
-        var_y = sum_y2 - (sum_y * sum_y) / nc
-        
-        assert var_x.ge(0).all() and var_y.ge(0).all(), "Negative variance encountered in Pearson computation!"
-
-        denom = torch.sqrt(var_x) * torch.sqrt(var_y)
-
-        assert denom.ge(0).all(), "Non-positive denominator encountered in Pearson computation!"
-
-        ret = cov / (denom + 1e-12) # [n]; account for possible 0 division
-        ret = torch.where((ret < -1.0) | (ret > 1.0), torch.nan, ret)
-
-        return ret
+        return _pearson_from_sums(
+            sum_xy,
+            sum_x,
+            sum_y,
+            sum_x2,
+            sum_y2,
+            nc,
+        )
 
 
 def _spearman(a: Tensor, b: Tensor) -> float:
