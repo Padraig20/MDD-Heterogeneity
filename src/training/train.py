@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import logging
+import os
 import random
 import pandas as pd
 import numpy as np
@@ -601,6 +602,7 @@ def main() -> None:
     wb_logger.finish()
 
     if args.output is not None:
+        os.makedirs(args.output.parent, exist_ok=True)
         torch.save({
             "model_state_dict": model.state_dict(),
             "input_dim": input_dim,
