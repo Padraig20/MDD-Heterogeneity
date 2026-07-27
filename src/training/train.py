@@ -342,6 +342,10 @@ def main() -> None:
         test_dataset.norm_features = train_dataset.norm_features
         if args.select_genes is not None:
             selected_dataset.norm_features = train_dataset.norm_features
+        if selected_calibration_dataset is not None:
+            selected_calibration_dataset.norm_features = (
+                train_dataset.norm_features
+            )
         if eval_calibration_dataset is not None:
             eval_calibration_dataset.norm_features = train_dataset.norm_features
         if test_calibration_dataset is not None:
@@ -610,6 +614,7 @@ def main() -> None:
             "n_layers": args.n_layers,
             "layer_norm": args.norm_layer,
             "model_name": args.model_name,
+            "norm_targets": args.norm_targets,
             "dropout": args.dropout,
             "weight_decay": args.weight_decay,
             "learning_rate": args.learning_rate,
@@ -618,6 +623,16 @@ def main() -> None:
             "seed": args.seed,
             "scheduler": "warmup-cosine",
             "loss_lambdas": dict(loss_lambda_dict),
+            "posthoc_variance_calibration": (
+                "validation_scalar_gaussian_nll"
+                if args.model_name == "deep-ensemble"
+                else None
+            ),
+            "variance_scale": (
+                float(model.variance_scale.item())
+                if args.model_name == "deep-ensemble"
+                else None
+            ),
             "cell_types": list(cell_type_names),
             "chromosome_split": {
                 "train": list(dict.fromkeys(train_dataset.X_chroms.astype(str))),

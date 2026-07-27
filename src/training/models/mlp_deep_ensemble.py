@@ -87,6 +87,81 @@ class MLPEnsemble(nn.Module):
             for _ in range(n_models)
         ])
         self.dropout_rate = dropout
+        # Scalar post-hoc variance temperature. It is used only for aggregated
+        # eval/inference outputs; joint per-member training remains unchanged.
+        self.register_buffer("variance_scale", torch.tensor(1.0))
+
+    def set_variance_scale(self, scale: float) -> None:
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError(
+                f"variance scale must be finite and positive, got {scale}."
+            )
+        self.variance_scale.fill_(float(scale))
+
+    def _aggregate_predictions(self, x, apply_variance_scale: bool):
+        means = []
+        variances = []
+        for model in self.models:
+            model.eval()
+            preds = model(x)
+            means.append(preds[..., :self.output_dim])
+            variances.append(preds[..., self.output_dim:])
+
+        prediction = torch.mean(torch.stack(means), dim=0)
+        aleatoric_unc = torch.mean(torch.stack(variances), dim=0)
+        epistemic_unc = (
+            torch.mean(
+                torch.stack([mean**2 for mean in means]),
+                dim=0,
+            )
+            - prediction**2
+        ).clamp_min(0.0)
+
+        if apply_variance_scale:
+            scale = self.variance_scale.to(
+                dtype=aleatoric_unc.dtype,
+                device=aleatoric_unc.device,
+            )
+            aleatoric_unc = aleatoric_unc * scale
+            epistemic_unc = epistemic_unc * scale
+
+        return prediction, aleatoric_unc, epistemic_unc
+
+    def forward_uncalibrated(self, x):
+        """Return aggregate predictions before post-hoc variance scaling."""
+        if self.training:
+            raise RuntimeError(
+                "forward_uncalibrated() requires model.eval()."
+            )
+        return self._aggregate_predictions(
+            x,
+            apply_variance_scale=False,
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Checkpoints created before post-hoc calibration have no scale buffer.
+        # Treat them as uncalibrated rather than failing strict loading.
+        scale_key = f"{prefix}variance_scale"
+        if scale_key not in state_dict:
+            state_dict[scale_key] = torch.ones_like(self.variance_scale)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
     
     def forward(self, x):
         if self.training: # during training, each model gets its own forward pass (for independent gradients)
@@ -99,22 +174,11 @@ class MLPEnsemble(nn.Module):
                 vars.append(preds[..., self.output_dim:])
             return means, vars
 
-        else: # calculate aggregated predictions and uncertainties
-            means = []
-            vars  = []
-            for model in self.models:
-                model.eval()
-                preds = model(x) # shape (batch_size, output_dim*2)
-                mu    = preds[..., :self.output_dim]
-                var   = preds[..., self.output_dim:]
-                means.append(mu)
-                vars.append(var)
-
-            prediction    = torch.mean(torch.stack(means), dim=0)   # MC estimate of mean
-            aleatoric_unc = torch.mean(torch.stack(vars), dim=0)    # MC estimate of variance
-            epistemic_unc = torch.mean(torch.stack([mu**2 for mu in means]), dim=0) - prediction**2 # MC estimate of mu^2 - prediction
-
-            return prediction, aleatoric_unc, epistemic_unc
+        else: # calculate aggregated predictions and calibrated uncertainties
+            return self._aggregate_predictions(
+                x,
+                apply_variance_scale=True,
+            )
     
 if __name__ == "__main__":
     # example usage

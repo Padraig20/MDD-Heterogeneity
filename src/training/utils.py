@@ -4,6 +4,7 @@ import logging
 from tqdm import tqdm
 from src.training.dataset import MddDataset
 from copy import deepcopy
+import numpy as np
 import torch
 import random
 
@@ -456,6 +457,71 @@ def evaluate_separate_model(
 # -------------- TRAINING AND EVALUATION FOR ENSEMBLE MODEL ------------------ #
 # ---------------------------------------------------------------------------- #
 
+def fit_posthoc_variance_scale(
+    model: torch.nn.Module,
+    calibration_loader: torch.utils.data.DataLoader,
+    device: torch.device = torch.device("cpu"),
+    eps: float = 1e-8,
+) -> float:
+    """Fit one Gaussian variance temperature on validation residuals.
+
+    For fixed means and raw total variances ``v``, the scalar minimizing
+    Gaussian NLL for ``alpha * v`` is
+
+        alpha = mean((y - mu) ** 2 / v).
+
+    Raw (unscaled) model outputs are always used, so calling this function
+    after successive epochs never compounds the previous epoch's scale.
+    """
+    model.eval()
+    ratio_sum = torch.tensor(0.0, dtype=torch.float64, device=device)
+    n_valid = 0
+
+    with torch.no_grad():
+        for inputs, targets in tqdm(
+            calibration_loader,
+            desc="Fitting variance scale",
+        ):
+            inputs, targets = inputs.to(device), targets.to(device)
+            prediction, aleatoric_unc, epistemic_unc = (
+                model.forward_uncalibrated(inputs)
+            )
+            raw_total_variance = (
+                aleatoric_unc + epistemic_unc
+            ).clamp_min(eps)
+            squared_error = (targets - prediction) ** 2
+            finite = (
+                torch.isfinite(raw_total_variance)
+                & torch.isfinite(squared_error)
+            )
+            if not finite.any():
+                continue
+
+            variance = raw_total_variance[finite].to(torch.float64)
+            error = squared_error[finite].to(torch.float64)
+            ratio_sum += torch.sum(error / variance)
+            n_valid += int(finite.sum().item())
+
+    if n_valid == 0:
+        raise RuntimeError(
+            "Cannot fit post-hoc variance scale: validation data contained "
+            "no finite prediction/target pairs."
+        )
+
+    variance_scale = float((ratio_sum / n_valid).item())
+    if not np.isfinite(variance_scale) or variance_scale < 0.0:
+        raise RuntimeError(
+            "Post-hoc variance fitting produced an invalid scale: "
+            f"{variance_scale}."
+        )
+    # A perfect validation fit puts the Gaussian-NLL optimum at the boundary
+    # alpha=0. Keep the stored predictive variance strictly positive.
+    variance_scale = max(variance_scale, eps)
+    model.set_variance_scale(variance_scale)
+
+    return variance_scale
+
+
 def train_ensemble_model(
     model: torch.nn.Module,
     train_loader: torch.utils.data.DataLoader,
@@ -470,7 +536,7 @@ def train_ensemble_model(
     device: torch.device = torch.device("cpu"),
     eval_calibration_loader: torch.utils.data.DataLoader | None = None,
 ) -> None:
-    """Train the ensemble model. Evaluate after each epoch."""
+    """Jointly train, fit validation variance scale, and evaluate each epoch."""
 
     log_dict = {
         "train/epoch": 0,
@@ -528,6 +594,22 @@ def train_ensemble_model(
         
         wb_logger.log(log_dict)
 
+        variance_calibration_loader = (
+            eval_calibration_loader
+            if eval_calibration_loader is not None
+            else eval_loader
+        )
+        variance_scale = fit_posthoc_variance_scale(
+            model=model,
+            calibration_loader=variance_calibration_loader,
+            device=device,
+        )
+        logging.info(
+            "Epoch %d post-hoc variance scale: %.6g.",
+            epoch + 1,
+            variance_scale,
+        )
+
         eval_loss = evaluate_ensemble_model(
                         model=model,
                         eval_loader=eval_loader,
@@ -577,6 +659,7 @@ def evaluate_ensemble_model(
         f"{mode}/pearson": 0.0,
         f"{mode}/aleatoric": 0.0, # should theoretically stay consistent
         f"{mode}/epistemic": 0.0, # should theoretically go down with training
+        f"{mode}/variance_scale": float(model.variance_scale.item()),
         f"{mode}/ence": 0.0,                       # calibration error of total uncertainty (lower is better)
         f"{mode}/uncertainty_error_spearman": 0.0  # rank corr. of total uncertainty vs error (higher is better)
     }
@@ -608,7 +691,14 @@ def evaluate_ensemble_model(
                 # total predictive variance = aleatoric + epistemic
                 calibration.update(prediction, aleatoric_unc + epistemic_unc, targets)
 
-            outputs = torch.stack([prediction, aleatoric_unc], dim=2) # shape (batch_size, output_dim, 2)
+            # Post-hoc calibration is fitted to total predictive variance,
+            # therefore GNLL evaluation must use that same quantity. The
+            # other losses only consume outputs[..., 0] (the mean).
+            total_unc = aleatoric_unc + epistemic_unc
+            outputs = torch.stack(
+                [prediction, total_unc],
+                dim=2,
+            ) # shape (batch_size, output_dim, 2)
             composite_loss = torch.tensor(0.0, device=device)
             for key in loss_dict.keys():
                 loss = loss_dict[key](outputs, targets) * loss_lambda_dict[key]
