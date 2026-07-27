@@ -6,6 +6,9 @@ from tqdm import tqdm
 from pathlib import Path
 
 from src.training.models.mlp import MLPPredictor
+from src.training.models.mlp_sep import (
+    MLPPredictor as SeparateMLPPredictor,
+)
 from src.training.models.mlp_deep_ensemble import MLPEnsemble
 
 """
@@ -33,6 +36,77 @@ output_dir/totvar/*.csv      (total predictive variance: aleatoric + epistemic)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def resolve_checkpoint_setting(
+    checkpoint: dict,
+    key: str,
+    requested_value: str | None,
+    legacy_default: str,
+) -> str:
+    """Resolve a CLI setting against self-describing checkpoint metadata."""
+    checkpoint_value = checkpoint.get(key)
+    if checkpoint_value is None:
+        return requested_value if requested_value is not None else legacy_default
+
+    checkpoint_value = str(checkpoint_value)
+    if requested_value is not None and requested_value != checkpoint_value:
+        raise ValueError(
+            f"Requested {key}={requested_value!r}, but the checkpoint records "
+            f"{key}={checkpoint_value!r}."
+        )
+    return checkpoint_value
+
+
+def resolve_cell_types(
+    checkpoint: dict,
+    ct_mapping_path: Path | None,
+) -> np.ndarray:
+    """Load cell types from the checkpoint and optionally validate a mapping."""
+    checkpoint_cell_types = checkpoint.get("cell_types")
+    checkpoint_cell_types = (
+        [str(cell_type) for cell_type in checkpoint_cell_types]
+        if checkpoint_cell_types is not None
+        else None
+    )
+    mapping_cell_types = (
+        [
+            str(cell_type)
+            for cell_type in np.load(ct_mapping_path, allow_pickle=True)
+        ]
+        if ct_mapping_path is not None
+        else None
+    )
+
+    if checkpoint_cell_types is None and mapping_cell_types is None:
+        raise ValueError(
+            "The checkpoint has no cell-type metadata. Provide --ct-mapping "
+            "when using a legacy checkpoint."
+        )
+    if (
+        checkpoint_cell_types is not None
+        and mapping_cell_types is not None
+        and checkpoint_cell_types != mapping_cell_types
+    ):
+        raise ValueError(
+            "The ordered cell types in --ct-mapping do not match the "
+            f"checkpoint: mapping={mapping_cell_types}, "
+            f"checkpoint={checkpoint_cell_types}."
+        )
+
+    cell_types = (
+        checkpoint_cell_types
+        if checkpoint_cell_types is not None
+        else mapping_cell_types
+    )
+    output_dim = int(checkpoint["output_dim"])
+    if len(cell_types) != output_dim:
+        raise ValueError(
+            f"Resolved {len(cell_types)} cell types, but the checkpoint has "
+            f"output_dim={output_dim}."
+        )
+    return np.asarray(cell_types, dtype=object)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepare target variables for downstream analysis."
@@ -40,16 +114,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-i", "--input-dir",     type=Path, required=True)
     parser.add_argument("-o", "--output-dir",    type=Path, required=True)
     parser.add_argument("-t", "--teacher-model", type=Path, required=True)
-    parser.add_argument("-c", "--ct-mapping",    type=Path, required=True)
+    parser.add_argument(
+        "-c", "--ct-mapping",
+        type=Path,
+        default=None,
+        help=(
+            "Optional cell-type mapping. New checkpoints contain this "
+            "metadata; when supplied, the mapping is validated against it. "
+            "Required for legacy checkpoints without cell_types."
+        ),
+    )
     parser.add_argument("-b", "--batch-size",    type=int, default=1)
     parser.add_argument("-m", "--model-name",
-                        type=str, default="mlp",
-                        choices=["mlp", "deep-ensemble"],
-                        help="Type of teacher model to load.")
+                        type=str, default=None,
+                        choices=["mlp", "mlp-sep", "deep-ensemble"],
+                        help=(
+                            "Optional teacher-model type. Inferred from new "
+                            "checkpoints and validated when supplied. Legacy "
+                            "checkpoints default to 'mlp'."
+                        ))
     parser.add_argument("-nt", "--norm-targets", 
-                        type=str, default="none", 
+                        type=str, default=None,
                         choices=["none", "log", "percentiles"], 
-                        help="Normalization method used for target labels. Will undo normalization.")
+                        help=(
+                            "Optional target normalization. Inferred from new "
+                            "checkpoints and validated when supplied. Legacy "
+                            "checkpoints default to 'none'."
+                        ))
     return parser.parse_args()
 
 
@@ -65,15 +156,36 @@ def infer_n_models(state_dict) -> int:
     return max(indices) + 1
 
 
-def load_model(teacher_model_path: Path, model_name: str):
-    checkpoint = torch.load(teacher_model_path, map_location=device)
+def load_model(
+    teacher_model_path: Path,
+    model_name: str | None = None,
+    *,
+    checkpoint: dict | None = None,
+):
+    if checkpoint is None:
+        checkpoint = torch.load(teacher_model_path, map_location=device)
+    model_name = resolve_checkpoint_setting(
+        checkpoint,
+        key="model_name",
+        requested_value=model_name,
+        legacy_default="mlp",
+    )
 
     if model_name == "mlp":
         model = MLPPredictor(
             input_dim=checkpoint["input_dim"],
             n_layers=checkpoint["n_layers"],
             output_dim=checkpoint["output_dim"],
-            layer_norm=checkpoint["layer_norm"]
+            layer_norm=checkpoint["layer_norm"],
+            dropout=checkpoint.get("dropout", 0.0),
+        )
+    elif model_name == "mlp-sep":
+        model = SeparateMLPPredictor(
+            input_dim=checkpoint["input_dim"],
+            n_layers=checkpoint["n_layers"],
+            output_dim=checkpoint["output_dim"],
+            layer_norm=checkpoint["layer_norm"],
+            dropout=checkpoint.get("dropout", 0.0),
         )
     elif model_name == "deep-ensemble":
         model = MLPEnsemble(
@@ -81,7 +193,8 @@ def load_model(teacher_model_path: Path, model_name: str):
             input_dim=checkpoint["input_dim"],
             n_layers=checkpoint["n_layers"],
             output_dim=checkpoint["output_dim"],
-            layer_norm=checkpoint["layer_norm"]
+            layer_norm=checkpoint["layer_norm"],
+            dropout=checkpoint.get("dropout", 0.0),
         )
     else:
         raise ValueError(f"Model {model_name} is not supported.")
@@ -147,11 +260,33 @@ def main() -> None:
     args = parse_args()
 
     # load some data first...
-    idx2ct  = np.load(args.ct_mapping, allow_pickle=True)
-    model   = load_model(args.teacher_model, args.model_name)
+    checkpoint = torch.load(args.teacher_model, map_location=device)
+    model_name = resolve_checkpoint_setting(
+        checkpoint,
+        key="model_name",
+        requested_value=args.model_name,
+        legacy_default="mlp",
+    )
+    norm_targets = resolve_checkpoint_setting(
+        checkpoint,
+        key="norm_targets",
+        requested_value=args.norm_targets,
+        legacy_default="none",
+    )
+    if norm_targets not in {"none", "log", "percentiles"}:
+        raise ValueError(
+            f"Checkpoint records unsupported norm_targets={norm_targets!r}."
+        )
+
+    idx2ct = resolve_cell_types(checkpoint, args.ct_mapping)
+    model = load_model(
+        args.teacher_model,
+        model_name,
+        checkpoint=checkpoint,
+    )
     persons = os.listdir(args.input_dir)
 
-    if args.norm_targets == "percentiles":
+    if norm_targets == "percentiles":
         raise NotImplementedError("Undoing percentile normalization is not supported, since it is not a bijective transformation. Please set --norm-targets to 'none' or 'log' when running this script.")
 
     # first we build a master index of genes (key triple) across all persons
@@ -163,7 +298,7 @@ def main() -> None:
     master_chroms = np.array([k[1] for k in all_keys], dtype=object)
     master_tss    = np.array([k[2] for k in all_keys], dtype=np.int64)
 
-    is_ensemble = args.model_name == "deep-ensemble"
+    is_ensemble = model_name == "deep-ensemble"
 
     # preallocate gene x person matrices for each cell-type. For the ensemble we
     # keep separate matrices for predictions and the two uncertainty estimates.
@@ -221,7 +356,7 @@ def main() -> None:
                         aleatoric[i, ct_idx] + epistemic[i, ct_idx]
                     )
 
-    if args.norm_targets == "log":
+    if norm_targets == "log":
         # undo log normalization on the predicted means. The uncertainties are
         # variances in the (log-)transformed space; expm1 is not a valid inverse
         # for a variance, so we leave them in the model's output space.
