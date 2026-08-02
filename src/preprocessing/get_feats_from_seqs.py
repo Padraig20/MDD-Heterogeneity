@@ -148,7 +148,18 @@ def parse_args() -> argparse.Namespace:
         "--sample-seed",
         type=int,
         default=42,
-        help="Random seed for integer-based sampling from the VCF header.",
+        help="Random seed for integer-based sampling from the available individuals.",
+    )
+    parser.add_argument(
+        "--individual-split",
+        type=str,
+        default=None,
+        help=(
+            "Optional K/N contiguous split applied after --num-individuals "
+            "selection (1-based). For example, '--num-individuals 1000 "
+            "--sample-seed 42 --individual-split 1/20' processes the first 50 "
+            "individuals from the seeded random sample of 1000."
+        ),
     )
     parser.add_argument(
         "--num-workers",
@@ -297,10 +308,15 @@ def split_contiguous(items: List[str], split_idx: int, total_splits: int) -> Lis
     return items[start:stop]
 
 
-def sample_individual_ids(chrom_to_vcf: Dict[str, "pysam.VariantFile"], selection: str, seed: int) -> List[str]:
+def sample_individual_ids(
+    chrom_to_vcf: Dict[str, "pysam.VariantFile"],
+    selection: str,
+    seed: int,
+    individual_split: Optional[str] = None,
+) -> List[str]:
     first_vcf = next(iter(chrom_to_vcf.values()))
     samples   = list(first_vcf.header.samples)
-    return select_individual_ids(samples, selection, seed)
+    return select_individual_ids(samples, selection, seed, individual_split)
 
 
 def get_vcf_samples(vcf_path: Path) -> List[str]:
@@ -364,11 +380,47 @@ def discover_individual_vcfs(vcf_dir: Path) -> Dict[str, Path]:
     return mapping
 
 
-def select_individual_ids(samples: List[str], selection: str, seed: int) -> List[str]:
+def apply_individual_split(samples: List[str], selection: str) -> List[str]:
+    """Apply a 1-based ``K/N`` contiguous split to already-selected samples."""
+    split_parts = selection.strip().lower().split("/")
+    if len(split_parts) != 2:
+        raise ValueError("--individual-split syntax must be K/N, e.g. 2/4.")
+    try:
+        split_idx = int(split_parts[0])
+        total_splits = int(split_parts[1])
+    except ValueError as exc:
+        raise ValueError(
+            "--individual-split syntax must use integer values, e.g. 2/4."
+        ) from exc
+    if total_splits <= 0:
+        raise ValueError("--individual-split total N must be greater than 0.")
+    if split_idx < 1 or split_idx > total_splits:
+        raise ValueError("--individual-split K must satisfy 1 <= K <= N.")
+
+    chosen = split_contiguous(samples, split_idx, total_splits)
+    if not chosen:
+        raise ValueError("--individual-split selected zero individuals.")
+    logging.info(
+        "Selected post-sampling split %d/%d with %d of %d individuals.",
+        split_idx,
+        total_splits,
+        len(chosen),
+        len(samples),
+    )
+    return chosen
+
+
+def select_individual_ids(
+    samples: List[str],
+    selection: str,
+    seed: int,
+    individual_split: Optional[str] = None,
+) -> List[str]:
     """Select individuals from a list of VCF sample IDs.
 
     Supports 'all', an integer count (randomly sampled), or a 'K/N' contiguous
-    split of the header order (1-based).
+    split of the header order (1-based). If ``individual_split`` is provided,
+    that contiguous K/N split is applied after this initial selection.
     """
     selection = selection.strip().lower()
 
@@ -411,10 +463,16 @@ def select_individual_ids(samples: List[str], selection: str, seed: int) -> List
 
         rng    = random.Random(seed)
         chosen = rng.sample(samples, num_individuals)
-        logging.info("Sampled %d individuals from VCF headers.", len(chosen))
+        logging.info(
+            "Sampled %d individuals from VCF headers using seed %d.",
+            len(chosen),
+            seed,
+        )
 
     if not chosen:
         raise ValueError("--num-individuals selected zero individuals.")
+    if individual_split is not None:
+        chosen = apply_individual_split(chosen, individual_split)
     logging.debug("Selected individuals: %s", chosen[:5])
     return chosen
 
@@ -572,6 +630,7 @@ def extract_variantformer_features(
     sample_seed: int = 42,
     num_workers: Optional[int] = None,
     prefetch_factor: Optional[int] = None,
+    individual_split: Optional[str] = None,
 ) -> None:
     if tissue is None:
         raise ValueError("--tissue is required when using the 'variantformer' backbone.")
@@ -641,7 +700,12 @@ def extract_variantformer_features(
         individual_to_vcf = discover_individual_vcfs(vcf_dir)
         all_individuals = list(individual_to_vcf.keys())
         sample_ids: List[Optional[str]] = list(
-            select_individual_ids(all_individuals, num_individuals, sample_seed)
+            select_individual_ids(
+                all_individuals,
+                num_individuals,
+                sample_seed,
+                individual_split,
+            )
         )
         logging.info(
             "Personalized mode: %d of %d per-individual VCFs from %s",
@@ -775,7 +839,23 @@ def extract_variantformer_features(
     logging.info("VariantFormer embeddings successfully extracted to %s", feats_mm_path)
 
 
-def get_features(data_path: Path, model_name: str, batch_size: int, window_size: int, output_path: Path, vcf_dir: Optional[Path] = None, num_individuals: str = "0", sample_seed: int = 42, checkpoint_every: int = 1000, tissue: Optional[str] = None, vf_model_class: str = "v4_pcg", maf_threshold: Optional[float] = None, num_workers: Optional[int] = None, prefetch_factor: Optional[int] = None) -> None:
+def get_features(
+    data_path: Path,
+    model_name: str,
+    batch_size: int,
+    window_size: int,
+    output_path: Path,
+    vcf_dir: Optional[Path] = None,
+    num_individuals: str = "0",
+    sample_seed: int = 42,
+    checkpoint_every: int = 1000,
+    tissue: Optional[str] = None,
+    vf_model_class: str = "v4_pcg",
+    maf_threshold: Optional[float] = None,
+    num_workers: Optional[int] = None,
+    prefetch_factor: Optional[int] = None,
+    individual_split: Optional[str] = None,
+) -> None:
     """Extract features from sequences using specified model."""
     logging.info("Extracting features using model: %s", model_name)
 
@@ -793,6 +873,7 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
             vcf_dir=vcf_dir,
             num_individuals=num_individuals,
             sample_seed=sample_seed,
+            individual_split=individual_split,
             num_workers=num_workers,
             prefetch_factor=prefetch_factor,
         )
@@ -806,7 +887,12 @@ def get_features(data_path: Path, model_name: str, batch_size: int, window_size:
         if personalized:
             logging.info("Personalized mode enabled using VCF directory: %s", vcf_dir)
             chrom_to_vcf = open_variant_files(vcf_dir)
-            sampled_ids  = sample_individual_ids(chrom_to_vcf, num_individuals, sample_seed)
+            sampled_ids = sample_individual_ids(
+                chrom_to_vcf,
+                num_individuals,
+                sample_seed,
+                individual_split,
+            )
         else:
             logging.info("Running in reference-sequence mode.")
 
@@ -951,6 +1037,7 @@ def main() -> None:
         vcf_dir=args.vcf_dir,
         num_individuals=args.num_individuals,
         sample_seed=args.sample_seed,
+        individual_split=args.individual_split,
         checkpoint_every=args.checkpoint_every,
         tissue=args.tissue,
         vf_model_class="v4_pcg" if args.model_name == "variantformer-pcg" else "v4_ag",
