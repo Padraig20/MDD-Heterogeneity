@@ -37,6 +37,54 @@ output_dir/totvar/*.csv      (total predictive variance: aleatoric + epistemic)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def numpy_checkpoint_safe_globals() -> list:
+    """Return the NumPy scalar types used by legacy training metadata."""
+    numpy_core = getattr(np, "_core", None)
+    if numpy_core is None:
+        numpy_core = np.core
+
+    safe_globals = [
+        numpy_core.multiarray.scalar,
+        np.dtype,
+    ]
+    scalar_types = (
+        np.bool_,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.float16,
+        np.float32,
+        np.float64,
+        np.complex64,
+        np.complex128,
+        np.str_,
+        np.bytes_,
+    )
+    safe_globals.extend(type(np.dtype(scalar_type)) for scalar_type in scalar_types)
+    return list(dict.fromkeys(safe_globals))
+
+
+def load_teacher_checkpoint(teacher_model_path: Path) -> dict:
+    """Load a project checkpoint without enabling unrestricted pickle."""
+    with torch.serialization.safe_globals(numpy_checkpoint_safe_globals()):
+        checkpoint = torch.load(
+            teacher_model_path,
+            map_location=device,
+            weights_only=True,
+        )
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            "Expected the teacher checkpoint to contain a dictionary, got "
+            f"{type(checkpoint).__name__}."
+        )
+    return checkpoint
+
+
 def resolve_checkpoint_setting(
     checkpoint: dict,
     key: str,
@@ -163,7 +211,7 @@ def load_model(
     checkpoint: dict | None = None,
 ):
     if checkpoint is None:
-        checkpoint = torch.load(teacher_model_path, map_location=device)
+        checkpoint = load_teacher_checkpoint(teacher_model_path)
     model_name = resolve_checkpoint_setting(
         checkpoint,
         key="model_name",
@@ -260,7 +308,7 @@ def main() -> None:
     args = parse_args()
 
     # load some data first...
-    checkpoint = torch.load(args.teacher_model, map_location=device)
+    checkpoint = load_teacher_checkpoint(args.teacher_model)
     model_name = resolve_checkpoint_setting(
         checkpoint,
         key="model_name",
