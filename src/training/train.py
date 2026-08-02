@@ -614,6 +614,7 @@ def main() -> None:
             "n_layers": args.n_layers,
             "layer_norm": args.norm_layer,
             "model_name": args.model_name,
+            "norm_inputs": args.norm_inputs,
             "norm_targets": args.norm_targets,
             "dropout": args.dropout,
             "weight_decay": args.weight_decay,
@@ -635,11 +636,24 @@ def main() -> None:
             ),
             "cell_types": list(cell_type_names),
             "chromosome_split": {
-                "train": list(dict.fromkeys(train_dataset.X_chroms.astype(str))),
+                "train": [
+                    str(chromosome)
+                    for chromosome in dict.fromkeys(
+                        train_dataset.X_chroms.astype(str)
+                    )
+                ],
                 "validation": list(
-                    dict.fromkeys(eval_dataset.X_chroms.astype(str))
+                    str(chromosome)
+                    for chromosome in dict.fromkeys(
+                        eval_dataset.X_chroms.astype(str)
+                    )
                 ),
-                "test": list(dict.fromkeys(test_dataset.X_chroms.astype(str))),
+                "test": [
+                    str(chromosome)
+                    for chromosome in dict.fromkeys(
+                        test_dataset.X_chroms.astype(str)
+                    )
+                ],
             },
         }, args.output)
         logging.info(f"Model saved to {args.output}.")

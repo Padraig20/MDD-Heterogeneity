@@ -2,13 +2,18 @@ from collections.abc import Sequence
 import logging
 
 from tqdm import tqdm
-from src.training.dataset import MddDataset
+from src.training.dataset import MddDataset, ReferencePopulationMddDataset
 from copy import deepcopy
 import numpy as np
 import torch
 import random
 
-from src.training.metrics import MeanCellPearson, MeanGenePearson, UncertaintyCalibration
+from src.training.metrics import (
+    MeanCellPearson,
+    MeanGenePearson,
+    PopulationVarianceEvaluation,
+    UncertaintyCalibration,
+)
 from src.training.wandb_logger import WandBLogger
 import wandb
 import matplotlib.pyplot as plt
@@ -647,9 +652,54 @@ def evaluate_ensemble_model(
     instead for uncertainty calibration (ENCE, uncertainty-error Spearman) --
     this lets callers evaluate accuracy against a population-mean target
     while still calibrating predicted variance against real per-individual
-    targets. If `calibration_loader` is None, calibration falls back to
-    `eval_loader` (previous behaviour).
+    targets. For a population dataset, that same per-individual dataset also
+    supplies the empirical across-donor variance target used to evaluate the
+    aleatoric head on unseen genes. If `calibration_loader` is None,
+    calibration falls back to `eval_loader` (previous behaviour).
     """
+
+    population_variance = None
+    if calibration_loader is not None:
+        population_dataset = calibration_loader.dataset
+        mean_dataset = eval_loader.dataset
+        if isinstance(
+            population_dataset,
+            ReferencePopulationMddDataset,
+        ) and isinstance(mean_dataset, ReferencePopulationMddDataset):
+            same_genes = np.array_equal(
+                population_dataset.X_ensids.astype(str),
+                mean_dataset.X_ensids.astype(str),
+            )
+            same_cell_types = (
+                list(population_dataset.cell_types)
+                == list(mean_dataset.cell_types)
+            )
+            sequential_genes = isinstance(
+                eval_loader.sampler,
+                torch.utils.data.SequentialSampler,
+            )
+            if (
+                len(mean_dataset.individuals) == 1
+                and same_genes
+                and same_cell_types
+                and sequential_genes
+            ):
+                target_variance, donor_counts = (
+                    population_dataset.population_variance_targets()
+                )
+                population_variance = PopulationVarianceEvaluation(
+                    target_variance=target_variance,
+                    cell_types=list(population_dataset.cell_types),
+                    donor_counts=donor_counts,
+                    variance_scale=float(model.variance_scale.item()),
+                )
+            else:
+                logging.warning(
+                    "Skipping population-variance evaluation because the "
+                    "population and population-mean datasets are not aligned "
+                    "to exactly the same unseen genes and cell types, or the "
+                    "evaluation loader is not sequential."
+                )
 
     log_dict = {
         f"{mode}/epoch": epoch,
@@ -681,6 +731,9 @@ def evaluate_ensemble_model(
             inputs, targets = inputs.to(device), targets.to(device)
 
             prediction, aleatoric_unc, epistemic_unc = model(inputs)
+
+            if population_variance is not None:
+                population_variance.update(aleatoric_unc)
 
             aleatoric_uncertainties.append(aleatoric_unc.mean(dim=0)) # avg aleatoric uncertainty across cells
             epistemic_uncertainties.append(epistemic_unc.mean(dim=0)) # avg epistemic uncertainty across cells
@@ -732,11 +785,24 @@ def evaluate_ensemble_model(
     log_dict[f"{mode}/ence"] = calibration.compute_ence()
     log_dict[f"{mode}/uncertainty_error_spearman"] = calibration.compute_spearman()
 
+    if population_variance is not None:
+        population_variance_scalars, _ = population_variance.compute()
+        log_dict[f"{mode}/population_aleatoric_pearson"] = (
+            population_variance_scalars["pearson_macro"]
+        )
+
     for key in loss_dict.keys():
         log_dict[f"{mode}/{key}_loss"] /= len(eval_loader.dataset)
     
     logging.info(f"{mode.capitalize()} Loss: {log_dict[f'{mode}/loss']:.4f}, PC Cells: {metric_cells.compute().nanmean():.4f}, PC Genes: {metric_genes.compute().nanmean():.4f}, PC: {log_dict[f'{mode}/pearson']:.4f}")
     logging.info(f"{mode.capitalize()} ENCE: {log_dict[f'{mode}/ence']:.4f}, Uncertainty-Error Spearman: {log_dict[f'{mode}/uncertainty_error_spearman']:.4f}")
+    if population_variance is not None:
+        logging.info(
+            "%s aleatoric vs empirical across-donor variance on unseen genes: "
+            "across-cell-type Pearson=%.4f.",
+            mode.capitalize(),
+            log_dict[f"{mode}/population_aleatoric_pearson"],
+        )
     
     wb_logger.log(log_dict)
 

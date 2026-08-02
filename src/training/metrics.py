@@ -264,3 +264,257 @@ class UncertaintyCalibration:
         ax.set_xticklabels(range(self.n_box_bins))
         fig.tight_layout()
         return fig
+
+
+def _numpy_pearson(first: np.ndarray, second: np.ndarray) -> float:
+    """Return Pearson's r for finite, nonconstant one-dimensional arrays."""
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    finite = np.isfinite(first) & np.isfinite(second)
+    if finite.sum() < 2:
+        return float("nan")
+    first = first[finite]
+    second = second[finite]
+    first -= first.mean()
+    second -= second.mean()
+    denominator = np.linalg.norm(first) * np.linalg.norm(second)
+    if not np.isfinite(denominator) or denominator <= 0.0:
+        return float("nan")
+    return float(np.clip((first @ second) / denominator, -1.0, 1.0))
+
+
+class PopulationVarianceEvaluation:
+    """Evaluate aleatoric variance against empirical donor variance.
+
+    This diagnostic is intended for unseen-gene evaluation of a
+    ``ReferencePopulationMddDataset``.  The empirical target must have shape
+    ``[n_genes, n_cell_types]`` and be expressed on the same target scale as
+    the model.  Predictions can be supplied one evaluation batch at a time.
+
+    The model's stored post-hoc temperature calibrates *total* predictive
+    variance.  We consequently report magnitude metrics for both the deployed
+    (scaled) aleatoric variance and its uncalibrated value.  Pearson correlation
+    is invariant to that positive scalar, so it is reported only once.
+    """
+
+    def __init__(
+        self,
+        target_variance: np.ndarray,
+        cell_types: list[str],
+        donor_counts: np.ndarray,
+        variance_scale: float,
+    ) -> None:
+        target = np.asarray(target_variance, dtype=np.float64)
+        if target.ndim != 2:
+            raise ValueError(
+                "target_variance must have shape [n_genes, n_cell_types]."
+            )
+        if target.shape[1] != len(cell_types):
+            raise ValueError(
+                f"Target has {target.shape[1]} cell types but received "
+                f"{len(cell_types)} labels."
+            )
+        counts = np.asarray(donor_counts, dtype=np.int64)
+        if counts.shape != (len(cell_types),):
+            raise ValueError(
+                "donor_counts must contain one value per cell type."
+            )
+        if not np.isfinite(variance_scale) or variance_scale <= 0.0:
+            raise ValueError("variance_scale must be finite and positive.")
+
+        self.target_variance = target
+        self.cell_types = [str(cell_type) for cell_type in cell_types]
+        self.donor_counts = counts
+        self.variance_scale = float(variance_scale)
+        self._prediction_chunks: list[np.ndarray] = []
+
+    def update(self, aleatoric_variance: Tensor) -> None:
+        prediction = (
+            aleatoric_variance.detach().to(dtype=torch.float64).cpu().numpy()
+        )
+        if prediction.ndim != 2 or prediction.shape[1] != len(self.cell_types):
+            raise ValueError(
+                "aleatoric_variance must have shape [batch, n_cell_types]."
+            )
+        self._prediction_chunks.append(prediction)
+
+    def _predictions(self) -> np.ndarray:
+        if not self._prediction_chunks:
+            raise RuntimeError("No aleatoric predictions were accumulated.")
+        prediction = np.concatenate(self._prediction_chunks, axis=0)
+        if prediction.shape != self.target_variance.shape:
+            raise RuntimeError(
+                "Aleatoric prediction/target shape mismatch: "
+                f"{prediction.shape} versus {self.target_variance.shape}. "
+                "Population-variance evaluation requires a sequential loader "
+                "with exactly one population-mean row per unseen gene."
+            )
+        return prediction
+
+    @staticmethod
+    def _magnitude_metrics(
+        prediction: np.ndarray,
+        target: np.ndarray,
+    ) -> dict[str, float]:
+        finite = (
+            np.isfinite(prediction)
+            & np.isfinite(target)
+            & (prediction >= 0.0)
+            & (target >= 0.0)
+        )
+        prediction = prediction[finite]
+        target = target[finite]
+        if prediction.size == 0:
+            return {
+                "variance_ratio": float("nan"),
+                "variance_r2": float("nan"),
+                "std_rmse": float("nan"),
+                "std_nrmse": float("nan"),
+            }
+
+        target_sum = float(target.sum())
+        variance_ratio = (
+            float(prediction.sum() / target_sum)
+            if target_sum > 0.0
+            else float("nan")
+        )
+        centered_target = target - target.mean()
+        total_sum_squares = float(centered_target @ centered_target)
+        residual = prediction - target
+        variance_r2 = (
+            1.0 - float(residual @ residual) / total_sum_squares
+            if total_sum_squares > 0.0
+            else float("nan")
+        )
+        prediction_std = np.sqrt(prediction)
+        target_std = np.sqrt(target)
+        std_rmse = float(
+            np.sqrt(np.mean(np.square(prediction_std - target_std)))
+        )
+        mean_target_std = float(target_std.mean())
+        std_nrmse = (
+            std_rmse / mean_target_std
+            if mean_target_std > 0.0
+            else float("nan")
+        )
+        return {
+            "variance_ratio": variance_ratio,
+            "variance_r2": variance_r2,
+            "std_rmse": std_rmse,
+            "std_nrmse": std_nrmse,
+        }
+
+    def compute(self) -> tuple[dict[str, float], dict[str, float]]:
+        prediction = self._predictions()
+        target = self.target_variance
+        per_cell_type = {
+            cell_type: _numpy_pearson(
+                prediction[:, index],
+                target[:, index],
+            )
+            for index, cell_type in enumerate(self.cell_types)
+        }
+        finite_correlations = np.asarray(
+            [value for value in per_cell_type.values() if np.isfinite(value)],
+            dtype=np.float64,
+        )
+        calibrated = self._magnitude_metrics(prediction, target)
+        uncalibrated = self._magnitude_metrics(
+            prediction / self.variance_scale,
+            target,
+        )
+        usable_donor_counts = self.donor_counts[self.donor_counts >= 2]
+        scalars = {
+            "pearson_macro": (
+                float(finite_correlations.mean())
+                if finite_correlations.size
+                else float("nan")
+            ),
+            "pearson_pooled": _numpy_pearson(prediction.ravel(), target.ravel()),
+            "n_genes": float(target.shape[0]),
+            "n_gene_cell_type_pairs": float(
+                np.count_nonzero(np.isfinite(prediction) & np.isfinite(target))
+            ),
+            "donors_min": (
+                float(usable_donor_counts.min())
+                if usable_donor_counts.size
+                else float("nan")
+            ),
+            "donors_max": (
+                float(usable_donor_counts.max())
+                if usable_donor_counts.size
+                else float("nan")
+            ),
+            **calibrated,
+            **{
+                f"uncalibrated_{name}": value
+                for name, value in uncalibrated.items()
+            },
+        }
+        return scalars, per_cell_type
+
+    def make_figure(self, title: str = "Population aleatoric variance"):
+        prediction = self._predictions()
+        target = self.target_variance
+        finite = (
+            np.isfinite(prediction)
+            & np.isfinite(target)
+            & (prediction >= 0.0)
+            & (target >= 0.0)
+        )
+        if finite.sum() < 2:
+            return None
+
+        predicted_std = np.sqrt(prediction[finite])
+        target_std = np.sqrt(target[finite])
+        positive = np.concatenate(
+            [predicted_std[predicted_std > 0.0], target_std[target_std > 0.0]]
+        )
+        floor = (
+            max(float(positive.min()) * 0.1, np.finfo(np.float64).tiny)
+            if positive.size
+            else np.finfo(np.float64).tiny
+        )
+        x = np.log10(np.maximum(target_std, floor))
+        y = np.log10(np.maximum(predicted_std, floor))
+        max_points = 100_000
+        if x.size > max_points:
+            indices = np.linspace(0, x.size - 1, max_points, dtype=np.int64)
+            x = x[indices]
+            y = y[indices]
+
+        _, per_cell_type = self.compute()
+        figure_height = max(5.0, 0.3 * len(self.cell_types) + 1.8)
+        figure, axes = plt.subplots(
+            1,
+            2,
+            figsize=(12.0, figure_height),
+            gridspec_kw={"width_ratios": (1.1, 1.0)},
+        )
+        axes[0].hexbin(x, y, gridsize=55, mincnt=1, cmap="viridis")
+        lower = float(min(x.min(), y.min()))
+        upper = float(max(x.max(), y.max()))
+        axes[0].plot([lower, upper], [lower, upper], "--", color="0.4", linewidth=1)
+        axes[0].set_xlabel("log10 empirical across-donor SD")
+        axes[0].set_ylabel("log10 predicted aleatoric SD")
+        axes[0].set_title("Magnitude calibration")
+
+        correlations = np.asarray(
+            [per_cell_type[cell_type] for cell_type in self.cell_types],
+            dtype=np.float64,
+        )
+        y_positions = np.arange(len(self.cell_types))
+        colors = np.where(correlations >= 0.0, "#4C78A8", "#F58518")
+        axes[1].barh(y_positions, correlations, color=colors)
+        axes[1].axvline(0.0, color="0.4", linewidth=0.8)
+        axes[1].set_yticks(y_positions)
+        axes[1].set_yticklabels(self.cell_types, fontsize=8)
+        axes[1].invert_yaxis()
+        axes[1].set_xlim(-1.0, 1.0)
+        axes[1].set_xlabel("Pearson r across unseen genes")
+        axes[1].set_title("Per-cell-type ranking")
+        axes[1].grid(axis="x", alpha=0.2)
+
+        figure.suptitle(title)
+        figure.tight_layout()
+        return figure

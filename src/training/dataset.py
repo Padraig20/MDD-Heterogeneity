@@ -429,6 +429,59 @@ class ReferencePopulationMddDataset(Dataset):
         }
         return ReferencePopulationMddDataset(_state=state)
 
+    def population_variance_targets(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return empirical across-individual variance on the training scale.
+
+        The returned matrix has shape ``(n_genes, n_cell_types)`` so it aligns
+        directly with one model output row per gene.  Variance is computed with
+        denominator ``n`` (``ddof=0``): this is the population/MLE variance that
+        minimizes the Gaussian NLL used to train the aleatoric head.
+
+        Missing individual/cell-type rows are excluded rather than using the
+        mean-imputed values stored in ``y_tensor``.  Including those values would
+        leave the population mean unchanged but would bias the variance toward
+        zero.  Values are transformed exactly as they are in ``__getitem__`` so
+        predictions and targets remain on the same scale.
+        """
+        cached = getattr(self, "_population_variance_targets_cache", None)
+        if cached is not None:
+            return cached
+
+        n_genes = len(self.X_ensids)
+        n_cell_types = len(self.cell_types)
+        variances = np.full(
+            (n_genes, n_cell_types),
+            np.nan,
+            dtype=np.float64,
+        )
+        counts = np.zeros(n_cell_types, dtype=np.int64)
+
+        for cell_type_index in range(n_cell_types):
+            observed = np.asarray(
+                self.observed_mask[:, cell_type_index],
+                dtype=bool,
+            )
+            counts[cell_type_index] = int(observed.sum())
+            if counts[cell_type_index] < 2:
+                continue
+
+            # Work one cell type at a time to avoid materializing another full
+            # individual x cell-type x gene tensor for large population files.
+            values = np.asarray(
+                self.y_tensor[observed, cell_type_index, :],
+                dtype=np.float64,
+            )
+            if self.normalize == "log":
+                values = np.log1p(values)
+            variances[:, cell_type_index] = np.var(
+                values,
+                axis=0,
+                ddof=0,
+            )
+
+        self._population_variance_targets_cache = (variances, counts)
+        return self._population_variance_targets_cache
+
     def apply_feature_log_transform(self, threshold: float = 1.0) -> None:
         """Decide which feature columns to log-transform based on per-column skew,
         estimated over the in-scope (reference) gene rows."""
