@@ -14,6 +14,7 @@ from src.training.utils import get_train_test_dataset, EarlyStopping
 
 from src.training.models.mlp import MLPPredictor
 from src.training.models.mlp_sep import MLPPredictor as SeparateMLPPredictor
+from src.training.models.mlp_sep import CtPredPredictor
 from src.training.models.mlp_deep_ensemble import MLPEnsemble
 
 from src.training.utils import train_single_model, evaluate_single_model
@@ -74,8 +75,13 @@ def parse_args() -> argparse.Namespace:
         "-m", "--model-name",
         type=str,
         default="mlp",
-        choices=["mlp", "mlp-sep", "deep-ensemble"],
-        help="Name of the model to train."
+        choices=["mlp", "mlp-sep", "ctpred", "deep-ensemble"],
+        help=(
+            "Name of the model to train. 'ctpred' reimplements the "
+            "per-cell-type ctPred architecture from scPrediXcan "
+            "(https://github.com/hakyimlab/scPrediXcan): a fixed-hidden-"
+            "dimension MLP trained independently per cell type."
+        )
     )
     parser.add_argument(
         "-b", "--batch-size",
@@ -112,6 +118,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of hidden layers in the neural network."
+    )
+    parser.add_argument(
+        "-hd", "--hidden-dim",
+        type=int,
+        default=64,
+        help=(
+            "Fixed hidden layer dimension, only used by --model-name ctpred "
+            "(the scPrediXcan default is 64)."
+        )
     )
     parser.add_argument(
         "-es", "--early-stop",
@@ -232,6 +247,10 @@ def main() -> None:
         raise ValueError("--epochs must be positive.")
     if args.n_layers < 0:
         raise ValueError("--n-layers must be non-negative.")
+    if args.model_name == "ctpred" and args.n_layers < 1:
+        raise ValueError("--n-layers must be positive for --model-name ctpred.")
+    if args.hidden_dim <= 0:
+        raise ValueError("--hidden-dim must be positive.")
     if not 0.0 <= args.dropout < 1.0:
         raise ValueError("--dropout must be in [0, 1).")
     if args.weight_decay < 0.0:
@@ -373,6 +392,13 @@ def main() -> None:
                                      n_layers=args.n_layers,
                                      layer_norm=args.norm_layer,
                                      dropout=args.dropout).to(device)
+    elif args.model_name == 'ctpred':
+        model = CtPredPredictor(input_dim=input_dim,
+                                output_dim=output_dim,
+                                n_layers=args.n_layers,
+                                hidden_dim=args.hidden_dim,
+                                layer_norm=args.norm_layer,
+                                dropout=args.dropout).to(device)
     elif args.model_name == 'deep-ensemble':
         model = MLPEnsemble(n_models=5,
                             input_dim=input_dim,
@@ -448,7 +474,7 @@ def main() -> None:
             milestones=[warmup_steps],
         )
 
-    separate_model = args.model_name == "mlp-sep"
+    separate_model = args.model_name in ("mlp-sep", "ctpred")
     if separate_model:
         optimizers = [
             torch.optim.Adam(
@@ -612,6 +638,7 @@ def main() -> None:
             "input_dim": input_dim,
             "output_dim": output_dim,
             "n_layers": args.n_layers,
+            "hidden_dim": args.hidden_dim if args.model_name == "ctpred" else None,
             "layer_norm": args.norm_layer,
             "model_name": args.model_name,
             "norm_inputs": args.norm_inputs,

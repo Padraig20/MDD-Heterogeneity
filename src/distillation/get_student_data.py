@@ -8,6 +8,7 @@ from pathlib import Path
 from src.training.models.mlp import MLPPredictor
 from src.training.models.mlp_sep import (
     MLPPredictor as SeparateMLPPredictor,
+    CtPredPredictor,
 )
 from src.training.models.mlp_deep_ensemble import MLPEnsemble
 
@@ -175,7 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-b", "--batch-size",    type=int, default=1)
     parser.add_argument("-m", "--model-name",
                         type=str, default=None,
-                        choices=["mlp", "mlp-sep", "deep-ensemble"],
+                        choices=["mlp", "mlp-sep", "ctpred", "deep-ensemble"],
                         help=(
                             "Optional teacher-model type. Inferred from new "
                             "checkpoints and validated when supplied. Legacy "
@@ -232,6 +233,15 @@ def load_model(
             input_dim=checkpoint["input_dim"],
             n_layers=checkpoint["n_layers"],
             output_dim=checkpoint["output_dim"],
+            layer_norm=checkpoint["layer_norm"],
+            dropout=checkpoint.get("dropout", 0.0),
+        )
+    elif model_name == "ctpred":
+        model = CtPredPredictor(
+            input_dim=checkpoint["input_dim"],
+            n_layers=checkpoint["n_layers"],
+            output_dim=checkpoint["output_dim"],
+            hidden_dim=checkpoint.get("hidden_dim") or 64,
             layer_norm=checkpoint["layer_norm"],
             dropout=checkpoint.get("dropout", 0.0),
         )
