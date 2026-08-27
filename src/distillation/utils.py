@@ -64,6 +64,99 @@ def pearson_pvalue(r, n) -> np.ndarray:
     return p
 
 
+def marginal_abs_corr(
+    X: np.ndarray, y: np.ndarray, weights: np.ndarray | None = None
+) -> np.ndarray:
+    """
+    Absolute marginal (univariate) correlation of every column of `X` with `y`.
+
+    Computed with a single matrix-vector product on the *raw* `X`: centering `y`
+    makes centering `X` unnecessary (``(X - mean).T @ y_centered == X.T @
+    y_centered``), so the whole matrix never has to be copied. Constant columns
+    score 0.
+
+    With `weights` (per-row, non-negative), all three moments become their
+    weighted counterparts, so screening scores rows the same way the weighted
+    fit that follows will. The unweighted path is left untouched, since it is
+    the one every non-weighted model takes on a full ~50k-column cis-window.
+    """
+    X = np.asarray(X)
+    y = np.asarray(y, dtype=X.dtype if X.dtype == np.float32 else np.float64)
+
+    if weights is None:
+        y_centered = y - y.mean()
+        num        = np.abs(X.T @ y_centered)
+        sd         = X.std(axis=0)
+    else:
+        w       = np.asarray(weights, dtype=np.float64)
+        w_total = float(w.sum())
+        if not np.isfinite(w_total) or w_total <= 0:
+            return np.zeros(X.shape[1], dtype=np.float64)
+        y_centered = y - float(w @ y) / w_total
+        # The numerator is left unscaled, exactly as in the branch above, so that
+        # uniform weights reproduce the unweighted scores rather than a rescaled
+        # copy of them. Only the ranking matters either way, since any constant
+        # applies to every column alike.
+        num = np.abs(X.T @ (w * y_centered))
+        # Weighted per-column variance as E_w[x^2] - E_w[x]^2. Squaring X costs
+        # one temporary of X's size, the same order as the copy `np.std` makes.
+        mean_x  = (w @ X) / w_total
+        mean_x2 = (w @ np.square(X)) / w_total
+        sd      = np.sqrt(np.clip(mean_x2 - mean_x ** 2, 0.0, None))
+
+    scores     = np.zeros(X.shape[1], dtype=np.float64)
+    usable     = sd > 0
+    scores[usable] = num[usable] / sd[usable]
+    return np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def screen_snps(
+    X: np.ndarray,
+    targets: np.ndarray | list[np.ndarray],
+    k: int | None,
+    weights: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """
+    Marginal-correlation screening: pick the `k` columns of `X` most correlated
+    with `targets`, so the elastic net solves an n x k problem instead of an
+    n x p one. In a cis-window p is ~40-50k while n is a few hundred, and the
+    fit selects only a few hundred SNPs, so all but the most promising columns
+    cost coordinate-descent time without changing the solution much.
+
+    With several `targets` (the mean / aleatoric / epistemic heads, which must
+    share one column set because they share `snp_ids` and one X scaler), a
+    column is scored by its *strongest* correlation across targets, so no head
+    can be starved of the SNPs it needs.
+
+    Pass `weights` (see `marginal_abs_corr`) to score columns under the same
+    per-row weighting the subsequent fit uses, so the prefilter cannot favour
+    SNPs that only look predictive on rows the loss barely counts.
+
+    IMPORTANT: screen on training rows only when the resulting fit is going to
+    be scored on held-out rows, otherwise the test fold leaks into the feature
+    selection.
+
+    Returns sorted column indices, or None when no screening applies (`k` unset
+    or not smaller than the number of columns), meaning "keep every column".
+    """
+    if k is None or k <= 0:
+        return None
+    n_snps = X.shape[1]
+    if n_snps <= k:
+        return None
+
+    if isinstance(targets, np.ndarray) and targets.ndim == 1:
+        targets = [targets]
+
+    scores = None
+    for target in targets:
+        target_scores = marginal_abs_corr(X, target, weights=weights)
+        scores = target_scores if scores is None else np.maximum(scores, target_scores)
+
+    top = np.argpartition(-scores, k - 1)[:k]
+    return np.sort(top)
+
+
 def train_test_indices(
     n: int,
     seed: int = 42,
@@ -160,8 +253,12 @@ def ld_prune(
             keep.append(j)
             continue
 
-        # corr(current, all kept) because columns are standardized
-        r = (Xs.T @ Xs[:, j]) / Xs.shape[0]
+        # corr(current, already-kept) because columns are standardized. Only the
+        # kept columns may be compared against: including every column would
+        # also include column `j` itself, whose r2 is 1 by construction, so the
+        # test below could never pass and nothing past the first SNP would
+        # survive pruning.
+        r  = (Xs[:, keep].T @ Xs[:, j]) / Xs.shape[0]
         r2 = r ** 2
 
         if np.all(r2 < threshold):

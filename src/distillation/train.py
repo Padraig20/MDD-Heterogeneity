@@ -5,12 +5,18 @@ import sys
 from pathlib import Path
 
 import os
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 import pandas as pd
+from sklearn.exceptions import ConvergenceWarning
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from src.distillation.models.lr import LR
 from src.distillation.models.probabilistic_lr import ProbabilisticLR
+from src.distillation.models.reg_lr import RegLR
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.wandb_logger import WandBLogger
 
@@ -89,6 +95,30 @@ def parse_args() -> argparse.Namespace:
         help="Number of alpha values to try for CV."
     )
     parser.add_argument(
+        "--cv",
+        type=int,
+        default=3,
+        help=(
+            "Number of inner cross-validation folds used to select the penalty per "
+            "gene. Cost scales with the fold count, and on a cis-window (n of a few "
+            "hundred, p of tens of thousands) 3 folds pick effectively the same "
+            "alpha as 5 at ~2/3 of the time."
+        ),
+    )
+    parser.add_argument(
+        "--screen-snps",
+        type=int,
+        default=5000,
+        help=(
+            "Before fitting, keep only this many SNPs per cis-window, the ones most "
+            "correlated with the target (computed on training individuals only, so "
+            "held-out metrics stay honest). A window holds tens of thousands of SNPs "
+            "while the fit retains only a few hundred, so screening cuts "
+            "coordinate-descent time several-fold at essentially unchanged accuracy. "
+            "Use 0 to fit against every SNP in the window."
+        ),
+    )
+    parser.add_argument(
         "-l1", "--l1-ratio",
         type=float,
         default=0.5,
@@ -137,6 +167,19 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number of parallel workers used per cell type to fit genes in "
             "parallel. Defaults to the number of CPUs."
+        ),
+    )
+    parser.add_argument(
+        "--celltype-batch",
+        type=int,
+        default=1,
+        help=(
+            "Number of cell types to fit together. Cell types drawn from the same "
+            "cohort share their genotypes, so fitting them in a batch reads each "
+            "gene's cis-window once for the whole batch instead of once per cell "
+            "type. Costs one target matrix in memory per cell type in the batch, "
+            "and only applies to cell types whose individuals match exactly. "
+            "Defaults to 1 (no sharing)."
         ),
     )
     parser.add_argument(
@@ -233,6 +276,76 @@ def parse_args() -> argparse.Namespace:
             "semantics as --aleatoric-test."
         ),
     )
+    parser.add_argument(
+        "--uncertainty-mode",
+        type=str,
+        default="heads",
+        choices=["heads", "weights"],
+        help=(
+            "How --aleatoric/--epistemic are consumed. 'heads' (default) distills the "
+            "teacher's uncertainty into two extra regressions per gene alongside the "
+            "mean (ProbabilisticLR). 'weights' instead keeps a single point-estimate "
+            "model and uses the uncertainty to weight the per-individual squared "
+            "error, downweighting individuals the teacher is unsure about, after "
+            "scTWAS's variance-weighted regression; what it saves is an ordinary "
+            "elastic net, directly comparable to the unweighted one."
+        ),
+    )
+    parser.add_argument(
+        "--weight-power",
+        type=float,
+        default=1.0,
+        help=(
+            "Exponent tau in the --uncertainty-mode weights loss weight "
+            "w_i = 1/variance_i^tau. 1.0 is scTWAS's exact inverse-variance "
+            "weighting, 0.5 weights by inverse standard deviation (gentler), and "
+            "0.0 disables the weighting entirely, reproducing the plain elastic net "
+            "as an exact ablation baseline."
+        ),
+    )
+    parser.add_argument(
+        "--weight-aleatoric",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on the *aleatoric* variance when building the loss weights "
+            "(--uncertainty-mode weights). This is label noise, i.e. exactly what "
+            "scTWAS downweights. Set to 0 to weight by epistemic uncertainty alone."
+        ),
+    )
+    parser.add_argument(
+        "--weight-epistemic",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on the *epistemic* variance when building the loss weights "
+            "(--uncertainty-mode weights). Unlike aleatoric noise, epistemic "
+            "uncertainty is a function of the genotype, so weighting hard on it can "
+            "systematically downweight individuals with unusual genotypes, which are "
+            "the ones carrying the signal for rare variants. Set to 0 to weight by "
+            "the teacher's label noise alone."
+        ),
+    )
+    parser.add_argument(
+        "--weight-clip-quantile",
+        type=float,
+        default=0.05,
+        help=(
+            "Clip the per-individual loss weights to their [q, 1-q] empirical "
+            "quantiles, so a handful of extreme individuals cannot become the only "
+            "ones the fit effectively sees. Use 0 for no clipping."
+        ),
+    )
+    parser.add_argument(
+        "--weight-eps-frac",
+        type=float,
+        default=1e-3,
+        help=(
+            "Floor the teacher variances at this fraction of the gene's median "
+            "nonzero variance before inverting them, so an individual the teacher "
+            "happens to be near-certain about cannot take an unbounded weight."
+        ),
+    )
     return parser.parse_args()
 
 def setup_logging(verbosity: int) -> None:
@@ -247,6 +360,172 @@ def setup_logging(verbosity: int) -> None:
 
 ONEK1K_BED_TEMPLATE = "OneK1K.GrCH38_chr{chrom}.biallelic"
 UKB_BED_TEMPLATE = "ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
+
+
+def prepare_cell_type(
+    ct_file: str,
+    args: argparse.Namespace,
+    bims: dict,
+    idx2ind: dict,
+    bed_template: str,
+    probabilistic: bool,
+    use_external_test: bool,
+    screen_snps: int | None,
+    jobs: int,
+):
+    """
+    Build the dataset(s) and the (still unfitted) model for one cell type.
+
+    Returns `(ct_name, dataset, test_dataset, model)`, or None when the cell type's
+    inputs are incomplete and it has to be skipped.
+    """
+    ct_name = ct_file[:-4]  # remove .csv extension
+    logging.info("Processing cell type: %s", ct_name)
+
+    y_aleatoric = os.path.join(args.aleatoric, ct_file) if probabilistic else None
+    y_epistemic = os.path.join(args.epistemic, ct_file) if probabilistic else None
+    if probabilistic and not (os.path.exists(y_aleatoric) and os.path.exists(y_epistemic)):
+        logging.warning(
+            "No aleatoric/epistemic file for cell type '%s' at %s / %s; skipping.",
+            ct_name, y_aleatoric, y_epistemic,
+        )
+        return None
+
+    dataset = GenotypeDataset(
+        bims=bims,
+        idx2ind=idx2ind,
+        y=os.path.join(args.targets, ct_file),
+        bim_dir=args.observations,
+        select_genes=args.select_genes,
+        normalize=args.norm_targets,
+        max_individuals=args.max_individuals,
+        bed_template=bed_template,
+        maf_threshold=args.maf_threshold,
+        y_aleatoric=y_aleatoric,
+        y_epistemic=y_epistemic,
+        min_detected_frac=args.min_detected_frac,
+        min_expr_std=args.min_expr_std,
+    )
+    if args.min_detected_frac is not None or args.min_expr_std is not None:
+        logging.info(
+            "Cell type '%s': %d genes pass expression filter "
+            "(min_detected_frac=%s, min_expr_std=%s).",
+            ct_name, len(dataset.genes), args.min_detected_frac, args.min_expr_std,
+        )
+
+    test_dataset = None
+    if use_external_test:
+        test_path = os.path.join(args.targets_test, ct_file)
+        if not os.path.exists(test_path):
+            logging.warning(
+                "No held-out target file for cell type '%s' at %s; falling back "
+                "to the automatic 80:20 split for this cell type.", ct_name, test_path,
+            )
+        else:
+            y_aleatoric_test = y_aleatoric
+            y_epistemic_test = y_epistemic
+            if probabilistic and args.aleatoric_test is not None and args.epistemic_test is not None:
+                candidate_aleatoric = os.path.join(args.aleatoric_test, ct_file)
+                candidate_epistemic = os.path.join(args.epistemic_test, ct_file)
+                if os.path.exists(candidate_aleatoric) and os.path.exists(candidate_epistemic):
+                    y_aleatoric_test = candidate_aleatoric
+                    y_epistemic_test = candidate_epistemic
+                else:
+                    logging.warning(
+                        "No held-out aleatoric/epistemic file for cell type '%s' at "
+                        "%s / %s; falling back to --aleatoric/--epistemic (%s / %s) "
+                        "for the held-out evaluation.",
+                        ct_name, candidate_aleatoric, candidate_epistemic,
+                        y_aleatoric, y_epistemic,
+                    )
+            test_dataset = GenotypeDataset(
+                bims=bims,
+                idx2ind=idx2ind,
+                y=test_path,
+                bim_dir=args.observations,
+                select_genes=args.select_genes,
+                normalize=args.norm_targets,
+                max_individuals=None,
+                bed_template=bed_template,
+                maf_threshold=args.maf_threshold,
+                y_aleatoric=y_aleatoric_test,
+                y_epistemic=y_epistemic_test,
+            )
+
+    model_class, extra = LR, {}
+    if probabilistic and args.uncertainty_mode == "weights":
+        model_class = RegLR
+        extra = dict(
+            weight_power=args.weight_power,
+            weight_lambda_aleatoric=args.weight_aleatoric,
+            weight_lambda_epistemic=args.weight_epistemic,
+            weight_clip_quantile=args.weight_clip_quantile,
+            weight_eps_frac=args.weight_eps_frac,
+        )
+    elif probabilistic:
+        model_class = ProbabilisticLR
+
+    model = model_class(
+        model_name=args.model_name,
+        l1_ratio=args.l1_ratio,
+        max_iter=args.max_iter,
+        alphas=args.alphas,
+        cv=args.cv,
+        seed=args.seed,
+        n_jobs=jobs,
+        screen=screen_snps,
+        **extra,
+    )
+    return ct_name, dataset, test_dataset, model
+
+
+def can_share_genotypes(jobs: list) -> bool:
+    """
+    Whether a batch of prepared cell types can be fitted from shared design
+    matrices, i.e. whether they all model exactly the same individuals in the same
+    order over the same cis-windows.
+    """
+    reference = jobs[0][1]
+    return all(reference.shares_individuals_with(dataset) for _, dataset, _, _ in jobs[1:])
+
+
+def fit_batch_sharing_genotypes(jobs: list, n_jobs: int, verbose: bool) -> None:
+    """
+    Fit a batch of cell types gene-major: each gene's cis-window is read once and
+    then handed to every cell type's model, instead of every cell type re-reading
+    the same genotypes for the same gene.
+
+    Parallelism stays at the gene level (one task fits all cell types for one gene)
+    with BLAS pinned to one thread per call, as in the per-cell-type path.
+    """
+    genes = list(dict.fromkeys(gene for _, dataset, _, _ in jobs for gene in dataset.genes))
+    n     = len(genes)
+
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+    def fit_gene(gene: str, i: int) -> None:
+        design = None
+        for ct_name, dataset, test_dataset, model in jobs:
+            if not dataset.has_gene(gene):
+                continue
+            try:
+                if design is None:
+                    design = dataset.gene_design(gene)
+                model.fit_gene_from_design(dataset, gene, design, test_dataset=test_dataset)
+            except Exception as e:
+                if verbose:
+                    print(f"[{i}/{n}] skip {gene} ({ct_name}): {e}")
+
+    with threadpool_limits(limits=1):
+        with ThreadPoolExecutor(max_workers=max(1, n_jobs)) as ex:
+            futures = [ex.submit(fit_gene, gene, i) for i, gene in enumerate(genes, start=1)]
+            iterator = as_completed(futures)
+            if not verbose:
+                iterator = tqdm(
+                    iterator, total=len(futures), desc="Fitting genes", leave=False
+                )
+            for fut in iterator:
+                fut.result()
 
 def main() -> None:
     args = parse_args()
@@ -332,124 +611,113 @@ def main() -> None:
     jobs = max(1, args.jobs)
     logging.info("Fitting genes per cell type with %d parallel workers.", jobs)
 
+    screen_snps = args.screen_snps if args.screen_snps and args.screen_snps > 0 else None
+    if screen_snps is not None:
+        logging.info(
+            "Screening each cis-window down to its %d SNPs most correlated with the "
+            "target (%d-fold inner CV).", screen_snps, args.cv,
+        )
+    else:
+        logging.info(
+            "SNP screening disabled: fitting against every SNP in each cis-window "
+            "(%d-fold inner CV).", args.cv,
+        )
+
     probabilistic = args.aleatoric is not None or args.epistemic is not None
     if probabilistic and (args.aleatoric is None or args.epistemic is None):
         logging.error("--aleatoric and --epistemic must both be provided together.")
         sys.exit(1)
-    if probabilistic:
+    if not probabilistic and args.uncertainty_mode == "weights":
+        logging.error(
+            "--uncertainty-mode weights needs the teacher's uncertainty to build the "
+            "loss weights from; pass --aleatoric and --epistemic."
+        )
+        sys.exit(1)
+    weighted = probabilistic and args.uncertainty_mode == "weights"
+    if weighted:
+        logging.info(
+            "Uncertainty-weighted distillation enabled: fitting one point-estimate "
+            "elastic-net/ridge per gene whose per-individual squared error is "
+            "weighted by 1/(%.2f*aleatoric + %.2f*epistemic)^%.2f (clipped at the "
+            "[%.3f, %.3f] weight quantiles), after scTWAS's variance-weighted "
+            "regression.",
+            args.weight_aleatoric, args.weight_epistemic, args.weight_power,
+            args.weight_clip_quantile, 1.0 - args.weight_clip_quantile,
+        )
+        if args.weight_power == 0:
+            logging.warning(
+                "--weight-power 0 disables the weighting entirely; this run "
+                "reproduces the plain elastic net (ablation baseline)."
+            )
+    elif probabilistic:
         logging.info(
             "Probabilistic distillation enabled: fitting three independent elastic-net/"
             "ridge regressions per gene (mean, aleatoric variance, epistemic variance) "
             "directly against the teacher's own uncertainty decomposition.",
         )
+    if probabilistic:
         if (args.aleatoric_test is None) != (args.epistemic_test is None):
             logging.warning(
                 "Only one of --aleatoric-test/--epistemic-test was provided; ignoring "
                 "it and falling back to --aleatoric/--epistemic for held-out evaluation."
             )
 
-    for ct_file in tqdm(cell_type_files, desc="Processing cell types"):
-        ct_name = ct_file[:-4]  # remove .csv extension
-        logging.info("Processing cell type: %s", ct_name)
+    batch_size = max(1, args.celltype_batch)
+    batches = [
+        cell_type_files[start:start + batch_size]
+        for start in range(0, len(cell_type_files), batch_size)
+    ]
+    if batch_size > 1:
+        logging.info(
+            "Fitting cell types in batches of up to %d, sharing one genotype read "
+            "per gene across each batch.", batch_size,
+        )
 
-        y_aleatoric = os.path.join(args.aleatoric, ct_file) if probabilistic else None
-        y_epistemic = os.path.join(args.epistemic, ct_file) if probabilistic else None
-        if probabilistic and not (os.path.exists(y_aleatoric) and os.path.exists(y_epistemic)):
-            logging.warning(
-                "No aleatoric/epistemic file for cell type '%s' at %s / %s; skipping.",
-                ct_name, y_aleatoric, y_epistemic,
+    for batch in tqdm(batches, desc="Processing cell types"):
+        prepared = []
+        for ct_file in batch:
+            job = prepare_cell_type(
+                ct_file,
+                args=args,
+                bims=bims,
+                idx2ind=idx2ind,
+                bed_template=bed_template,
+                probabilistic=probabilistic,
+                use_external_test=use_external_test,
+                screen_snps=screen_snps,
+                jobs=jobs,
             )
+            if job is not None:
+                prepared.append(job)
+
+        if not prepared:
             continue
 
-        dataset = GenotypeDataset(
-            bims=bims,
-            idx2ind=idx2ind,
-            y=os.path.join(args.targets, ct_file),
-            bim_dir=args.observations,
-            select_genes=args.select_genes,
-            normalize=args.norm_targets,
-            max_individuals=args.max_individuals,
-            bed_template=bed_template,
-            maf_threshold=args.maf_threshold,
-            y_aleatoric=y_aleatoric,
-            y_epistemic=y_epistemic,
-            min_detected_frac=args.min_detected_frac,
-            min_expr_std=args.min_expr_std,
-        )
-        if args.min_detected_frac is not None or args.min_expr_std is not None:
-            logging.info(
-                "Cell type '%s': %d genes pass expression filter "
-                "(min_detected_frac=%s, min_expr_std=%s).",
-                ct_name, len(dataset.genes), args.min_detected_frac, args.min_expr_std,
-            )
-
-        test_dataset = None
-        if use_external_test:
-            test_path = os.path.join(args.targets_test, ct_file)
-            if not os.path.exists(test_path):
-                logging.warning(
-                    "No held-out target file for cell type '%s' at %s; falling back "
-                    "to the automatic 80:20 split for this cell type.", ct_name, test_path,
-                )
-            else:
-                y_aleatoric_test = y_aleatoric
-                y_epistemic_test = y_epistemic
-                if probabilistic and args.aleatoric_test is not None and args.epistemic_test is not None:
-                    candidate_aleatoric = os.path.join(args.aleatoric_test, ct_file)
-                    candidate_epistemic = os.path.join(args.epistemic_test, ct_file)
-                    if os.path.exists(candidate_aleatoric) and os.path.exists(candidate_epistemic):
-                        y_aleatoric_test = candidate_aleatoric
-                        y_epistemic_test = candidate_epistemic
-                    else:
-                        logging.warning(
-                            "No held-out aleatoric/epistemic file for cell type '%s' at "
-                            "%s / %s; falling back to --aleatoric/--epistemic (%s / %s) "
-                            "for the held-out evaluation.",
-                            ct_name, candidate_aleatoric, candidate_epistemic,
-                            y_aleatoric, y_epistemic,
-                        )
-                test_dataset = GenotypeDataset(
-                    bims=bims,
-                    idx2ind=idx2ind,
-                    y=test_path,
-                    bim_dir=args.observations,
-                    select_genes=args.select_genes,
-                    normalize=args.norm_targets,
-                    max_individuals=None,
-                    bed_template=bed_template,
-                    maf_threshold=args.maf_threshold,
-                    y_aleatoric=y_aleatoric_test,
-                    y_epistemic=y_epistemic_test,
-                )
-
-        if probabilistic:
-            model = ProbabilisticLR(
-                model_name=args.model_name,
-                l1_ratio=args.l1_ratio,
-                max_iter=args.max_iter,
-                alphas=args.alphas,
-                seed=args.seed,
-                n_jobs=jobs,
-            )
+        if len(prepared) > 1 and can_share_genotypes(prepared):
+            fit_batch_sharing_genotypes(prepared, jobs, verbose=args.verbose > 0)
         else:
-            model = LR(
-                model_name=args.model_name,
-                l1_ratio=args.l1_ratio,
-                max_iter=args.max_iter,
-                alphas=args.alphas,
-                seed=args.seed,
-                n_jobs=jobs,
-            )
-        model.fit_dataset(dataset, test_dataset=test_dataset, verbose=args.verbose > 0)
+            if len(prepared) > 1:
+                logging.info(
+                    "Cell types in this batch do not model the same individuals; "
+                    "fitting them one at a time instead of sharing genotype reads."
+                )
+            for _, dataset, test_dataset, model in prepared:
+                model.fit_dataset(dataset, test_dataset=test_dataset, verbose=args.verbose > 0)
 
-        if args.output_dir is not None:
-            ct_path = ct_name.replace(" ", "_")
-            path = os.path.join(args.output_dir, f"{ct_path}.json")
-            model.save_coefficients(path)
+        for ct_name, _, _, model in prepared:
+            if args.output_dir is not None:
+                ct_path = ct_name.replace(" ", "_")
+                path = os.path.join(args.output_dir, f"{ct_path}.json")
+                model.save_coefficients(path)
 
-        model_label = "Probabilistic Elastic Net" if probabilistic else args.model_name.capitalize()
-        df = model.summarize_models()
-        wb_logger.log_celltype_diagnostics(df, cell_type=ct_name, model_label=model_label)
+            if weighted:
+                model_label = "Uncertainty-weighted Elastic Net"
+            elif probabilistic:
+                model_label = "Probabilistic Elastic Net"
+            else:
+                model_label = args.model_name.capitalize()
+            df = model.summarize_models()
+            wb_logger.log_celltype_diagnostics(df, cell_type=ct_name, model_label=model_label)
 
     wb_logger.finish()
 

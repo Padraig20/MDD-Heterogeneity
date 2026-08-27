@@ -1,4 +1,6 @@
 import os
+import threading
+import weakref
 
 import torch
 from torch.utils.data import Dataset
@@ -31,9 +33,47 @@ and are nicely put into a dict with keys according to their chromosome (e.g. "ch
 # (e.g. OneK1K: "OneK1K.GrCH38_chr{chrom}.biallelic").
 DEFAULT_BED_TEMPLATE = "ukb_imp_v3_chr{chrom}.unrelatedbritishqced.maf001geno9.biallelic"
 
+# Per-chromosome lookups derived from the `bims`/`idx2ind` inputs. Those inputs are
+# read once per run and then handed to one dataset per cell type, so deriving them
+# again for every dataset would repeat identical work (and, for the individual ->
+# BED row maps of a large cohort, allocate the same millions of dict entries over
+# and over). Keyed by object identity, since neither DataFrames nor ndarrays hash.
+_BP_CACHE: dict[int, tuple] = {}
+_SNP_ID_CACHE: dict[int, tuple] = {}
+_IND_INDEX_CACHE: dict[int, tuple] = {}
+
+
+def _cached_by_identity(cache: dict, owner, build):
+    """
+    Memoize `build()` against the identity of `owner`.
+
+    A weak reference to `owner` is stored alongside the value so that a recycled
+    `id()` (possible once the original object is garbage-collected) can never
+    return another object's cached value.
+    """
+    key   = id(owner)
+    entry = cache.get(key)
+    if entry is not None:
+        ref, value = entry
+        if ref() is owner:
+            return value
+        del cache[key]
+
+    value = build()
+    try:
+        cache[key] = (weakref.ref(owner), value)
+    except TypeError:
+        pass  # not weak-referenceable: skip caching rather than risk a stale hit
+    return value
+
 
 class GenotypeDataset(Dataset):
-    
+
+    # Variants per allele-frequency block (see `_block_maf`). Large enough that a
+    # 2 Mb cis-window spans only a couple of blocks, small enough that filling one
+    # stays a modest read.
+    MAF_BLOCK = 262_144
+
     def __init__(
         self,
         bims: dict[str],
@@ -113,12 +153,21 @@ class GenotypeDataset(Dataset):
             self.y    = pd.read_csv(y)
         else:
             self.y    = y # assume it's already a DataFrame
-        # we will slightly change the y format to make training easier...
-        # we currently have per row: gene,chrom,tss,individual1,individual2,...
-        # we will denormalize this to have one row per gene-individual pair
-        # with columns: gene, chrom, tss, individual, expression
-        if "individual" not in self.y.columns:
-            metadata_cols = ["gene", "chrom", "tss"]
+
+        # Two accepted input layouts:
+        #   wide (the on-disk format): one row per gene, columns
+        #     gene,chrom,tss,individual1,individual2,...
+        #   long: one row per gene-individual pair, with `individual`/`expression`
+        #     columns (what `split_by_chromosome` used to hand on).
+        # Everything downstream consumes the per-gene arrays built in
+        # `_build_caches`, so the wide layout is kept as-is rather than melted into
+        # n_genes x n_individuals rows: melting a whole cell type (~20k genes x a few
+        # hundred individuals) costs seconds and a multi-million-row frame per cell
+        # type, and every consumer would immediately group it back up by gene.
+        self._long_format = "individual" in self.y.columns
+
+        if not self._long_format:
+            metadata_cols   = ["gene", "chrom", "tss"]
             individual_cols = [col for col in self.y.columns if col not in metadata_cols]
 
             # Expression-based gene filtering happens on *all* individual columns,
@@ -128,22 +177,31 @@ class GenotypeDataset(Dataset):
                 self.y, individual_cols=individual_cols
             )
             if keep_genes is not None:
-                self.y = self.y[self.y["gene"].isin(keep_genes)].copy()
+                self.y = self.y[self.y["gene"].isin(keep_genes)]
+
+            selected_genes = self._selected_genes(self.y["gene"].unique())
+            if selected_genes is not None:
+                self.y = self.y[self.y["gene"].isin(selected_genes)]
 
             if self.max_individuals is not None:
-                keep_cols = metadata_cols + individual_cols[:self.max_individuals]
-                self.y = self.y.loc[:, keep_cols].copy()
-            self.y = self.y.melt(id_vars=["gene", "chrom", "tss"], var_name="individual", value_name="expression")
-            if self.normalize == "percentiles":
-                self.y = self.to_percentiles(self.y)
-            elif self.normalize == "log":
-                self.y["expression"] = np.log1p(self.y["expression"])
-            else:
-                raise ValueError(f"Invalid normalization method: {self.normalize}")
-            if y_aleatoric is not None:
-                self.y = self._attach_target(self.y, y_aleatoric, "aleatoric")
-            if y_epistemic is not None:
-                self.y = self._attach_target(self.y, y_epistemic, "epistemic")
+                individual_cols = individual_cols[:self.max_individuals]
+            # One row per gene from here on, so gene ids index straight into the
+            # expression matrix built below.
+            self.y = self.y.loc[
+                ~self.y["gene"].duplicated(), metadata_cols + individual_cols
+            ].copy()
+
+            self.genes        = self.y["gene"].to_numpy()
+            self._individuals = np.asarray(individual_cols, dtype=str)
+            self._expression  = self._normalized_expression(self.y[individual_cols])
+            self._aleatoric   = (
+                None if y_aleatoric is None
+                else self._aligned_matrix(y_aleatoric, "aleatoric", individual_cols)
+            )
+            self._epistemic   = (
+                None if y_epistemic is None
+                else self._aligned_matrix(y_epistemic, "epistemic", individual_cols)
+            )
         else:
             keep_genes = self._genes_passing_expression_filter(self.y, individual_cols=None)
             if keep_genes is not None:
@@ -151,104 +209,175 @@ class GenotypeDataset(Dataset):
             if self.max_individuals is not None:
                 selected_individuals = self.y["individual"].drop_duplicates().head(self.max_individuals)
                 self.y = self.y[self.y["individual"].isin(selected_individuals)].copy()
-        
-        # get all different genes
-        self.genes = self.y["gene"].unique()
-    
-        if self.select_genes is not None:
-            if self.select_genes == Path("random"):
-                # select 227 genes at random (same number as in MDD gene list) for quick testing
-                np.random.seed(42)
-                if len(self.genes) < 227:
-                    selected_genes = self.genes
-                else:
-                    selected_genes = np.random.choice(self.genes, size=227, replace=False)
-            else:
-                selected_genes = set(pd.read_csv(self.select_genes, sep="\t")["ENSID"])
-            self.genes = np.array([g for g in self.genes if g in selected_genes])
-            self.y     = self.y[self.y["gene"].isin(selected_genes)].copy()
+
+            self.genes     = self.y["gene"].unique()
+            selected_genes = self._selected_genes(self.genes)
+            if selected_genes is not None:
+                self.genes = np.array([g for g in self.genes if g in selected_genes])
+                self.y     = self.y[self.y["gene"].isin(selected_genes)].copy()
 
         # Build per-chromosome and per-gene caches so that get_gene_matrix is
         # O(log M + W) instead of repeating O(N) scans / dict builds per call.
         self._build_caches()
 
-    def _build_caches(self) -> None:
-        # Per-chromosome: sorted bp array (BIM files from plink are bp-sorted by
-        # chrom), snp id array, individual->row dict.
-        self._chrom_bps: dict[str, np.ndarray] = {}
-        self._chrom_snp_ids: dict[str, np.ndarray] = {}
-        for chrom, bim in self.bims.items():
-            self._chrom_bps[chrom] = bim["bp"].to_numpy()
-            self._chrom_snp_ids[chrom] = bim["snp"].astype(str).to_numpy()
-
-        self._ind_to_idx: dict[str, dict[str, int]] = {}
-        for chrom, ind_arr in self.idx2ind.items():
-            ind_str = np.asarray(ind_arr).astype(str)
-            self._ind_to_idx[chrom] = {ind: i for i, ind in enumerate(ind_str)}
-
-        # Cache of per-window MAF keep-masks so repeated reads (e.g. __getitem__
-        # over many individuals of the same gene) don't recompute allele freqs.
-        self._maf_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
-
-        # Per-gene: metadata + the row-individuals/expression (and optional aleatoric/
-        # epistemic uncertainty) vectors.
-        self.has_uncertainty = {"aleatoric", "epistemic"}.issubset(self.y.columns)
-        self._gene_meta: dict[
-            str, tuple[str, int, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]
-        ] = {}
-        if "gene" in self.y.columns and len(self.y) > 0:
-            for gene, group in self.y.groupby("gene", sort=False):
-                aleatoric = (
-                    group["aleatoric"].to_numpy() if self.has_uncertainty else None
-                )
-                epistemic = (
-                    group["epistemic"].to_numpy() if self.has_uncertainty else None
-                )
-                self._gene_meta[gene] = (
-                    str(group["chrom"].iloc[0]),
-                    int(group["tss"].iloc[0]),
-                    group["individual"].astype(str).to_numpy(),
-                    group["expression"].to_numpy(),
-                    aleatoric,
-                    epistemic,
-                )
-
-    @staticmethod
-    def _attach_target(
-        y_df: pd.DataFrame, extra: Path | pd.DataFrame | str, col_name: str
-    ) -> pd.DataFrame:
+    def _selected_genes(self, genes: np.ndarray) -> set | None:
         """
-        Melt a wide per-(gene, individual) target table and merge it onto the
-        (already melted) `y_df` as a new column named `col_name`, by (gene, chrom,
-        tss, individual).
+        Resolve `select_genes` into the set of gene ids to keep, or None when no
+        selection was requested.
+        """
+        if self.select_genes is None:
+            return None
+        if self.select_genes == Path("random"):
+            # select 227 genes at random (same number as in MDD gene list) for quick testing
+            np.random.seed(42)
+            if len(genes) < 227:
+                return set(genes)
+            return set(np.random.choice(genes, size=227, replace=False))
+        return set(pd.read_csv(self.select_genes, sep="\t")["ENSID"])
 
-        Values are kept in the teacher's output space (no log/percentile transform),
-        which is consistent with the log-transformed mean targets used for distillation.
+    def _normalized_expression(self, expr_df: pd.DataFrame) -> np.ndarray:
+        """
+        Normalize a wide (genes x individuals) expression block, vectorized over the
+        whole block rather than per gene-individual row.
+        """
+        expr = expr_df.to_numpy(dtype=np.float64)
+        if self.normalize == "percentiles":
+            if expr.shape[1] == 0:
+                return expr
+            # ranked across individuals, separately per gene (i.e. along the row)
+            return rankdata(expr, method="average", axis=1) / expr.shape[1]
+        elif self.normalize == "log":
+            return np.log1p(expr)
+        raise ValueError(f"Invalid normalization method: {self.normalize}")
+
+    def _aligned_matrix(
+        self,
+        extra: Path | pd.DataFrame | str,
+        col_name: str,
+        individual_cols: list[str],
+    ) -> np.ndarray:
+        """
+        Load an extra per-(gene, individual) target table (e.g. the teacher's
+        aleatoric/epistemic variances) and lay it out on exactly this dataset's gene
+        rows and individual columns, so it can be indexed row-wise alongside the
+        expression matrix.
+
+        Missing genes/individuals become NaN, as with the left join this replaces;
+        the models drop those rows per gene. Values are kept in the teacher's output
+        space (no log/percentile transform), consistent with the log-transformed mean
+        targets used for distillation.
         """
         if isinstance(extra, (Path, str)):
             extra_df = pd.read_csv(extra)
         else:
-            extra_df = extra.copy()
+            extra_df = extra
 
-        if "individual" not in extra_df.columns:
-            extra_df = extra_df.melt(
-                id_vars=["gene", "chrom", "tss"],
-                var_name="individual",
-                value_name=col_name,
+        if "individual" in extra_df.columns:
+            extra_df = extra_df.pivot_table(
+                index="gene", columns="individual", values=col_name
+            )
+        else:
+            extra_df = extra_df.drop(columns=["chrom", "tss"], errors="ignore")
+            extra_df = extra_df.set_index("gene")
+
+        extra_df = extra_df[~extra_df.index.duplicated(keep="first")]
+        extra_df.index   = extra_df.index.astype(str)
+        extra_df.columns = extra_df.columns.astype(str)
+        extra_df = extra_df.reindex(
+            index=[str(gene) for gene in self.genes],
+            columns=[str(col) for col in individual_cols],
+        )
+        return extra_df.to_numpy(dtype=np.float64)
+
+    def _build_caches(self) -> None:
+        # Per-chromosome: sorted bp array (BIM files from plink are bp-sorted by
+        # chrom), snp id array, individual->row dict. All three are derived from
+        # inputs shared across every dataset of a run, so they are memoized against
+        # those inputs' identity instead of rebuilt per dataset.
+        self._chrom_bps: dict[str, np.ndarray] = {}
+        self._chrom_snp_ids: dict[str, np.ndarray] = {}
+        for chrom, bim in self.bims.items():
+            self._chrom_bps[chrom] = _cached_by_identity(
+                _BP_CACHE, bim, lambda bim=bim: bim["bp"].to_numpy()
+            )
+            self._chrom_snp_ids[chrom] = _cached_by_identity(
+                _SNP_ID_CACHE, bim, lambda bim=bim: bim["snp"].astype(str).to_numpy()
             )
 
-        merge_keys = ["gene", "chrom", "tss", "individual"]
-        tmp_keys   = [f"__merge_{key}" for key in merge_keys]
+        self._ind_to_idx: dict[str, dict[str, int]] = {}
+        for chrom, ind_arr in self.idx2ind.items():
+            self._ind_to_idx[chrom] = _cached_by_identity(
+                _IND_INDEX_CACHE,
+                ind_arr,
+                lambda ind_arr=ind_arr: {
+                    ind: i for i, ind in enumerate(np.asarray(ind_arr).astype(str))
+                },
+            )
 
-        y_df = y_df.copy()
-        extra_df = extra_df[merge_keys + [col_name]].copy()
-        for key, tmp_key in zip(merge_keys, tmp_keys):
-            y_df[tmp_key] = y_df[key].astype(str)
-            extra_df[tmp_key] = extra_df[key].astype(str)
+        # Cached allele frequencies, in blocks of variants, so overlapping cis-windows
+        # (and __getitem__ over many individuals of the same gene) don't recompute
+        # them. Guarded by a lock because genes are fitted from several threads.
+        self._maf_cache: dict[tuple[str, int], np.ndarray] = {}
+        self._maf_lock = threading.Lock()
+        self._cohort_row_cache: dict[str, np.ndarray] = {}
 
-        merged = y_df.merge(extra_df[tmp_keys + [col_name]], on=tmp_keys, how="left")
-        merged = merged.drop(columns=tmp_keys)
-        return merged
+        # Individual -> target row position, for aligning this dataset's targets onto
+        # another dataset's rows (see `gene_targets`).
+        self._wide_positions: dict[str, int] | None = None
+        self._gene_positions: dict[str, dict[str, int]] = {}
+
+        # Per-gene: metadata + the row-individuals/expression (and optional aleatoric/
+        # epistemic uncertainty) vectors.
+        self._gene_meta: dict[
+            str, tuple[str, int, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]
+        ] = {}
+        if self._long_format:
+            self.has_uncertainty = {"aleatoric", "epistemic"}.issubset(self.y.columns)
+            if "gene" in self.y.columns and len(self.y) > 0:
+                for gene, group in self.y.groupby("gene", sort=False):
+                    aleatoric = (
+                        group["aleatoric"].to_numpy() if self.has_uncertainty else None
+                    )
+                    epistemic = (
+                        group["epistemic"].to_numpy() if self.has_uncertainty else None
+                    )
+                    self._gene_meta[gene] = (
+                        str(group["chrom"].iloc[0]),
+                        int(group["tss"].iloc[0]),
+                        group["individual"].astype(str).to_numpy(),
+                        group["expression"].to_numpy(),
+                        aleatoric,
+                        epistemic,
+                    )
+        else:
+            self.has_uncertainty = self._aleatoric is not None and self._epistemic is not None
+            chroms = self.y["chrom"].astype(str).to_numpy()
+            tss    = self.y["tss"].to_numpy()
+            # Every gene shares one individual array (the wide frame's columns), so
+            # it is referenced rather than copied per gene.
+            for i, gene in enumerate(self.genes):
+                self._gene_meta[gene] = (
+                    chroms[i],
+                    int(tss[i]),
+                    self._individuals,
+                    self._expression[i],
+                    self._aleatoric[i] if self._aleatoric is not None else None,
+                    self._epistemic[i] if self._epistemic is not None else None,
+                )
+
+        # Flat (gene, individual) addressing for the torch Dataset interface.
+        self._gene_order   = list(self._gene_meta.keys())
+        counts             = [len(self._gene_meta[gene][3]) for gene in self._gene_order]
+        self._pair_offsets = np.cumsum([0] + counts)
+
+        # The individuals this dataset actually models, used for allele frequencies.
+        if self._long_format:
+            self._cohort_individuals = (
+                self.y["individual"].astype(str).unique()
+                if "individual" in self.y.columns else np.empty(0, dtype=str)
+            )
+        else:
+            self._cohort_individuals = self._individuals
 
     def _genes_passing_expression_filter(
         self,
@@ -325,27 +454,107 @@ class GenotypeDataset(Dataset):
         p = np.where(np.isnan(p), 0.0, p)  # all-missing SNP -> MAF 0 (gets filtered out)
         return np.minimum(p, 1.0 - p)
 
-    def _window_maf_mask(self, chrom: str, var_idx: np.ndarray) -> np.ndarray:
+    def _cohort_rows(self, chrom: str) -> np.ndarray:
         """
-        Boolean keep-mask (len == len(var_idx)) for SNPs in a window whose MAF,
-        computed across the whole loaded cohort, is >= ``self.maf_threshold``.
+        BED row indices of this dataset's individuals on `chrom`, ascending.
 
-        Results are cached per (chrom, first_var, last_var) window.
+        Allele frequencies are a property of the cohort being modelled, so they are
+        computed from these rows rather than from every individual in the fileset
+        (which, for a fileset far larger than the cohort, also means reading far
+        more data than the fit will ever use).
         """
-        key = (chrom, int(var_idx[0]), int(var_idx[-1]))
-        cached = self._maf_mask_cache.get(key)
+        cached = self._cohort_row_cache.get(chrom)
         if cached is not None:
             return cached
 
-        bed_path = os.path.join(self.bim_dir, f"{self.bed_template.format(chrom=chrom)}.bed")
-        with open_bed(bed_path) as bed:
-            genotypes = bed.read(index=np.s_[:, var_idx], dtype="int8")
-        mask = self._maf_from_genotypes(genotypes) >= self.maf_threshold
-        self._maf_mask_cache[key] = mask
-        return mask
+        ind_to_idx = self._ind_to_idx[chrom]
+        rows = [
+            ind_to_idx[ind]
+            for ind in self._cohort_individuals
+            if ind in ind_to_idx
+        ]
+        rows = np.sort(np.asarray(rows, dtype=np.int64))
+        self._cohort_row_cache[chrom] = rows
+        return rows
+
+    def _block_maf(self, chrom: str, block: int) -> np.ndarray:
+        """
+        Per-SNP MAF for one fixed-size block of `chrom`'s variants, computed over the
+        cohort rows and cached.
+
+        Blocking (rather than caching per cis-window) is what makes MAF filtering
+        cheap: neighbouring genes' windows overlap heavily, so a window-keyed cache
+        almost never hits and re-reads the same genotypes for every gene, while
+        whole-chromosome computation would read far past the windows actually needed.
+        """
+        key    = (chrom, block)
+        cached = self._maf_cache.get(key)
+        if cached is not None:
+            return cached
+
+        with self._maf_lock:
+            # Another thread may have filled this block while we waited.
+            cached = self._maf_cache.get(key)
+            if cached is not None:
+                return cached
+
+            n_variants = len(self._chrom_bps[chrom])
+            start      = block * self.MAF_BLOCK
+            stop       = min(start + self.MAF_BLOCK, n_variants)
+            bed_path   = os.path.join(
+                self.bim_dir, f"{self.bed_template.format(chrom=chrom)}.bed"
+            )
+            rows = self._cohort_rows(chrom)
+            with open_bed(bed_path) as bed:
+                genotypes = bed.read(index=np.s_[rows, start:stop], dtype="int8")
+            maf = self._maf_from_genotypes(genotypes)
+            self._maf_cache[key] = maf
+            return maf
+
+    def _window_maf_mask(self, chrom: str, var_idx: np.ndarray) -> np.ndarray:
+        """
+        Boolean keep-mask (len == len(var_idx)) for SNPs in a window whose MAF,
+        computed across the loaded cohort, is >= ``self.maf_threshold``.
+        """
+        maf         = np.empty(var_idx.size, dtype=np.float64)
+        first_block = int(var_idx[0]) // self.MAF_BLOCK
+        last_block  = int(var_idx[-1]) // self.MAF_BLOCK
+        for block in range(first_block, last_block + 1):
+            start     = block * self.MAF_BLOCK
+            stop      = start + self.MAF_BLOCK
+            in_block  = (var_idx >= start) & (var_idx < stop)
+            if not in_block.any():
+                continue
+            maf[in_block] = self._block_maf(chrom, block)[var_idx[in_block] - start]
+        return maf >= self.maf_threshold
+
+    def _cis_window(self, chrom: str, tss: int) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Variant indices and SNP ids of the cis-window around `tss`, MAF-filtered if
+        requested. The BIM is bp-sorted per chromosome in plink output, so the window
+        bounds come from two binary searches instead of a scan.
+        """
+        bps      = self._chrom_bps[chrom]
+        all_snps = self._chrom_snp_ids[chrom]
+        left     = int(np.searchsorted(bps, tss - self.window_size, side="left"))
+        right    = int(np.searchsorted(bps, tss + self.window_size, side="right"))
+        var_idx  = np.arange(left, right, dtype=np.int64)
+        snp_ids  = all_snps[left:right]
+
+        if self.maf_threshold is not None and var_idx.size > 0:
+            maf_keep = self._window_maf_mask(chrom, var_idx)
+            var_idx  = var_idx[maf_keep]
+            snp_ids  = snp_ids[maf_keep]
+        return var_idx, snp_ids
 
     def split_by_chromosome(self, chroms: list[str]) -> Dataset:
-        # filter y and chroms to only include rows with chrom in chroms
+        """
+        Restrict the dataset to `chroms`.
+
+        `self.y` holds the targets as they were read (normalization lives in the
+        derived per-gene arrays), so the sub-dataset re-derives them from raw values
+        rather than normalizing already-normalized ones.
+        """
         y_filtered       = self.y[self.y["chrom"].astype(str).isin(chroms)].copy()
         bims_filtered    = {chrom: bim for chrom, bim in self.bims.items() if chrom in chroms}
         idx2ind_filtered = {chrom: idx2ind for chrom, idx2ind in self.idx2ind.items() if chrom in chroms}
@@ -365,43 +574,47 @@ class GenotypeDataset(Dataset):
         )
     
     def __len__(self) -> int:
-        return len(self.y)
-    
+        return int(self._pair_offsets[-1])
+
     def __getitem__(self, idx) -> tuple[torch.Tensor, torch.Tensor]:
-        row        = self.y.iloc[idx]
-        ensid      = row["gene"]
-        chrom      = str(row["chrom"])
-        tss        = row["tss"]
-        individual = row["individual"]
-        expression = row["expression"]
+        """
+        One (genotype window, expression) pair, addressed gene-major: index `idx`
+        walks all individuals of the first gene, then all individuals of the next,
+        and so on.
+        """
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self)}")
 
-        # find window in BIM file for this chrom that contains tss
-        bim    = self.bims[chrom]
-        start  = tss - self.window_size
-        end    = tss + self.window_size
-        idx2ind        = self.idx2ind[chrom]
-        individual_idx = np.where(idx2ind == individual)[0][0]
+        gene_pos = int(np.searchsorted(self._pair_offsets, idx, side="right") - 1)
+        gene     = self._gene_order[gene_pos]
+        local    = int(idx - self._pair_offsets[gene_pos])
 
-        mask = (bim["chrom"] == chrom) & (bim["bp"] >= start) & (bim["bp"] <= end)
-        var_idx = np.flatnonzero(mask.to_numpy())
+        chrom, tss, individuals, expression, _, _ = self._gene_meta[gene]
+        individual_idx = self._ind_to_idx[chrom][str(individuals[local])]
 
-        if self.maf_threshold is not None and var_idx.size > 0:
-            var_idx = var_idx[self._window_maf_mask(chrom, var_idx)]
+        var_idx, _ = self._cis_window(chrom, tss)
 
         bed_path = os.path.join(self.bim_dir, f"{self.bed_template.format(chrom=chrom)}.bed")
         with open_bed(bed_path) as bed:
             x = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
 
         x = torch.from_numpy(x).flatten().float() # convert to float for training
-        y = torch.tensor(expression, dtype=torch.float32)
+        y = torch.tensor(expression[local], dtype=torch.float32)
 
         return x, y
     
     def get_gene_matrix(
-        self, gene: str, return_uncertainty: bool = False
+        self,
+        gene: str,
+        return_uncertainty: bool = False,
+        return_individuals: bool = False,
     ) -> (
         tuple[np.ndarray, np.ndarray, np.ndarray, str]
         | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]
+        | tuple[np.ndarray, np.ndarray, np.ndarray, str, np.ndarray]
+        | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, np.ndarray]
     ):
         """
         Build the full design matrix for one gene.
@@ -415,19 +628,24 @@ class GenotypeDataset(Dataset):
             return_uncertainty: if True, also return the per-individual target
                 aleatoric/epistemic variances (requires the dataset to have been built
                 with both `y_aleatoric` and `y_epistemic`).
+            return_individuals: if True, also return the row-aligned individual IDs
+                (i.e. `individuals[i]` is the donor for row `i` of `X`/`y`). This is
+                the same donor subset actually used to build `X` (individuals absent
+                from the BED/FAM for this chromosome are already excluded), so it is
+                safe to zip directly against `X`'s rows without re-deriving the
+                filtering logic above.
 
         Returns:
-            X           : shape (n_individuals_for_gene, n_snps_in_window)
-            y           : shape (n_individuals_for_gene,)
+            X            : shape (n_individuals_for_gene, n_snps_in_window)
+            y            : shape (n_individuals_for_gene,)
             [y_aleatoric]: shape (n_individuals_for_gene,)  (only if return_uncertainty=True)
             [y_epistemic]: shape (n_individuals_for_gene,)  (only if return_uncertainty=True)
-            snp_ids     : shape (n_snps_in_window,)
-            chrom       : chromosome name
+            snp_ids      : shape (n_snps_in_window,)
+            chrom        : chromosome name
+            [individuals]: shape (n_individuals_for_gene,)  (only if return_individuals=True)
         """
-        meta = self._gene_meta.get(gene)
-        if meta is None:
-            raise ValueError(f"No data found for gene {gene}")
-        chrom, tss, row_individuals, y, y_aleatoric, y_epistemic = meta
+        X, snp_ids, chrom, kept_individuals = self.gene_design(gene)
+        y, y_aleatoric, y_epistemic = self.gene_targets(gene, kept_individuals)
 
         if return_uncertainty and (y_aleatoric is None or y_epistemic is None):
             raise ValueError(
@@ -435,21 +653,29 @@ class GenotypeDataset(Dataset):
                 "`y_aleatoric`/`y_epistemic`."
             )
 
-        # Cis window via sorted-bp searchsorted (BIM is bp-sorted by chrom in plink output).
-        bps      = self._chrom_bps[chrom]
-        all_snps = self._chrom_snp_ids[chrom]
-        start    = tss - self.window_size
-        end      = tss + self.window_size
-        left     = int(np.searchsorted(bps, start, side="left"))
-        right    = int(np.searchsorted(bps, end,   side="right"))
-        var_idx  = np.arange(left, right, dtype=np.int64)
-        snp_ids  = all_snps[left:right]
+        if return_uncertainty and return_individuals:
+            return X, y, y_aleatoric, y_epistemic, snp_ids, chrom, kept_individuals
+        if return_uncertainty:
+            return X, y, y_aleatoric, y_epistemic, snp_ids, chrom
+        if return_individuals:
+            return X, y, snp_ids, chrom, kept_individuals
+        return X, y, snp_ids, chrom
 
-        # MAF filtering (if enabled) happens before subsetting
-        if self.maf_threshold is not None and var_idx.size > 0:
-            maf_keep = self._window_maf_mask(chrom, var_idx)
-            var_idx  = var_idx[maf_keep]
-            snp_ids  = snp_ids[maf_keep]
+    def gene_design(self, gene: str) -> tuple[np.ndarray, np.ndarray, str, np.ndarray]:
+        """
+        Genotype side of one gene's design matrix: `(X, snp_ids, chrom, individuals)`.
+
+        Split out from `get_gene_matrix` so a single read can be shared by several
+        cell types (see `shares_individuals_with`), whose targets differ while their
+        genotypes are identical.
+        """
+        meta = self._gene_meta.get(gene)
+        if meta is None:
+            raise ValueError(f"No data found for gene {gene}")
+        chrom, tss, row_individuals, _, _, _ = meta
+
+        # Cis window (MAF-filtered if enabled) via sorted-bp searchsorted.
+        var_idx, snp_ids = self._cis_window(chrom, tss)
 
         # Map individuals to BED/FAM row indices via cached dict.
         ind_to_idx = self._ind_to_idx[chrom]
@@ -458,14 +684,11 @@ class GenotypeDataset(Dataset):
             dtype=np.int64,
             count=len(row_individuals),
         )
-        keep = individual_idx >= 0
+        keep             = individual_idx >= 0
+        kept_individuals = row_individuals
         if not keep.all():
-            individual_idx = individual_idx[keep]
-            y = y[keep]
-            if y_aleatoric is not None:
-                y_aleatoric = y_aleatoric[keep]
-            if y_epistemic is not None:
-                y_epistemic = y_epistemic[keep]
+            individual_idx   = individual_idx[keep]
+            kept_individuals = row_individuals[keep]
 
         bed_path = os.path.join(
             self.bim_dir,
@@ -473,10 +696,81 @@ class GenotypeDataset(Dataset):
         )
         with open_bed(bed_path) as bed:
             X = bed.read(index=np.s_[individual_idx, var_idx], dtype="int8")
+        return X, snp_ids, chrom, kept_individuals
 
-        if return_uncertainty:
-            return X, y, y_aleatoric, y_epistemic, snp_ids, chrom
-        return X, y, snp_ids, chrom
+    def has_gene(self, gene: str) -> bool:
+        """Whether this dataset carries targets for `gene`."""
+        return gene in self._gene_meta
+
+    def gene_targets(
+        self, gene: str, individuals: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+        """
+        Targets for one gene as `(y, y_aleatoric, y_epistemic)`, row-aligned to
+        `individuals` (defaults to this dataset's own individuals for the gene).
+
+        Individuals this dataset has no value for become NaN, which the models drop
+        per gene.
+        """
+        meta = self._gene_meta.get(gene)
+        if meta is None:
+            raise ValueError(f"No data found for gene {gene}")
+        _, _, row_individuals, y, y_aleatoric, y_epistemic = meta
+
+        if individuals is None or individuals is row_individuals:
+            return y, y_aleatoric, y_epistemic
+
+        positions = self._individual_positions(gene, row_individuals)
+        take      = np.fromiter(
+            (positions.get(str(ind), -1) for ind in individuals),
+            dtype=np.int64,
+            count=len(individuals),
+        )
+        missing = take < 0
+        take    = np.where(missing, 0, take)
+
+        def aligned(values):
+            if values is None:
+                return None
+            out = values[take].astype(np.float64, copy=True)
+            out[missing] = np.nan
+            return out
+
+        return aligned(y), aligned(y_aleatoric), aligned(y_epistemic)
+
+    def _individual_positions(self, gene: str, row_individuals: np.ndarray) -> dict:
+        """Individual -> row position within a gene's target vectors."""
+        if not self._long_format:
+            # Every gene shares the wide frame's columns, so one map serves them all.
+            if self._wide_positions is None:
+                self._wide_positions = {
+                    str(ind): i for i, ind in enumerate(self._individuals)
+                }
+            return self._wide_positions
+
+        positions = self._gene_positions.get(gene)
+        if positions is None:
+            positions = {str(ind): i for i, ind in enumerate(row_individuals)}
+            self._gene_positions[gene] = positions
+        return positions
+
+    def shares_individuals_with(self, other: "GenotypeDataset") -> bool:
+        """
+        Whether `other` can be fitted against design matrices read from this dataset.
+
+        Requires the exact same individuals in the exact same order: a differing
+        order would silently misalign rows, and a differing membership would
+        silently train on the wrong individuals.
+        """
+        if self._long_format or other._long_format:
+            return False
+        return (
+            self.bed_template == other.bed_template
+            and self.bim_dir == other.bim_dir
+            and self.window_size == other.window_size
+            and self.maf_threshold == other.maf_threshold
+            and np.array_equal(self._individuals, other._individuals)
+        )
 
 if __name__ == "__main__":
     # example usage

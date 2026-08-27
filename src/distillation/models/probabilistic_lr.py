@@ -23,8 +23,14 @@ from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
-from src.distillation.models.lr import LR
-from src.distillation.utils import ld_prune, safe_pearson, safe_spearman, train_test_indices
+from src.distillation.models.lr import LR, fitted_alpha, fitted_l1_ratio
+from src.distillation.utils import (
+    ld_prune,
+    safe_pearson,
+    safe_spearman,
+    screen_snps,
+    train_test_indices,
+)
 
 
 @dataclass
@@ -113,11 +119,12 @@ class ProbabilisticLR:
         self,
         model_name: str      = "elasticnet",
         l1_ratio: float      = 0.5,
-        cv: int              = 5,
+        cv: int              = 3,
         alphas: int          = 100,
         max_iter: int        = 10000,
         seed: int            = 42,
         n_jobs: int          = 1,
+        screen: Optional[int] = 5000,
     ):
         self.model_name = model_name
         self.l1_ratio   = l1_ratio
@@ -126,30 +133,17 @@ class ProbabilisticLR:
         self.max_iter   = max_iter
         self.seed       = seed
         self.n_jobs     = n_jobs
-        # A single shared `LR` instance whose `_fit_scaled`/`_predict_scaled` helpers
+        self.screen     = screen
+        # A single shared `LR` instance whose `_scale_x`/`_fit_prescaled` helpers
         # are reused for all three heads: identical ElasticNet/Ridge construction
         # (alpha path, solver settings, ...), just called with a different target
         # each time. Never calls `LR.fit_gene_matrix` itself, since that bundles its
         # own held-out split + persisted-model refit for a single target.
         self._lr = LR(
             model_name=model_name, l1_ratio=l1_ratio, cv=cv, alphas=alphas,
-            max_iter=max_iter, seed=seed,
+            max_iter=max_iter, seed=seed, screen=screen,
         )
         self.models_: Dict[str, ProbabilisticLRStruct] = {}
-
-    def _fit_head(self, X: np.ndarray, y: np.ndarray, log1p: bool):
-        """Fit one head on (X, y); returns (LinearHead, x_scaler, y_scaler)."""
-        x_scaler, y_scaler, enet = self._lr._fit_scaled(X, y)
-        head = LinearHead(
-            coef_=enet.coef_.copy(),
-            intercept_=float(enet.intercept_),
-            alpha_=float(enet.alpha_),
-            l1_ratio_=getattr(enet, "l1_ratio_", None),
-            y_mean_=float(y_scaler.mean_[0]),
-            y_scale_=float(y_scaler.scale_[0]),
-            log1p=log1p,
-        )
-        return head, x_scaler, y_scaler
 
     def _fit_heads(
         self,
@@ -157,12 +151,41 @@ class ProbabilisticLR:
         y: np.ndarray,
         y_aleatoric_log: np.ndarray,
         y_epistemic_log: np.ndarray,
+        alphas: Optional[dict] = None,
     ) -> dict:
-        return {
-            "mean":      self._fit_head(X, y, log1p=False),
-            "aleatoric": self._fit_head(X, y_aleatoric_log, log1p=True),
-            "epistemic": self._fit_head(X, y_epistemic_log, log1p=True),
-        }
+        """
+        Fit the mean/aleatoric/epistemic heads, all on one shared standardization of
+        `X`. The three heads differ only in their target, so standardizing X once and
+        reusing it avoids building three identical (n x p) copies per gene.
+
+        Pass `alphas` (head name -> penalty) to refit at penalties selected earlier
+        instead of searching the alpha path again for each head.
+        """
+        x_scaler, X_scaled = self._lr._scale_x(X)
+        heads = {}
+        for name, target, log1p in (
+            ("mean",      y,               False),
+            ("aleatoric", y_aleatoric_log, True),
+            ("epistemic", y_epistemic_log, True),
+        ):
+            alpha          = None if alphas is None else alphas.get(name)
+            y_scaler, enet = self._lr._fit_prescaled(X_scaled, target, alpha=alpha)
+            head = LinearHead(
+                coef_=enet.coef_.copy(),
+                intercept_=float(enet.intercept_),
+                alpha_=fitted_alpha(enet),
+                l1_ratio_=fitted_l1_ratio(enet),
+                y_mean_=float(y_scaler.mean_[0]),
+                y_scale_=float(y_scaler.scale_[0]),
+                log1p=log1p,
+            )
+            heads[name] = (head, x_scaler, y_scaler)
+        return heads
+
+    @staticmethod
+    def _head_alphas(heads: dict) -> dict:
+        """Penalty selected by each head, for refitting without a second search."""
+        return {name: head.alpha_ for name, (head, _, _) in heads.items()}
 
     @staticmethod
     def _nan_metrics(y_aleatoric: np.ndarray, y_epistemic: np.ndarray) -> dict:
@@ -199,13 +222,16 @@ class ProbabilisticLR:
         source individually, so aleatoric and epistemic can each be judged on their
         own rather than only via their sum.
         """
-        mean_head,      mean_xs,      _ = heads["mean"]
-        aleatoric_head, aleatoric_xs, _ = heads["aleatoric"]
-        epistemic_head, epistemic_xs, _ = heads["epistemic"]
+        mean_head,      x_scaler, _ = heads["mean"]
+        aleatoric_head, _,        _ = heads["aleatoric"]
+        epistemic_head, _,        _ = heads["epistemic"]
 
-        mu                 = mean_head.predict(mean_xs.transform(X))
-        aleatoric_pred      = aleatoric_head.predict(aleatoric_xs.transform(X))
-        epistemic_pred      = epistemic_head.predict(epistemic_xs.transform(X))
+        # All three heads were fit against one shared standardization of X (see
+        # `_fit_heads`), so it only has to be applied once here too.
+        X_scaled            = x_scaler.transform(X)
+        mu                  = mean_head.predict(X_scaled)
+        aleatoric_pred      = aleatoric_head.predict(X_scaled)
+        epistemic_pred      = epistemic_head.predict(X_scaled)
         aleatoric_std_pred  = np.sqrt(aleatoric_pred)
         epistemic_std_pred  = np.sqrt(epistemic_pred)
         total_std           = np.sqrt(aleatoric_pred + epistemic_pred)
@@ -340,11 +366,23 @@ class ProbabilisticLR:
             else:
                 X, snp_ids = ld_prune(X, snp_ids)
 
+        # The persisted heads, once it is known that fitting them again would
+        # reproduce heads already computed for the held-out metrics.
+        heads_final  = None
+        reuse_alphas = None
+
         if has_external_test:
             # Held-out evaluation on a user-supplied, disjoint test set: train on
             # *all* individuals from `X`/`y`/uncertainty targets (no internal split)
             # and evaluate on the `_test` arrays.
             if y_test.size > 0:
+                keep = screen_snps(
+                    X, [y, y_aleatoric_log, y_epistemic_log], self.screen
+                )
+                if keep is not None:
+                    X       = X[:, keep]
+                    X_test  = X_test[:, keep]
+                    snp_ids = np.asarray(snp_ids)[keep]
                 heads_h     = self._fit_heads(X, y, y_aleatoric_log, y_epistemic_log)
                 metrics     = self._evaluate(heads_h, X_test, y_test, y_aleatoric_test, y_epistemic_test)
                 insample    = self._evaluate(heads_h, X, y, y_aleatoric, y_epistemic)
@@ -352,6 +390,9 @@ class ProbabilisticLR:
                 insample_pearson_r = insample["pearson_r"]
                 insample_spearman_r = insample["spearman_r"]
                 n_train, n_test = int(y.size), int(y_test.size)
+                # These heads already saw every individual, so they *are* the heads
+                # that would be persisted; refitting would repeat identical work.
+                heads_final = heads_h
             else:
                 metrics = self._nan_metrics(y_aleatoric, y_epistemic)
                 insample_r2 = float("nan")
@@ -366,19 +407,28 @@ class ProbabilisticLR:
             # individuals afterwards.
             train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
             if test_idx is not None:
+                # Screened on the train fold alone: screening on all rows would let
+                # the test fold influence which SNPs the scored heads may use.
+                keep = screen_snps(
+                    X[train_idx],
+                    [y[train_idx], y_aleatoric_log[train_idx], y_epistemic_log[train_idx]],
+                    self.screen,
+                )
+                X_h = X if keep is None else X[:, keep]
                 heads_h = self._fit_heads(
-                    X[train_idx], y[train_idx], y_aleatoric_log[train_idx], y_epistemic_log[train_idx]
+                    X_h[train_idx], y[train_idx], y_aleatoric_log[train_idx], y_epistemic_log[train_idx]
                 )
                 metrics = self._evaluate(
-                    heads_h, X[test_idx], y[test_idx], y_aleatoric[test_idx], y_epistemic[test_idx]
+                    heads_h, X_h[test_idx], y[test_idx], y_aleatoric[test_idx], y_epistemic[test_idx]
                 )
                 insample = self._evaluate(
-                    heads_h, X[train_idx], y[train_idx], y_aleatoric[train_idx], y_epistemic[train_idx]
+                    heads_h, X_h[train_idx], y[train_idx], y_aleatoric[train_idx], y_epistemic[train_idx]
                 )
                 insample_r2 = insample["r2"]
                 insample_pearson_r = insample["pearson_r"]
                 insample_spearman_r = insample["spearman_r"]
                 n_train, n_test = int(train_idx.size), int(test_idx.size)
+                reuse_alphas = self._head_alphas(heads_h)
             else:
                 # too few individuals to hold out: no honest generalization estimate
                 metrics = self._nan_metrics(y_aleatoric, y_epistemic)
@@ -388,7 +438,18 @@ class ProbabilisticLR:
                 n_train, n_test = int(y.size), 0
 
         # Final heads refit on all individuals -> these are the persisted coefficients.
-        heads_final = self._fit_heads(X, y, y_aleatoric_log, y_epistemic_log)
+        # The penalties selected on the train fold are carried over instead of
+        # searching the alpha path a second time for each head.
+        if heads_final is None:
+            keep = screen_snps(
+                X, [y, y_aleatoric_log, y_epistemic_log], self.screen
+            )
+            if keep is not None:
+                X       = X[:, keep]
+                snp_ids = np.asarray(snp_ids)[keep]
+            heads_final = self._fit_heads(
+                X, y, y_aleatoric_log, y_epistemic_log, alphas=reuse_alphas
+            )
         mean_head,      x_scaler, _ = heads_final["mean"]
         aleatoric_head, _,        _ = heads_final["aleatoric"]
         epistemic_head, _,        _ = heads_final["epistemic"]
@@ -452,6 +513,38 @@ class ProbabilisticLR:
                 # Gene has no rows in the external test set; train on all of `X`/`y`/
                 # uncertainty targets but report held-out metrics as NaN (see
                 # fit_gene_matrix).
+                X_test = np.empty((0, X.shape[1]), dtype=X.dtype)
+                y_test = np.empty(0, dtype=y.dtype)
+                y_aleatoric_test = np.empty(0, dtype=y_aleatoric.dtype)
+                y_epistemic_test = np.empty(0, dtype=y_epistemic.dtype)
+        return self.fit_gene_matrix(
+            gene, X, y, y_aleatoric, y_epistemic, snp_ids, chr,
+            X_test=X_test, y_test=y_test,
+            y_aleatoric_test=y_aleatoric_test, y_epistemic_test=y_epistemic_test,
+        )
+
+    def fit_gene_from_design(
+        self,
+        dataset: GenotypeDataset,
+        gene: str,
+        design: tuple,
+        test_dataset: Optional[GenotypeDataset] = None,
+    ) -> ProbabilisticLRStruct:
+        """
+        Fit one gene against a design matrix read elsewhere (see
+        `GenotypeDataset.gene_design`), so cell types sharing a cohort can share one
+        genotype read per gene instead of repeating it.
+        """
+        X, snp_ids, chr, individuals = design
+        y, y_aleatoric, y_epistemic  = dataset.gene_targets(gene, individuals)
+
+        X_test, y_test, y_aleatoric_test, y_epistemic_test = None, None, None, None
+        if test_dataset is not None:
+            try:
+                X_test, y_test, y_aleatoric_test, y_epistemic_test, _, _ = (
+                    test_dataset.get_gene_matrix(gene, return_uncertainty=True)
+                )
+            except ValueError:
                 X_test = np.empty((0, X.shape[1]), dtype=X.dtype)
                 y_test = np.empty(0, dtype=y.dtype)
                 y_aleatoric_test = np.empty(0, dtype=y_aleatoric.dtype)
