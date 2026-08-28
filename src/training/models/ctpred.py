@@ -34,12 +34,19 @@ class CtPredMLP(nn.Module):
         if not 0.0 <= dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
 
-        # input_dim -> hidden_dim, then (n_layers - 1) more hidden_dim -> hidden_dim
-        # blocks, matching the reference `num_layers` semantics, then a final
-        # hidden_dim -> output_dim projection with no activation attached.
+        # input_dim -> hidden_dim, then repeatedly apply one shared
+        # hidden_dim -> hidden_dim block.  The reference implementation creates
+        # `hidden_layer` once and inserts those same module objects at every
+        # hidden position, so its repeated Linear transformations share weights.
+        # Preserve that behavior here for an exact architectural match.
         layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)]
+        hidden_layer = [
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        ]
         for _ in range(n_layers - 1):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)]
+            layers.extend(hidden_layer)
         layers.append(nn.Linear(hidden_dim, output_dim))
         self.net = nn.Sequential(*layers)
 
