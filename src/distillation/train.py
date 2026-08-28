@@ -1,8 +1,10 @@
 from __future__ import annotations
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
+from typing import Optional
 
 import os
 import warnings
@@ -15,8 +17,11 @@ from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from src.distillation.models.lr import LR
+from src.distillation.models.ensemble_lr import (
+    EnsembleGenotypeDataset,
+    EnsembleLR,
+)
 from src.distillation.models.probabilistic_lr import ProbabilisticLR
-from src.distillation.models.reg_lr import RegLR
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.wandb_logger import WandBLogger
 
@@ -41,8 +46,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-y", "--targets",
         type=Path,
-        required=True,
-        help="Path to target directory; should contain a CSV file for each cell-type."
+        default=None,
+        help=(
+            "Path to an ordinary target directory containing one CSV per cell "
+            "type. Mutually exclusive with --ensemble-members-dir."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-members-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Per-member teacher output produced by get_student_data.py. Accepts "
+            "either its output root or the nested members/ directory and expects "
+            "member_<index>/{preds,sigmas}/<cell-type>.csv. Each member is "
+            "distilled independently with heteroskedastic SparseVB. Mutually "
+            "exclusive with --targets."
+        ),
     )
     parser.add_argument(
         "-yt", "--targets-test",
@@ -53,6 +73,15 @@ def parse_args() -> argparse.Namespace:
             "--targets, one CSV per cell-type, disjoint individuals). If provided, models "
             "are trained on *all* individuals in --targets and evaluated on the "
             "individuals found here, instead of the automatic per-gene 80:20 split."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-members-test-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional held-out per-member output root, with the same member IDs "
+            "and layout as --ensemble-members-dir."
         ),
     )
     parser.add_argument(
@@ -151,8 +180,12 @@ def parse_args() -> argparse.Namespace:
         "-nt", "--norm-targets",
         type=str,
         default="log",
-        choices=["log", "percentiles"],
-        help="Normalization method for target labels."
+        choices=["none", "log", "percentiles"],
+        help=(
+            "Normalization for target means. Ensemble sigmas are never "
+            "transformed; use 'log' for member files exported from a "
+            "log-target teacher and 'none' for an untransformed teacher."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -277,73 +310,57 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--uncertainty-mode",
-        type=str,
-        default="heads",
-        choices=["heads", "weights"],
-        help=(
-            "How --aleatoric/--epistemic are consumed. 'heads' (default) distills the "
-            "teacher's uncertainty into two extra regressions per gene alongside the "
-            "mean (ProbabilisticLR). 'weights' instead keeps a single point-estimate "
-            "model and uses the uncertainty to weight the per-individual squared "
-            "error, downweighting individuals the teacher is unsure about, after "
-            "scTWAS's variance-weighted regression; what it saves is an ordinary "
-            "elastic net, directly comparable to the unweighted one."
-        ),
+        "--svb-slab",
+        choices=["gaussian", "laplace"],
+        default="gaussian",
+        help="SparseVB slab distribution for ensemble-member distillation.",
     )
     parser.add_argument(
-        "--weight-power",
+        "--svb-tol",
+        type=float,
+        default=1e-5,
+        help="SparseVB CAVI convergence tolerance.",
+    )
+    parser.add_argument(
+        "--svb-prior-scale",
         type=float,
         default=1.0,
+        help="Scale parameter of the SparseVB slab prior.",
+    )
+    parser.add_argument(
+        "--svb-alpha",
+        type=float,
+        default=None,
         help=(
-            "Exponent tau in the --uncertainty-mode weights loss weight "
-            "w_i = 1/variance_i^tau. 1.0 is scTWAS's exact inverse-variance "
-            "weighting, 0.5 weights by inverse standard deviation (gentler), and "
-            "0.0 disables the weighting entirely, reproducing the plain elastic net "
-            "as an exact ablation baseline."
+            "Optional shared alpha parameter of SparseVB's Beta inclusion "
+            "hyperprior. By default each fit initializes it from Lasso."
         ),
     )
     parser.add_argument(
-        "--weight-aleatoric",
+        "--svb-beta",
         type=float,
-        default=1.0,
+        default=None,
         help=(
-            "Multiplier on the *aleatoric* variance when building the loss weights "
-            "(--uncertainty-mode weights). This is label noise, i.e. exactly what "
-            "scTWAS downweights. Set to 0 to weight by epistemic uncertainty alone."
+            "Optional shared beta parameter of SparseVB's Beta inclusion "
+            "hyperprior. By default each fit initializes it from Lasso."
         ),
     )
     parser.add_argument(
-        "--weight-epistemic",
+        "--sigma-floor",
         type=float,
-        default=1.0,
+        default=1e-4,
         help=(
-            "Multiplier on the *epistemic* variance when building the loss weights "
-            "(--uncertainty-mode weights). Unlike aleatoric noise, epistemic "
-            "uncertainty is a function of the genotype, so weighting hard on it can "
-            "systematically downweight individuals with unusual genotypes, which are "
-            "the ones carrying the signal for rare variants. Set to 0 to weight by "
-            "the teacher's label noise alone."
+            "Floor applied to each teacher member's aleatoric standard "
+            "deviation before whitening."
         ),
     )
     parser.add_argument(
-        "--weight-clip-quantile",
+        "--pip-threshold",
         type=float,
-        default=0.05,
+        default=0.5,
         help=(
-            "Clip the per-individual loss weights to their [q, 1-q] empirical "
-            "quantiles, so a handful of extreme individuals cannot become the only "
-            "ones the fit effectively sees. Use 0 for no clipping."
-        ),
-    )
-    parser.add_argument(
-        "--weight-eps-frac",
-        type=float,
-        default=1e-3,
-        help=(
-            "Floor the teacher variances at this fraction of the gene's median "
-            "nonzero variance before inverting them, so an individual the teacher "
-            "happens to be near-certain about cannot take an unbounded weight."
+            "A SNP is written when at least one member has posterior inclusion "
+            "probability at or above this threshold."
         ),
     )
     return parser.parse_args()
@@ -452,18 +469,7 @@ def prepare_cell_type(
                 y_epistemic=y_epistemic_test,
             )
 
-    model_class, extra = LR, {}
-    if probabilistic and args.uncertainty_mode == "weights":
-        model_class = RegLR
-        extra = dict(
-            weight_power=args.weight_power,
-            weight_lambda_aleatoric=args.weight_aleatoric,
-            weight_lambda_epistemic=args.weight_epistemic,
-            weight_clip_quantile=args.weight_clip_quantile,
-            weight_eps_frac=args.weight_eps_frac,
-        )
-    elif probabilistic:
-        model_class = ProbabilisticLR
+    model_class = ProbabilisticLR if probabilistic else LR
 
     model = model_class(
         model_name=args.model_name,
@@ -474,7 +480,145 @@ def prepare_cell_type(
         seed=args.seed,
         n_jobs=jobs,
         screen=screen_snps,
-        **extra,
+    )
+    return ct_name, dataset, test_dataset, model
+
+
+MEMBER_DIR_PATTERN = re.compile(r"^member_(\d+)$")
+
+
+def discover_ensemble_members(
+    root: Path,
+) -> tuple[list[tuple[str, Path]], list[str]]:
+    """Discover and validate a get_student_data per-member output tree."""
+    root = Path(root)
+    members_root = root / "members" if (root / "members").is_dir() else root
+    discovered = []
+    if members_root.is_dir():
+        for child in members_root.iterdir():
+            match = MEMBER_DIR_PATTERN.fullmatch(child.name)
+            if match and child.is_dir():
+                discovered.append((int(match.group(1)), child))
+    discovered.sort(key=lambda item: item[0])
+    if not discovered:
+        raise ValueError(
+            f"No member_<index> directories found under {members_root}."
+        )
+
+    indices = [index for index, _ in discovered]
+    if indices != list(range(len(indices))):
+        raise ValueError(
+            "Ensemble member indices must start at 0 and be contiguous; found "
+            f"{indices} under {members_root}."
+        )
+
+    reference_files = None
+    members = []
+    for index, member_dir in discovered:
+        preds_dir = member_dir / "preds"
+        sigmas_dir = member_dir / "sigmas"
+        if not preds_dir.is_dir() or not sigmas_dir.is_dir():
+            raise ValueError(
+                f"{member_dir} must contain both preds/ and sigmas/."
+            )
+        pred_files = {path.name for path in preds_dir.glob("*.csv")}
+        sigma_files = {path.name for path in sigmas_dir.glob("*.csv")}
+        if pred_files != sigma_files:
+            raise ValueError(
+                f"Prediction/sigma cell-type files differ for {member_dir.name}."
+            )
+        if reference_files is None:
+            reference_files = pred_files
+        elif pred_files != reference_files:
+            raise ValueError(
+                "All ensemble members must contain the same cell-type CSVs."
+            )
+        members.append((str(index), member_dir))
+
+    if not reference_files:
+        raise ValueError(f"No cell-type CSVs found under {members_root}.")
+    return members, sorted(reference_files)
+
+
+def prepare_ensemble_cell_type(
+    ct_file: str,
+    args: argparse.Namespace,
+    bims: dict,
+    idx2ind: dict,
+    bed_template: str,
+    member_dirs: list[tuple[str, Path]],
+    test_member_dirs: Optional[list[tuple[str, Path]]],
+    screen_snps: int | None,
+    jobs: int,
+):
+    """Build aligned member datasets and one EnsembleLR for a cell type."""
+    ct_name = ct_file[:-4]
+    logging.info(
+        "Processing ensemble cell type %s with %d members.",
+        ct_name,
+        len(member_dirs),
+    )
+
+    member_datasets = []
+    member_ids = []
+    for member_id, member_dir in member_dirs:
+        member_datasets.append(
+            GenotypeDataset(
+                bims=bims,
+                idx2ind=idx2ind,
+                y=member_dir / "preds" / ct_file,
+                y_sigma=member_dir / "sigmas" / ct_file,
+                bim_dir=args.observations,
+                select_genes=args.select_genes,
+                normalize=args.norm_targets,
+                max_individuals=args.max_individuals,
+                bed_template=bed_template,
+                maf_threshold=args.maf_threshold,
+                min_detected_frac=args.min_detected_frac,
+                min_expr_std=args.min_expr_std,
+            )
+        )
+        member_ids.append(member_id)
+    dataset = EnsembleGenotypeDataset(member_datasets, member_ids)
+
+    test_dataset = None
+    if test_member_dirs is not None:
+        test_ids = [member_id for member_id, _ in test_member_dirs]
+        if test_ids != member_ids:
+            raise ValueError(
+                "Training and held-out ensemble member IDs must match exactly."
+            )
+        test_dataset = EnsembleGenotypeDataset(
+            [
+                GenotypeDataset(
+                    bims=bims,
+                    idx2ind=idx2ind,
+                    y=member_dir / "preds" / ct_file,
+                    y_sigma=member_dir / "sigmas" / ct_file,
+                    bim_dir=args.observations,
+                    select_genes=args.select_genes,
+                    normalize=args.norm_targets,
+                    max_individuals=None,
+                    bed_template=bed_template,
+                    maf_threshold=args.maf_threshold,
+                )
+                for _, member_dir in test_member_dirs
+            ],
+            test_ids,
+        )
+
+    model = EnsembleLR(
+        max_iter=args.max_iter,
+        tol=args.svb_tol,
+        slab=args.svb_slab,
+        prior_scale=args.svb_prior_scale,
+        alpha=args.svb_alpha,
+        beta=args.svb_beta,
+        sigma_floor=args.sigma_floor,
+        pip_threshold=args.pip_threshold,
+        seed=args.seed,
+        n_jobs=jobs,
+        screen=screen_snps,
     )
     return ct_name, dataset, test_dataset, model
 
@@ -532,6 +676,66 @@ def main() -> None:
     setup_logging(args.verbose)
     logging.debug("Arguments: %s", args)
 
+    ensemble_mode = args.ensemble_members_dir is not None
+    if ensemble_mode == (args.targets is not None):
+        logging.error(
+            "Provide exactly one of --targets or --ensemble-members-dir."
+        )
+        sys.exit(1)
+    aggregate_uncertainty_args = (
+        args.aleatoric,
+        args.epistemic,
+        args.aleatoric_test,
+        args.epistemic_test,
+    )
+    if ensemble_mode and any(
+        value is not None for value in aggregate_uncertainty_args
+    ):
+        logging.error(
+            "--aleatoric/--epistemic and their test variants are aggregate "
+            "uncertainty targets and cannot be combined with "
+            "--ensemble-members-dir."
+        )
+        sys.exit(1)
+    if ensemble_mode and args.targets_test is not None:
+        logging.error(
+            "Use --ensemble-members-test-dir, not --targets-test, with "
+            "--ensemble-members-dir."
+        )
+        sys.exit(1)
+    if not ensemble_mode and args.ensemble_members_test_dir is not None:
+        logging.error(
+            "--ensemble-members-test-dir requires --ensemble-members-dir."
+        )
+        sys.exit(1)
+    if ensemble_mode and args.norm_targets == "percentiles":
+        logging.error(
+            "Percentile-normalized means have no compatible transformation for "
+            "the member sigmas; use --norm-targets log or none."
+        )
+        sys.exit(1)
+
+    member_dirs = None
+    test_member_dirs = None
+    if ensemble_mode:
+        member_dirs, cell_type_files = discover_ensemble_members(
+            args.ensemble_members_dir
+        )
+        if args.ensemble_members_test_dir is not None:
+            test_member_dirs, test_cell_type_files = discover_ensemble_members(
+                args.ensemble_members_test_dir
+            )
+            if [item[0] for item in member_dirs] != [
+                item[0] for item in test_member_dirs
+            ]:
+                raise ValueError(
+                    "Training and held-out ensemble member IDs differ."
+                )
+            if set(cell_type_files) != set(test_cell_type_files):
+                raise ValueError(
+                    "Training and held-out ensemble cell-type files differ."
+                )
+
     if args.run_name is not None:
         wb_logger = WandBLogger(enabled=True, run_name=args.run_name)
     else:
@@ -580,7 +784,12 @@ def main() -> None:
 
         logging.info(f"Loaded genotype data for '{chrom_name}'.")
 
-    cell_type_files = os.listdir(args.targets)
+    if not ensemble_mode:
+        cell_type_files = [
+            filename
+            for filename in os.listdir(args.targets)
+            if filename.endswith(".csv")
+        ]
     logging.info(f"Found {len(cell_type_files)} cell types!")
 
     if args.cell_types is not None:
@@ -589,7 +798,13 @@ def main() -> None:
         if missing_cell_types:
             logging.error(
                 "Requested cell type(s) not found in '%s': %s. Available cell types: %s",
-                args.targets, missing_cell_types, sorted(available_cell_types.keys()),
+                (
+                    args.ensemble_members_dir
+                    if ensemble_mode
+                    else args.targets
+                ),
+                missing_cell_types,
+                sorted(available_cell_types.keys()),
             )
             sys.exit(1)
         cell_type_files = [available_cell_types[ct] for ct in args.cell_types]
@@ -598,11 +813,20 @@ def main() -> None:
             len(cell_type_files), args.cell_types,
         )
 
-    use_external_test = args.targets_test is not None
+    use_external_test = (
+        args.ensemble_members_test_dir is not None
+        if ensemble_mode
+        else args.targets_test is not None
+    )
     if use_external_test:
         logging.info(
             "Using held-out target directory '%s' for evaluation instead of the "
-            "automatic 80:20 split.", args.targets_test,
+            "automatic 80:20 split.",
+            (
+                args.ensemble_members_test_dir
+                if ensemble_mode
+                else args.targets_test
+            ),
         )
 
     if args.output_dir is not None:
@@ -612,43 +836,44 @@ def main() -> None:
     logging.info("Fitting genes per cell type with %d parallel workers.", jobs)
 
     screen_snps = args.screen_snps if args.screen_snps and args.screen_snps > 0 else None
-    if screen_snps is not None:
+    if screen_snps is not None and ensemble_mode:
+        logging.info(
+            "Screening each cis-window to the %d SNPs with the strongest "
+            "precision-weighted marginal association across ensemble members.",
+            screen_snps,
+        )
+    elif screen_snps is not None:
         logging.info(
             "Screening each cis-window down to its %d SNPs most correlated with the "
             "target (%d-fold inner CV).", screen_snps, args.cv,
         )
     else:
-        logging.info(
-            "SNP screening disabled: fitting against every SNP in each cis-window "
-            "(%d-fold inner CV).", args.cv,
-        )
+        if ensemble_mode:
+            logging.info(
+                "SNP screening disabled: fitting SparseVB against every SNP in "
+                "each cis-window."
+            )
+        else:
+            logging.info(
+                "SNP screening disabled: fitting against every SNP in each "
+                "cis-window (%d-fold inner CV).",
+                args.cv,
+            )
 
     probabilistic = args.aleatoric is not None or args.epistemic is not None
     if probabilistic and (args.aleatoric is None or args.epistemic is None):
         logging.error("--aleatoric and --epistemic must both be provided together.")
         sys.exit(1)
-    if not probabilistic and args.uncertainty_mode == "weights":
-        logging.error(
-            "--uncertainty-mode weights needs the teacher's uncertainty to build the "
-            "loss weights from; pass --aleatoric and --epistemic."
-        )
-        sys.exit(1)
-    weighted = probabilistic and args.uncertainty_mode == "weights"
-    if weighted:
+    if ensemble_mode:
         logging.info(
-            "Uncertainty-weighted distillation enabled: fitting one point-estimate "
-            "elastic-net/ridge per gene whose per-individual squared error is "
-            "weighted by 1/(%.2f*aleatoric + %.2f*epistemic)^%.2f (clipped at the "
-            "[%.3f, %.3f] weight quantiles), after scTWAS's variance-weighted "
-            "regression.",
-            args.weight_aleatoric, args.weight_epistemic, args.weight_power,
-            args.weight_clip_quantile, 1.0 - args.weight_clip_quantile,
+            "Ensemble Bayesian distillation enabled: fitting %d independent "
+            "heteroskedastic SparseVB posteriors per gene (slab=%s, "
+            "sigma_floor=%g), then combining SNP-weight moments as an equal "
+            "mixture.",
+            len(member_dirs),
+            args.svb_slab,
+            args.sigma_floor,
         )
-        if args.weight_power == 0:
-            logging.warning(
-                "--weight-power 0 disables the weighting entirely; this run "
-                "reproduces the plain elastic net (ablation baseline)."
-            )
     elif probabilistic:
         logging.info(
             "Probabilistic distillation enabled: fitting three independent elastic-net/"
@@ -676,17 +901,30 @@ def main() -> None:
     for batch in tqdm(batches, desc="Processing cell types"):
         prepared = []
         for ct_file in batch:
-            job = prepare_cell_type(
-                ct_file,
-                args=args,
-                bims=bims,
-                idx2ind=idx2ind,
-                bed_template=bed_template,
-                probabilistic=probabilistic,
-                use_external_test=use_external_test,
-                screen_snps=screen_snps,
-                jobs=jobs,
-            )
+            if ensemble_mode:
+                job = prepare_ensemble_cell_type(
+                    ct_file,
+                    args=args,
+                    bims=bims,
+                    idx2ind=idx2ind,
+                    bed_template=bed_template,
+                    member_dirs=member_dirs,
+                    test_member_dirs=test_member_dirs,
+                    screen_snps=screen_snps,
+                    jobs=jobs,
+                )
+            else:
+                job = prepare_cell_type(
+                    ct_file,
+                    args=args,
+                    bims=bims,
+                    idx2ind=idx2ind,
+                    bed_template=bed_template,
+                    probabilistic=probabilistic,
+                    use_external_test=use_external_test,
+                    screen_snps=screen_snps,
+                    jobs=jobs,
+                )
             if job is not None:
                 prepared.append(job)
 
@@ -710,8 +948,8 @@ def main() -> None:
                 path = os.path.join(args.output_dir, f"{ct_path}.json")
                 model.save_coefficients(path)
 
-            if weighted:
-                model_label = "Uncertainty-weighted Elastic Net"
+            if ensemble_mode:
+                model_label = "Ensemble spike-and-slab regression"
             elif probabilistic:
                 model_label = "Probabilistic Elastic Net"
             else:

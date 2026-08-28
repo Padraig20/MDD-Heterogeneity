@@ -224,3 +224,5 @@ plots
 *.png
 
 .tmp
+
+src/preprocessing/ablation-variformer/model_weights

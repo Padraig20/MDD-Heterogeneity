@@ -88,6 +88,7 @@ class GenotypeDataset(Dataset):
         maf_threshold: float | None = None,
         y_aleatoric: Path | pd.DataFrame | None = None,
         y_epistemic: Path | pd.DataFrame | None = None,
+        y_sigma: Path | pd.DataFrame | None = None,
         min_detected_frac: float | None = None,
         min_expr_std: float | None = None,
     ):
@@ -99,7 +100,7 @@ class GenotypeDataset(Dataset):
             bim_dir (Path):               Directory containing the BIM files.
             window_size (int):            Size of the genomic window to consider around each TSS.
             select_genes (Path | None):   Path to a file containing a list of genes to select. If None, use all genes.
-            normalize (str):              Normalization method for expression values. Options are "log" or "percentiles".
+            normalize (str):              Normalization method for expression values. Options are "none", "log", or "percentiles".
             max_individuals (int | None):  Maximum number of individuals to use. If None, use all individuals.
             bed_template (str):           Template for the PLINK fileset basename, with a `{chrom}` placeholder.
             maf_threshold (float | None): Minimum minor allele frequency a SNP must have to be kept (e.g. 0.05
@@ -119,6 +120,11 @@ class GenotypeDataset(Dataset):
                                           variance targets, same format as `y_aleatoric` (e.g. the
                                           'epistemic' output of get_student_data.py). Must be provided
                                           together with `y_aleatoric` (both or neither).
+            y_sigma (Path | pd.DataFrame | None): Optional per-(gene, individual)
+                                          teacher standard deviations, in the same wide format as
+                                          `y`. This is used by ensemble-member distillation and is
+                                          intentionally separate from the variance-valued
+                                          `y_aleatoric`/`y_epistemic` inputs.
             min_detected_frac (float | None): Minimum fraction of individuals with nonzero raw expression a gene
                                           must have to be kept (e.g. 0.2 requires >=20% of individuals to have
                                           nonzero expression). Guards against near-all-zero, dropout-dominated
@@ -145,6 +151,7 @@ class GenotypeDataset(Dataset):
         self.maf_threshold = maf_threshold
         self.min_detected_frac = min_detected_frac
         self.min_expr_std = min_expr_std
+        self._y_sigma_source = y_sigma
         if (y_aleatoric is None) != (y_epistemic is None):
             raise ValueError(
                 "y_aleatoric and y_epistemic must be provided together (both or neither)."
@@ -165,6 +172,12 @@ class GenotypeDataset(Dataset):
         # hundred individuals) costs seconds and a multi-million-row frame per cell
         # type, and every consumer would immediately group it back up by gene.
         self._long_format = "individual" in self.y.columns
+        if self._long_format and y_sigma is not None:
+            raise ValueError(
+                "A separate y_sigma table is currently supported only with wide "
+                "gene-by-individual targets. Long targets may carry a 'sigma' "
+                "column directly."
+            )
 
         if not self._long_format:
             metadata_cols   = ["gene", "chrom", "tss"]
@@ -201,6 +214,10 @@ class GenotypeDataset(Dataset):
             self._epistemic   = (
                 None if y_epistemic is None
                 else self._aligned_matrix(y_epistemic, "epistemic", individual_cols)
+            )
+            self._sigma = (
+                None if y_sigma is None
+                else self._aligned_matrix(y_sigma, "sigma", individual_cols)
             )
         else:
             keep_genes = self._genes_passing_expression_filter(self.y, individual_cols=None)
@@ -248,6 +265,8 @@ class GenotypeDataset(Dataset):
             return rankdata(expr, method="average", axis=1) / expr.shape[1]
         elif self.normalize == "log":
             return np.log1p(expr)
+        elif self.normalize == "none":
+            return expr
         raise ValueError(f"Invalid normalization method: {self.normalize}")
 
     def _aligned_matrix(
@@ -331,8 +350,10 @@ class GenotypeDataset(Dataset):
         self._gene_meta: dict[
             str, tuple[str, int, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]
         ] = {}
+        self._gene_sigma: dict[str, np.ndarray] = {}
         if self._long_format:
             self.has_uncertainty = {"aleatoric", "epistemic"}.issubset(self.y.columns)
+            self.has_sigma = "sigma" in self.y.columns
             if "gene" in self.y.columns and len(self.y) > 0:
                 for gene, group in self.y.groupby("gene", sort=False):
                     aleatoric = (
@@ -349,8 +370,11 @@ class GenotypeDataset(Dataset):
                         aleatoric,
                         epistemic,
                     )
+                    if self.has_sigma:
+                        self._gene_sigma[gene] = group["sigma"].to_numpy()
         else:
             self.has_uncertainty = self._aleatoric is not None and self._epistemic is not None
+            self.has_sigma = self._sigma is not None
             chroms = self.y["chrom"].astype(str).to_numpy()
             tss    = self.y["tss"].to_numpy()
             # Every gene shares one individual array (the wide frame's columns), so
@@ -364,6 +388,8 @@ class GenotypeDataset(Dataset):
                     self._aleatoric[i] if self._aleatoric is not None else None,
                     self._epistemic[i] if self._epistemic is not None else None,
                 )
+                if self._sigma is not None:
+                    self._gene_sigma[gene] = self._sigma[i]
 
         # Flat (gene, individual) addressing for the torch Dataset interface.
         self._gene_order   = list(self._gene_meta.keys())
@@ -569,6 +595,7 @@ class GenotypeDataset(Dataset):
             max_individuals=self.max_individuals,
             bed_template=self.bed_template,
             maf_threshold=self.maf_threshold,
+            y_sigma=self._y_sigma_source,
             min_detected_frac=self.min_detected_frac,
             min_expr_std=self.min_expr_std,
         )
@@ -737,6 +764,35 @@ class GenotypeDataset(Dataset):
             return out
 
         return aligned(y), aligned(y_aleatoric), aligned(y_epistemic)
+
+    def gene_sigma(
+        self,
+        gene: str,
+        individuals: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Return a member's row-aligned teacher standard deviations."""
+        if not self.has_sigma or gene not in self._gene_sigma:
+            raise ValueError(
+                "No sigma targets are available for gene "
+                f"{gene!r}; construct the dataset with y_sigma."
+            )
+
+        _, _, row_individuals, _, _, _ = self._gene_meta[gene]
+        sigma = self._gene_sigma[gene]
+        if individuals is None or individuals is row_individuals:
+            return sigma
+
+        positions = self._individual_positions(gene, row_individuals)
+        take = np.fromiter(
+            (positions.get(str(ind), -1) for ind in individuals),
+            dtype=np.int64,
+            count=len(individuals),
+        )
+        missing = take < 0
+        take = np.where(missing, 0, take)
+        out = sigma[take].astype(np.float64, copy=True)
+        out[missing] = np.nan
+        return out
 
     def _individual_positions(self, gene: str, row_individuals: np.ndarray) -> dict:
         """Individual -> row position within a gene's target vectors."""

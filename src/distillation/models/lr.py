@@ -187,7 +187,7 @@ class LR:
         several targets sharing one design matrix (see `ProbabilisticLR`) also share
         its standardization instead of each rebuilding a full copy of it.
 
-        `sample_weight` weights each individual's squared error (see `RegLR`); the
+        `sample_weight` weights each individual's squared error; the
         CV estimators apply it to their inner CV loss as well, so the penalty is
         selected under the same objective it is later used with. Leave it None for
         the ordinary, unweighted fit.
@@ -468,7 +468,7 @@ class LR:
     def _summary_row(self, gene: str, model: LRStruct) -> dict:
         """
         One gene's row of `summarize_models`. Split out so subclasses can add their
-        own columns (see `RegLR`) without re-implementing the sorting/ranking below.
+        own columns without re-implementing the sorting/ranking below.
         """
         return {
             "gene": gene,
