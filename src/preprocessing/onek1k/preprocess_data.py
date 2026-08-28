@@ -31,7 +31,10 @@ applied. Two output flavours are available, selected with
 
     Values are the per-(individual, cell type) mean expression (counts per
     cell), optionally min-max normalized per gene across individuals with
-    --normalize. The `gene` column is the ENSID from the gene-metadata CSV.
+    --normalize. With --percentiles, each individual's column is instead
+    ranked across genes within each cell type (i.e. converted to a
+    percentile expression rank computed separately per individual). The
+    `gene` column is the ENSID from the gene-metadata CSV.
 
   * --aggregate-across-individuals -> target variables. A single CSV with
     rows=cell types and columns=genes. Values are the cell-weighted mean
@@ -46,31 +49,71 @@ applied. Two output flavours are available, selected with
     IDs; X: mean expression, counts per cell). Every donor in the subset is kept
     as a separate row -- no averaging across individuals -- so a heteroscedastic
     / deep-ensemble model trained with the reference features can learn per-gene
-    population variance (the "version a" uncertainty setup). Restricted to the
-    training donor subset by default (same as --aggregate-across-individuals;
-    override with --target-individual / --all-individuals) so the held-out
-    evaluation cohort does not leak into the variance estimate. Gene filters are
-    not applied here; the target stays dense and gene selection happens via the
+    population variance (the "version a" uncertainty setup). All donors are used
+    by default. With --number-individuals, a reproducible donor subset is sampled
+    without replacement after excluding INDIVIDUAL_IDS. Gene filters are not
+    applied here; the target stays dense and gene selection happens via the
     reference feature set at training time.
+
+  * --scpredixcan -> ctPred labels, byte-for-byte equivalent to the reference
+    pipeline. A preset over --aggregate-across-individuals that reproduces
+    `Scripts/ctPred/data_prep.py` of https://github.com/hakyimlab/scPrediXcan:
+    sum counts per (donor, cell type), take the *unweighted* mean over donors,
+    pin the gene axis to the epigenomic feature gene list (--feature-genes)
+    while zero-filling feature genes that the single-cell data never detected,
+    then rank across genes within each cell type and divide by the gene count.
+
+    Crucially, scPrediXcan applies NO gene filters and NO per-(donor, cell type)
+    cell-count threshold, so the preset switches both off. The "125 cells" in
+    the paper is not a filter: it is the smallest number of cells that any one
+    cell type has *pooled across the whole cohort* ("The minimum number of cells
+    per cell type used for ctPred training was 125"), reported alongside a
+    matching 561,372 total reads -- i.e. ~4.5k reads/cell, which only makes
+    sense as a cohort-wide total. The same paragraph notes a minimum of 2 cells
+    for the full Tabula Sapiens dataset, confirming no threshold is enforced.
+    Reading 125 as a per-donor minimum instead (--min-cells 125) discards nearly
+    every pseudo-bulk sample and, because --expr-min-prop counts against *all*
+    donors, then makes the expression filter unsatisfiable for most cell types.
 """
 
 
 # OneK1K obs columns are stable, so they are hardcoded rather than exposed.
 INDIVIDUAL_COL = "donor_id"
-CELL_TYPE_COL = "celltype"
+CELL_TYPE_COL = "cell_type"
 DEFAULT_LAYER = "counts"
 
 REQUIRED_GENE_COLUMNS = ("chrom", "ensid", "tss")
 
-# Default donor subset used for the aggregated target variables (the OneK1K
-# training individuals).
+# Column names accepted by --feature-genes when it points at a delimited file.
+GENE_ID_COLUMNS = ("ensid", "ensembl_gene_id", "gene", "gene_name")
+
+# Evaluation donors. These are excluded only when --number-individuals is used;
+# the default all-donor behavior intentionally ignores this list.
 INDIVIDUAL_IDS = [
-    "1000_1001",
-    "1001_1002",
-    "1002_1003",
-    "1003_1004",
-    "1004_1005",
+    "1001", "1002", "1003", "1004", "1005",
+    "3", "7", "8", "11", "19", "24", "37", "45", "56", "60",
+    "65", "82", "84", "99", "107", "112", "117", "119", "123", "127",
+    "128", "137", "139", "141", "152", "168", "169", "172", "182", "185",
+    "187", "189", "191", "192", "223", "232", "244", "246", "247", "253",
+    "256", "257", "260", "265", "267", "272", "284", "287", "291", "302",
+    "303", "304", "306", "307", "309", "313", "316", "328", "332", "355",
+    "356", "365", "377", "384", "394", "399", "404", "410", "417", "418",
+    "419", "420", "423", "434", "437", "439", "458", "466", "472", "485",
+    "490", "494", "495", "499", "503", "529", "534", "540", "543", "562",
+    "567", "572", "579", "585", "586", "590", "593", "599", "616", "617",
+    "621", "622", "628", "635", "637", "641", "652", "661", "668", "671",
+    "672", "673", "675", "680", "682", "688", "693", "701", "708", "712",
+    "716", "717", "719", "721", "731", "735", "738", "751", "753", "756",
+    "763", "765", "772", "777", "780", "782", "784", "789", "794", "798",
+    "805", "806", "810", "813", "831", "832", "847", "848", "849", "862",
+    "870", "874", "881", "886", "893", "900", "905", "906", "907", "908",
+    "924", "927", "931", "933", "938", "948", "956", "957", "958", "960",
+    "970", "975", "979", "982", "986", "987", "990", "993", "995", "997",
+    "1007", "1012", "1027", "1029", "1031", "1033", "1045", "1047", "1049",
+    "1057", "1064", "1066", "1071", "1073", "1080"
 ]
+
+SEED = 42
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,6 +178,54 @@ def parse_args() -> argparse.Namespace:
             "Gene filters are NOT applied (the target stays dense; gene "
             "selection happens via the reference feature set at training time). "
             "Requires neither --gene-metadata nor --aggregate-across-individuals."
+        ),
+    )
+    parser.add_argument(
+        "--scpredixcan",
+        action="store_true",
+        help=(
+            "Reproduce the scPrediXcan / ctPred label pipeline exactly "
+            "(Scripts/ctPred/data_prep.py). Preset over "
+            "--aggregate-across-individuals that forces --min-cells 0, "
+            "--disable-gene-filters, --keep-empty, --percentiles and "
+            "--donor-aggregation mean-of-sums. Requires --feature-genes, since "
+            "the reference pipeline pins the gene axis to the epigenomic "
+            "feature gene list and zero-fills undetected genes before ranking. "
+            "The resulting CSV is already percentile-encoded, so train.py "
+            "should use --norm-targets none. Cannot be combined with "
+            "--population-h5ad or --normalize."
+        ),
+    )
+    parser.add_argument(
+        "--feature-genes",
+        type=Path,
+        default=None,
+        help=(
+            "Pin the target gene axis to this reference feature gene list "
+            "instead of letting the input h5ad decide it. Accepts a .npy array "
+            "of gene IDs (e.g. the <name>.ensids.npy sibling of a training "
+            "feature set) or a CSV/TSV with one gene ID per line or an "
+            "ensid/ensembl_gene_id/gene/gene_name column. To match scPrediXcan "
+            "exactly, pass its 19,667-gene BioMart protein-coding list "
+            "(data/metadata.csv). Genes measured in the single-cell "
+            "data but absent from the list are dropped; list genes never "
+            "detected in the single-cell data are kept and filled with zero so "
+            "they still occupy a slot in the percentile denominator. Only "
+            "valid with --aggregate-across-individuals (or --scpredixcan)."
+        ),
+    )
+    parser.add_argument(
+        "--donor-aggregation",
+        choices=["cell-weighted", "mean-of-sums"],
+        default="cell-weighted",
+        help=(
+            "How to collapse donors in --aggregate-across-individuals mode. "
+            '"cell-weighted" (default) divides the summed counts by the total '
+            'number of cells, giving mean expression per cell. "mean-of-sums" '
+            "divides by the number of donors instead, matching scPrediXcan's "
+            "unweighted mean over donor columns. The two differ only by a "
+            "gene-independent factor, so they give identical --percentiles "
+            "output and only matter on the raw scale. Ignored with --normalize."
         ),
     )
 
@@ -230,11 +321,14 @@ def parse_args() -> argparse.Namespace:
         "--percentiles",
         action="store_true",
         help=(
-            "With --aggregate-across-individuals, convert the aggregated mean "
-            "expression values to percentile ranks across genes, separately "
-            "for each cell type. Donors are aggregated before ranks are "
-            "computed. Ties receive their average rank. Cannot be combined "
-            "with --normalize."
+            "Convert mean expression values to percentile ranks across genes, "
+            "separately for each cell type. In the default per-individual "
+            "ground-truth output, ranks are computed separately for each "
+            "individual (each individual's column is ranked across genes). "
+            "With --aggregate-across-individuals, donors are aggregated "
+            "before ranks are computed, and ranks are computed per cell type "
+            "across genes. Ties receive their average rank. Cannot be "
+            "combined with --normalize or --population-h5ad."
         ),
     )
 
@@ -244,18 +338,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Donor ID to include in the donor subset. May be passed multiple "
-            "times. Defaults to the OneK1K training individuals. Used with "
-            "--aggregate-across-individuals and --population-h5ad (both restrict "
-            "to this subset by default); ignored for the per-individual "
-            "ground-truth CSVs, which always keep the full cohort."
+            "times. This explicitly overrides the default of using every donor. "
+            "Used with --aggregate-across-individuals and --population-h5ad; "
+            "ignored for the per-individual ground-truth CSVs, which always keep "
+            "the full cohort. Cannot be combined with --number-individuals."
         ),
     )
     parser.add_argument(
-        "--all-individuals",
-        action="store_true",
+        "--number-individuals",
+        type=int,
+        default=None,
         help=(
-            "For --aggregate-across-individuals / --population-h5ad, use every "
-            "donor in the input instead of the default training individuals."
+            "For --aggregate-across-individuals / --population-h5ad, sample "
+            "exactly this many donors without replacement using SEED. Donors in "
+            "INDIVIDUAL_IDS are excluded from the sampling pool. When omitted, "
+            "all input donors are used and INDIVIDUAL_IDS has no effect."
         ),
     )
     parser.add_argument(
@@ -264,7 +361,7 @@ def parse_args() -> argparse.Namespace:
         default="error",
         help=(
             "What to do if requested donors are missing. Default: error. "
-            "Ignored with --all-individuals."
+            "Only applies to --target-individual."
         ),
     )
 
@@ -292,23 +389,99 @@ def parse_args() -> argparse.Namespace:
     if (
         not args.aggregate_across_individuals
         and not args.population_h5ad
+        and not args.scpredixcan
         and args.gene_metadata is None
     ):
         parser.error(
             "--gene-metadata is required for the default per-individual "
             "ground-truth output (omit it only with "
-            "--aggregate-across-individuals or --population-h5ad)."
+            "--aggregate-across-individuals, --population-h5ad or "
+            "--scpredixcan)."
         )
-    if args.all_individuals and args.target_individual is not None:
-        parser.error("--all-individuals cannot be combined with --target-individual.")
-    if args.percentiles and not args.aggregate_across_individuals:
+    if args.number_individuals is not None and args.number_individuals <= 0:
+        parser.error("--number-individuals must be greater than zero.")
+    if args.number_individuals is not None and args.target_individual is not None:
         parser.error(
-            "--percentiles is only available with --aggregate-across-individuals."
+            "--number-individuals cannot be combined with --target-individual."
         )
+    if args.percentiles and args.population_h5ad:
+        parser.error("--percentiles cannot be combined with --population-h5ad.")
     if args.percentiles and args.normalize:
         parser.error("--percentiles cannot be combined with --normalize.")
 
+    if args.scpredixcan:
+        if args.population_h5ad:
+            parser.error(
+                "--scpredixcan cannot be combined with --population-h5ad: "
+                "ctPred labels are a single value per (gene, cell type), so "
+                "the preset implies --aggregate-across-individuals."
+            )
+        if args.normalize:
+            parser.error(
+                "--scpredixcan cannot be combined with --normalize: the "
+                "reference pipeline applies no min-max normalization, only the "
+                "across-genes percentile rank."
+            )
+        if args.feature_genes is None:
+            parser.error(
+                "--scpredixcan requires --feature-genes. The reference "
+                "pipeline decides the gene axis from the epigenomic feature "
+                "file and zero-fills undetected genes before ranking, so "
+                "without it the percentile denominator would be wrong."
+            )
+
+    aggregating = args.aggregate_across_individuals or args.scpredixcan
+    if args.feature_genes is not None and not aggregating:
+        parser.error(
+            "--feature-genes only applies to --aggregate-across-individuals "
+            "(or --scpredixcan)."
+        )
+    if args.donor_aggregation != "cell-weighted":
+        if not aggregating:
+            parser.error(
+                "--donor-aggregation only applies to "
+                "--aggregate-across-individuals (or --scpredixcan)."
+            )
+        if args.normalize:
+            parser.error(
+                "--donor-aggregation cannot be combined with --normalize, "
+                "which always weights donors by their cell count."
+            )
+
     return args
+
+
+def apply_scpredixcan_preset(args: argparse.Namespace) -> None:
+    """Force the exact label-construction settings used by scPrediXcan.
+
+    Mirrors ``Scripts/ctPred/data_prep.py`` from
+    https://github.com/hakyimlab/scPrediXcan, which applies no gene filter and
+    no cell-count threshold: the gene axis comes from the epigenomic feature
+    file, undetected genes are zero-filled rather than dropped, donors are
+    averaged unweighted, and the labels are across-genes percentile ranks.
+    """
+    overrides = {
+        "aggregate_across_individuals": True,
+        "min_cells": 0,
+        "disable_gene_filters": True,
+        "keep_empty": True,
+        "percentiles": True,
+        "donor_aggregation": "mean-of-sums",
+    }
+    changed = {
+        key: (getattr(args, key), value)
+        for key, value in overrides.items()
+        if getattr(args, key) != value
+    }
+    for key, value in overrides.items():
+        setattr(args, key, value)
+
+    logging.info(
+        "--scpredixcan: reproducing the ctPred label pipeline of "
+        "scPrediXcan Scripts/ctPred/data_prep.py"
+    )
+    for key, (old, new) in changed.items():
+        logging.info("  overriding --%s: %r -> %r", key.replace("_", "-"), old, new)
 
 
 def setup_logging(verbosity: int) -> None:
@@ -466,6 +639,62 @@ def load_gene_metadata(path: Path) -> pd.DataFrame:
     return gene_meta
 
 
+def load_feature_genes(path: Path) -> pd.Index:
+    """Load the reference feature gene list that pins the target gene axis.
+
+    Accepts a ``.npy`` array of gene IDs (the ``<name>.ensids.npy`` sibling of a
+    training feature set), or a text file with one gene ID per line, or a
+    CSV/TSV with one of ``GENE_ID_COLUMNS`` as its gene ID column (which covers
+    ``data/metadata.csv``, scPrediXcan's BioMart protein-coding gene list).
+    """
+    logging.info("Reading reference feature gene list from %s", path)
+    if path.suffix == ".npy":
+        genes = pd.Index(np.load(path, allow_pickle=True).astype(str))
+    else:
+        # Take the delimiter from the first line rather than letting pandas
+        # sniff it: on a plain one-ID-per-line list csv.Sniffer picks "0" and
+        # shreds every ENSG accession into fragments.
+        with path.open() as handle:
+            first_line = handle.readline()
+        separator = next((s for s in ("\t", ",") if s in first_line), None)
+
+        if separator is None:
+            lines = [line.strip() for line in path.read_text().splitlines()]
+            lines = [line for line in lines if line]
+            if lines and lines[0].casefold() in GENE_ID_COLUMNS:
+                lines = lines[1:]
+            genes = pd.Index(lines)
+        else:
+            table = pd.read_csv(path, sep=separator)
+            for column in GENE_ID_COLUMNS:
+                if column in table.columns:
+                    genes = pd.Index(table[column])
+                    break
+            else:
+                if table.shape[1] != 1:
+                    raise ValueError(
+                        f"Cannot infer the gene ID column of {path}: expected "
+                        f"one of {list(GENE_ID_COLUMNS)}, or a single-column "
+                        f"file, got columns {table.columns.tolist()}"
+                    )
+                genes = pd.Index(table.iloc[:, 0])
+
+    genes = genes.astype(str)
+    if genes.empty:
+        raise ValueError(f"Reference feature gene list is empty: {path}")
+    if genes.has_duplicates:
+        n_duplicates = int(genes.duplicated().sum())
+        logging.warning(
+            "Reference feature gene list has %d duplicate gene IDs; keeping the "
+            "first occurrence of each",
+            n_duplicates,
+        )
+        genes = genes[~genes.duplicated()]
+
+    logging.info("Pinning the target gene axis to %d reference feature genes", len(genes))
+    return genes
+
+
 def align_gene_metadata_to_var(
     gene_meta: pd.DataFrame,
     var_index: pd.Index,
@@ -569,6 +798,27 @@ def compute_gene_keep_mask(
             keep_by_ct[cell_type] = np.zeros(n_genes, dtype=bool)
             continue
 
+        # The expression filter counts qualifying donors against the *full*
+        # cohort, so once --min-cells leaves fewer usable samples than the
+        # required donor count no gene can qualify and the cell type is silently
+        # emptied. This is the usual cause of a near-total gene loss.
+        if n_valid < n_required:
+            logging.warning(
+                "Cell type %r: only %d donor samples reach --min-cells %d, but "
+                "a gene must pass in >=%g of all %d donors, so NO gene can "
+                "qualify and every gene will be dropped. OneK1K cells are split "
+                "across ~29 cell types, so most (donor, cell type) samples hold "
+                "far fewer than 125 cells. Note that scPrediXcan applies no "
+                "per-donor cell-count threshold at all (its '125 cells' is a "
+                "cohort-wide total per cell type); use --scpredixcan to "
+                "replicate it, or lower --min-cells / --expr-min-prop.",
+                cell_type,
+                n_valid,
+                min_cells,
+                n_required,
+                n_donors_total,
+            )
+
         counts = sums[group_rows, :]
         counts = np.asarray(counts.toarray()) if sp.issparse(counts) else np.asarray(counts)
         counts = counts.astype(np.float64, copy=False)
@@ -626,13 +876,11 @@ def write_population_h5ad(
 
     ``sums`` holds summed counts per (individual, cell type) group and ``obs``
     the matching ``individual_id`` / ``cell_type`` / ``n_cells`` columns. Only
-    the ``selected_individuals`` donors are written (the training donor subset
-    by default) so downstream population-variance estimation does not leak the
-    held-out evaluation cohort. Each row is divided by its cell count so the
-    stored value is mean expression (counts per cell), matching the
-    per-individual ground-truth CSVs and the target consumed by the training
-    datasets. Every selected donor stays a separate row so downstream training
-    can estimate per-gene population variance.
+    the ``selected_individuals`` donors are written. Each row is divided by its
+    cell count so the stored value is mean expression (counts per cell),
+    matching the per-individual ground-truth CSVs and the target consumed by the
+    training datasets. Every selected donor stays a separate row so downstream
+    training can estimate per-gene population variance.
     """
     if output_path.exists() and not overwrite:
         raise FileExistsError(
@@ -743,6 +991,25 @@ def normalize_expression_across_individuals(values: np.ndarray) -> np.ndarray:
     return normalized
 
 
+def rank_genes_per_individual(values: np.ndarray) -> np.ndarray:
+    """Convert expression to percentile ranks across genes, per individual.
+
+    ``values`` is a genes x individuals array. Each individual's column is
+    ranked independently across genes (i.e. the rank axis is genes, not
+    individuals), so the result is comparable to
+    ``rank_genes_within_cell_types`` but transposed: there, each row
+    (cell type) is ranked across its gene columns; here, each column
+    (individual) is ranked across its gene rows. Missing genes remain
+    missing and are excluded from the rank denominator. Ties receive their
+    average rank, yielding finite percentiles in ``(0, 1]``.
+    """
+    return (
+        pd.DataFrame(values)
+        .rank(axis=0, method="average", pct=True)
+        .to_numpy(dtype=np.float32)
+    )
+
+
 def write_ground_truth(
     *,
     sums: sp.csr_matrix | np.ndarray,
@@ -754,6 +1021,7 @@ def write_ground_truth(
     keep_by_ct: dict[str, np.ndarray] | None,
     drop_empty: bool,
     normalize: bool,
+    percentiles: bool,
     overwrite: bool,
 ) -> None:
     all_individuals = sorted(obs["individual_id"].astype(str).unique().tolist())
@@ -781,6 +1049,11 @@ def write_ground_truth(
     )
     if normalize:
         logging.info("Normalizing each gene across individuals to the 0-1 range")
+    if percentiles:
+        logging.info(
+            "Ranking each individual's expression across genes, separately "
+            "for each cell type"
+        )
 
     n_written = 0
     n_skipped = 0
@@ -818,6 +1091,8 @@ def write_ground_truth(
 
         if normalize:
             values = normalize_expression_across_individuals(values)
+        if percentiles:
+            values = rank_genes_per_individual(values)
 
         logging.info(
             "%s (%d/%d donor samples pass QC, %d total columns, "
@@ -901,16 +1176,51 @@ def write_ground_truth(
 
 def select_individuals(
     obs: pd.DataFrame,
-    requested: list[str],
-    all_individuals: bool,
+    requested: list[str] | None,
+    number_individuals: int | None,
     missing_individuals: str,
 ) -> list[str]:
+    """Select all, explicitly requested, or reproducibly sampled donors."""
     available = set(obs["individual_id"].astype(str).unique().tolist())
-    if all_individuals:
+
+    if requested is None and number_individuals is None:
         selected = sorted(available)
         logging.info("Using all %d donors for aggregation", len(selected))
         return selected
 
+    if number_individuals is not None:
+        if number_individuals <= 0:
+            raise ValueError("number_individuals must be greater than zero.")
+
+        excluded_ids = {str(individual_id) for individual_id in INDIVIDUAL_IDS}
+        eligible = sorted(
+            individual
+            for individual in available
+            if individual not in excluded_ids
+            and individual.rsplit("_", maxsplit=1)[-1] not in excluded_ids
+        )
+        if number_individuals > len(eligible):
+            raise ValueError(
+                f"Cannot sample {number_individuals} donors: only {len(eligible)} "
+                f"of {len(available)} input donors remain after excluding "
+                "INDIVIDUAL_IDS."
+            )
+
+        rng = np.random.default_rng(SEED)
+        selected = sorted(
+            rng.choice(eligible, size=number_individuals, replace=False).tolist()
+        )
+        logging.info(
+            "Sampled %d of %d eligible donors for aggregation with seed %d "
+            "(%d input donors excluded by INDIVIDUAL_IDS)",
+            len(selected),
+            len(eligible),
+            SEED,
+            len(available) - len(eligible),
+        )
+        return selected
+
+    assert requested is not None
     missing = [ind for ind in requested if ind not in available]
     if missing:
         msg = (
@@ -943,6 +1253,37 @@ def rank_genes_within_cell_types(target: pd.DataFrame) -> pd.DataFrame:
     return target.rank(axis=1, method="average", pct=True).astype(np.float32)
 
 
+def align_target_to_feature_genes(
+    target: pd.DataFrame,
+    feature_genes: pd.Index,
+) -> pd.DataFrame:
+    """Pin the gene axis of ``target`` to the reference feature gene list.
+
+    Reproduces the left join in scPrediXcan's ``Scripts/ctPred/data_prep.py``:
+    the epigenomic feature file decides the gene axis, genes measured in the
+    single-cell data but absent from it are dropped, and feature genes the
+    single-cell data never detected are filled with zero so that they still
+    occupy a slot in the percentile denominator. Genes that are missing for any
+    other reason (e.g. a cell type with no usable donor sample) keep their NaN.
+    """
+    undetected = feature_genes.difference(target.columns)
+    dropped = target.columns.difference(feature_genes)
+
+    aligned = target.reindex(columns=feature_genes)
+    if len(undetected):
+        aligned.loc[:, undetected] = 0.0
+
+    logging.info(
+        "Aligned the gene axis to %d reference feature genes: dropped %d genes "
+        "absent from the feature list, zero-filled %d feature genes not "
+        "detected in the single-cell data",
+        len(feature_genes),
+        len(dropped),
+        len(undetected),
+    )
+    return aligned.astype(np.float32)
+
+
 def write_target_vars(
     *,
     sums: sp.csr_matrix | np.ndarray,
@@ -956,6 +1297,8 @@ def write_target_vars(
     normalize: bool,
     overwrite: bool,
     percentiles: bool = False,
+    donor_aggregation: str = "cell-weighted",
+    feature_genes: pd.Index | None = None,
 ) -> None:
     if output_path.exists() and not overwrite:
         raise FileExistsError(
@@ -1017,10 +1360,16 @@ def write_target_vars(
                 weighted_sums[has_weight] / weight_sums[has_weight]
             ).astype(np.float32, copy=False)
         else:
-            # Cell-weighted mean: sum counts over donors / total cells.
-            total_cells = float(n_cells.sum())
-            summed = sums[group_rows, :].sum(axis=0)
-            row = row_to_dense(summed) / total_cells
+            summed = row_to_dense(sums[group_rows, :].sum(axis=0))
+            if donor_aggregation == "mean-of-sums":
+                # scPrediXcan: unweighted mean over the donor columns of the
+                # per-donor summed counts. This differs from the cell-weighted
+                # mean only by the gene-independent factor
+                # total_cells / n_donors, so the two agree exactly once ranked.
+                row = summed / float(len(group_rows))
+            else:
+                # Cell-weighted mean: sum counts over donors / total cells.
+                row = summed / float(n_cells.sum())
             row = np.asarray(row, dtype=np.float32).copy()
             row[~keep_genes] = np.nan
 
@@ -1036,6 +1385,11 @@ def write_target_vars(
             n_duplicates,
         )
         target = target.T.groupby(level=0, sort=False).mean().T
+
+    # Pin the gene axis before ranking, so zero-filled genes count towards the
+    # percentile denominator exactly as they do in the reference pipeline.
+    if feature_genes is not None:
+        target = align_target_to_feature_genes(target, feature_genes)
 
     if drop_empty:
         n_ct_before, n_gene_before = target.shape
@@ -1076,6 +1430,8 @@ def write_target_vars(
 def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
+    if args.scpredixcan:
+        apply_scpredixcan_preset(args)
     logging.debug("Arguments: %s", args)
 
     input_path = args.input.expanduser().resolve()
@@ -1092,6 +1448,12 @@ def main() -> None:
         )
         if write_ground_truth_csvs:
             gene_meta = load_gene_metadata(args.gene_metadata)
+
+        feature_genes = (
+            load_feature_genes(args.feature_genes.expanduser().resolve())
+            if args.feature_genes is not None
+            else None
+        )
 
         logging.info("Reading %s", input_path)
         adata = ad.read_h5ad(input_path)
@@ -1138,11 +1500,10 @@ def main() -> None:
             )
 
         if args.population_h5ad:
-            requested = args.target_individual or list(INDIVIDUAL_IDS)
             selected_individuals = select_individuals(
                 obs=obs,
-                requested=requested,
-                all_individuals=args.all_individuals,
+                requested=args.target_individual,
+                number_individuals=args.number_individuals,
                 missing_individuals=args.missing_individuals,
             )
             write_population_h5ad(
@@ -1154,11 +1515,10 @@ def main() -> None:
                 overwrite=args.overwrite,
             )
         elif args.aggregate_across_individuals:
-            requested = args.target_individual or list(INDIVIDUAL_IDS)
             selected_individuals = select_individuals(
                 obs=obs,
-                requested=requested,
-                all_individuals=args.all_individuals,
+                requested=args.target_individual,
+                number_individuals=args.number_individuals,
                 missing_individuals=args.missing_individuals,
             )
             write_target_vars(
@@ -1173,6 +1533,8 @@ def main() -> None:
                 normalize=args.normalize,
                 percentiles=args.percentiles,
                 overwrite=args.overwrite,
+                donor_aggregation=args.donor_aggregation,
+                feature_genes=feature_genes,
             )
         else:
             gene_meta, var_positions = align_gene_metadata_to_var(
@@ -1188,6 +1550,7 @@ def main() -> None:
                 keep_by_ct=keep_by_ct,
                 drop_empty=not args.keep_empty,
                 normalize=args.normalize,
+                percentiles=args.percentiles,
                 overwrite=args.overwrite,
             )
 
