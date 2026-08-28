@@ -87,8 +87,9 @@ class MLPEnsemble(nn.Module):
             for _ in range(n_models)
         ])
         self.dropout_rate = dropout
-        # Scalar post-hoc variance temperature. It is used only for aggregated
-        # eval/inference outputs; joint per-member training remains unchanged.
+        # Scalar post-hoc variance temperature. It is used only for
+        # eval/inference uncertainty outputs; joint per-member training remains
+        # unchanged.
         self.register_buffer("variance_scale", torch.tensor(1.0))
 
     def set_variance_scale(self, scale: float) -> None:
@@ -98,7 +99,15 @@ class MLPEnsemble(nn.Module):
             )
         self.variance_scale.fill_(float(scale))
 
-    def _aggregate_predictions(self, x, apply_variance_scale: bool):
+    def _member_predictions(self, x):
+        """Return stacked mean and variance predictions for every member.
+
+        Both tensors have shape ``(n_models, *x.shape[:-1], output_dim)``.
+        The variances returned here are the raw, uncalibrated variance-head
+        outputs; keeping that representation internal makes it possible to
+        apply the post-hoc variance scale consistently to aggregate and
+        per-member inference results.
+        """
         means = []
         variances = []
         for model in self.models:
@@ -107,25 +116,41 @@ class MLPEnsemble(nn.Module):
             means.append(preds[..., :self.output_dim])
             variances.append(preds[..., self.output_dim:])
 
-        prediction = torch.mean(torch.stack(means), dim=0)
-        aleatoric_unc = torch.mean(torch.stack(variances), dim=0)
+        return torch.stack(means, dim=0), torch.stack(variances, dim=0)
+
+    def _variance_scale_for(self, tensor):
+        return self.variance_scale.to(
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+
+    def _aggregate_member_predictions(
+        self,
+        means,
+        variances,
+        apply_variance_scale: bool,
+    ):
+        prediction = torch.mean(means, dim=0)
+        aleatoric_unc = torch.mean(variances, dim=0)
         epistemic_unc = (
-            torch.mean(
-                torch.stack([mean**2 for mean in means]),
-                dim=0,
-            )
+            torch.mean(means**2, dim=0)
             - prediction**2
         ).clamp_min(0.0)
 
         if apply_variance_scale:
-            scale = self.variance_scale.to(
-                dtype=aleatoric_unc.dtype,
-                device=aleatoric_unc.device,
-            )
+            scale = self._variance_scale_for(aleatoric_unc)
             aleatoric_unc = aleatoric_unc * scale
             epistemic_unc = epistemic_unc * scale
 
         return prediction, aleatoric_unc, epistemic_unc
+
+    def _aggregate_predictions(self, x, apply_variance_scale: bool):
+        means, variances = self._member_predictions(x)
+        return self._aggregate_member_predictions(
+            means,
+            variances,
+            apply_variance_scale=apply_variance_scale,
+        )
 
     def forward_uncalibrated(self, x):
         """Return aggregate predictions before post-hoc variance scaling."""
@@ -163,8 +188,25 @@ class MLPEnsemble(nn.Module):
             error_msgs,
         )
     
-    def forward(self, x):
+    def forward(self, x, return_members: bool = False):
+        """Run the ensemble.
+
+        Training mode retains the original ``(means, variances)`` list output
+        used to optimize the members independently. In evaluation mode the
+        default output remains ``(prediction, aleatoric, epistemic)``.
+
+        When ``return_members=True`` in evaluation mode, two tensors are
+        appended to the default output: ``member_means`` and
+        ``member_sigmas``. They have shape
+        ``(n_models, *x.shape[:-1], output_dim)``. ``member_sigmas`` contains
+        standard deviations (not variances) and includes the fitted post-hoc
+        variance scale.
+        """
         if self.training: # during training, each model gets its own forward pass (for independent gradients)
+            if return_members:
+                raise RuntimeError(
+                    "return_members=True is only supported in evaluation mode."
+                )
             means = []
             vars  = []
             for model in self.models:
@@ -175,10 +217,20 @@ class MLPEnsemble(nn.Module):
             return means, vars
 
         else: # calculate aggregated predictions and calibrated uncertainties
-            return self._aggregate_predictions(
-                x,
+            member_means, member_variances = self._member_predictions(x)
+            aggregate = self._aggregate_member_predictions(
+                member_means,
+                member_variances,
                 apply_variance_scale=True,
             )
+            if not return_members:
+                return aggregate
+
+            member_sigmas = torch.sqrt(
+                member_variances
+                * self._variance_scale_for(member_variances)
+            )
+            return (*aggregate, member_means, member_sigmas)
     
 if __name__ == "__main__":
     # example usage

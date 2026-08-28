@@ -26,13 +26,21 @@ cell-type, which look like this:
 gene (ensid) | chrom | tss | individual 1 | individual 2 | ... | individual N
 
 For the deep ensemble teacher, we additionally obtain aleatoric and epistemic
-uncertainty estimates, so we write three such csv files per cell-type, split
+uncertainty estimates, so we write four such csv files per cell-type, split
 into subdirectories:
 
 output_dir/preds/*.csv       (predicted mean expression)
 output_dir/aleatoric/*.csv   (aleatoric uncertainty / data noise)
 output_dir/epistemic/*.csv   (epistemic uncertainty / model uncertainty)
 output_dir/totvar/*.csv      (total predictive variance: aleatoric + epistemic)
+
+Passing ``--ensemble-output members`` writes each member's mean and standard
+deviation instead:
+
+output_dir/members/member_0/preds/*.csv
+output_dir/members/member_0/sigmas/*.csv
+
+Use ``--ensemble-output both`` to write both layouts.
 """
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -190,6 +198,19 @@ def parse_args() -> argparse.Namespace:
                             "checkpoints and validated when supplied. Legacy "
                             "checkpoints default to 'none'."
                         ))
+    parser.add_argument(
+        "--ensemble-output",
+        choices=["aggregate", "members", "both"],
+        default="aggregate",
+        help=(
+            "Deep-ensemble output to write. 'aggregate' preserves the "
+            "existing preds/aleatoric/epistemic/totvar layout; 'members' "
+            "writes each member's means and calibrated standard deviations "
+            "under members/member_<index>/{preds,sigmas}; 'both' writes both "
+            "layouts. Only valid with --model-name deep-ensemble (or a "
+            "checkpoint that records that model type)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -357,6 +378,15 @@ def main() -> None:
     master_tss    = np.array([k[2] for k in all_keys], dtype=np.int64)
 
     is_ensemble = model_name == "deep-ensemble"
+    if not is_ensemble and args.ensemble_output != "aggregate":
+        raise ValueError(
+            "--ensemble-output members/both requires a deep-ensemble teacher."
+        )
+    write_aggregate = not is_ensemble or args.ensemble_output in {
+        "aggregate",
+        "both",
+    }
+    write_members = is_ensemble and args.ensemble_output in {"members", "both"}
 
     # preallocate gene x person matrices for each cell-type. For the ensemble we
     # keep separate matrices for predictions and the two uncertainty estimates.
@@ -366,10 +396,28 @@ def main() -> None:
             for ct in idx2ct
         }
 
-    ct_to_pred = empty_ct_matrices()
-    ct_to_aleatoric = empty_ct_matrices() if is_ensemble else None
-    ct_to_epistemic = empty_ct_matrices() if is_ensemble else None
-    ct_to_totvar = empty_ct_matrices() if is_ensemble else None
+    ct_to_pred = empty_ct_matrices() if write_aggregate else None
+    ct_to_aleatoric = (
+        empty_ct_matrices() if is_ensemble and write_aggregate else None
+    )
+    ct_to_epistemic = (
+        empty_ct_matrices() if is_ensemble and write_aggregate else None
+    )
+    ct_to_totvar = (
+        empty_ct_matrices() if is_ensemble and write_aggregate else None
+    )
+
+    n_models = len(model.models) if is_ensemble else 0
+    member_ct_to_pred = (
+        [empty_ct_matrices() for _ in range(n_models)]
+        if write_members
+        else None
+    )
+    member_ct_to_sigma = (
+        [empty_ct_matrices() for _ in range(n_models)]
+        if write_members
+        else None
+    )
 
     # now perform inference for each person, place into correct row in each matrix based on key
     for person_idx, person in enumerate(persons):
@@ -383,21 +431,40 @@ def main() -> None:
         n_person_genes = feats.shape[0]
 
         # batched inference
-        preds = np.empty((n_person_genes, len(idx2ct)), dtype=np.float32)
-        if is_ensemble:
+        preds = (
+            np.empty((n_person_genes, len(idx2ct)), dtype=np.float32)
+            if write_aggregate
+            else None
+        )
+        if is_ensemble and write_aggregate:
             aleatoric = np.empty((n_person_genes, len(idx2ct)), dtype=np.float32)
             epistemic = np.empty((n_person_genes, len(idx2ct)), dtype=np.float32)
+        if write_members:
+            member_preds = np.empty(
+                (n_models, n_person_genes, len(idx2ct)),
+                dtype=np.float32,
+            )
+            member_sigmas = np.empty_like(member_preds)
 
         with torch.no_grad():
             for start in tqdm(range(0, n_person_genes, args.batch_size), desc=f"Predicting {person}"):
                 end = min(start + args.batch_size, n_person_genes)
                 x = torch.from_numpy(feats[start:end]).float().to(device)
                 if is_ensemble:
-                    # eval mode returns (prediction, aleatoric_unc, epistemic_unc)
-                    pred, ale, epi = model(x)
-                    preds[start:end]     = pred.detach().cpu().numpy()
-                    aleatoric[start:end] = ale.detach().cpu().numpy()
-                    epistemic[start:end] = epi.detach().cpu().numpy()
+                    outputs = model(x, return_members=write_members)
+                    pred, ale, epi = outputs[:3]
+                    if write_aggregate:
+                        preds[start:end] = pred.detach().cpu().numpy()
+                        aleatoric[start:end] = ale.detach().cpu().numpy()
+                        epistemic[start:end] = epi.detach().cpu().numpy()
+                    if write_members:
+                        member_means, sigmas = outputs[3:]
+                        member_preds[:, start:end] = (
+                            member_means.detach().cpu().numpy()
+                        )
+                        member_sigmas[:, start:end] = (
+                            sigmas.detach().cpu().numpy()
+                        )
                 else:
                     y = model(x)  # (B, num_ct)
                     preds[start:end] = y.detach().cpu().numpy()
@@ -406,22 +473,37 @@ def main() -> None:
         for i, k in enumerate(keys):
             row = key_to_row.get(k)
             for ct_idx, ct in enumerate(idx2ct): # fill all cell-types for this gene and person
-                ct_to_pred[ct][row, person_idx] = preds[i, ct_idx]
-                if is_ensemble:
+                if write_aggregate:
+                    ct_to_pred[ct][row, person_idx] = preds[i, ct_idx]
+                if is_ensemble and write_aggregate:
                     ct_to_aleatoric[ct][row, person_idx] = aleatoric[i, ct_idx]
                     ct_to_epistemic[ct][row, person_idx] = epistemic[i, ct_idx]
                     ct_to_totvar[ct][row, person_idx] = (
                         aleatoric[i, ct_idx] + epistemic[i, ct_idx]
                     )
+                if write_members:
+                    for member_idx in range(n_models):
+                        member_ct_to_pred[member_idx][ct][row, person_idx] = (
+                            member_preds[member_idx, i, ct_idx]
+                        )
+                        member_ct_to_sigma[member_idx][ct][row, person_idx] = (
+                            member_sigmas[member_idx, i, ct_idx]
+                        )
 
     if norm_targets == "log":
         # undo log normalization on the predicted means. The uncertainties are
-        # variances in the (log-)transformed space; expm1 is not a valid inverse
-        # for a variance, so we leave them in the model's output space.
-        ct_to_pred = undo_log(ct_to_pred)
+        # variances/standard deviations in the (log-)transformed space; expm1
+        # is not a valid inverse for either, so leave them in model output space.
+        if write_aggregate:
+            ct_to_pred = undo_log(ct_to_pred)
+        if write_members:
+            member_ct_to_pred = [
+                undo_log(member_matrices)
+                for member_matrices in member_ct_to_pred
+            ]
 
     # now write output CSVs
-    if is_ensemble:
+    if is_ensemble and write_aggregate:
         print(f"Writing ensemble output CSVs to {args.output_dir}...")
         write_csvs(args.output_dir / "preds", ct_to_pred, idx2ct, persons,
                    master_ensids, master_chroms, master_tss)
@@ -431,10 +513,33 @@ def main() -> None:
                    master_ensids, master_chroms, master_tss)
         write_csvs(args.output_dir / "totvar", ct_to_totvar, idx2ct, persons,
                    master_ensids, master_chroms, master_tss)
-    else:
+    elif not is_ensemble:
         print(f"Writing output CSVs to {args.output_dir}...")
         write_csvs(args.output_dir, ct_to_pred, idx2ct, persons,
                    master_ensids, master_chroms, master_tss)
+
+    if write_members:
+        print(f"Writing per-member ensemble output CSVs to {args.output_dir}...")
+        for member_idx in range(n_models):
+            member_dir = args.output_dir / "members" / f"member_{member_idx}"
+            write_csvs(
+                member_dir / "preds",
+                member_ct_to_pred[member_idx],
+                idx2ct,
+                persons,
+                master_ensids,
+                master_chroms,
+                master_tss,
+            )
+            write_csvs(
+                member_dir / "sigmas",
+                member_ct_to_sigma[member_idx],
+                idx2ct,
+                persons,
+                master_ensids,
+                master_chroms,
+                master_tss,
+            )
 
     print("Done!")
 
