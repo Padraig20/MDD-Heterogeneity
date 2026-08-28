@@ -80,7 +80,7 @@ class GenotypeDataset(Dataset):
         idx2ind: dict[np.ndarray],
         y: Path | pd.DataFrame,
         bim_dir: str = "",
-        window_size=1_000_000,
+        window_size=500_000,
         select_genes: Path | None = None,
         normalize: str = "log",
         max_individuals: int | None = None,
