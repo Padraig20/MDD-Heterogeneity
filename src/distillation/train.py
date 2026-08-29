@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
             "Per-member teacher output produced by get_student_data.py. Accepts "
             "either its output root or the nested members/ directory and expects "
             "member_<index>/{preds,sigmas}/<cell-type>.csv. Each member is "
-            "distilled independently with heteroskedastic SparseVB. Mutually "
+            "distilled with bootstrapped, heteroskedastic elastic nets. Mutually "
             "exclusive with --targets."
         ),
     )
@@ -101,7 +101,10 @@ def parse_args() -> argparse.Namespace:
         "-o", "--output-dir",
         type=Path,
         default=None,
-        help="Directory to save the trained models. Creates one JSON file per cell type with non-zero coefficients for each gene."
+        help=(
+            "Directory to save the trained models. Creates one JSON file per "
+            "cell type; ensemble models retain SNPs meeting --pip-threshold."
+        ),
     )
     parser.add_argument(
         "-m", "--model-name",
@@ -139,10 +142,8 @@ def parse_args() -> argparse.Namespace:
         default=5000,
         help=(
             "Before fitting, keep only this many SNPs per cis-window, the ones most "
-            "correlated with the target (computed on training individuals only, so "
-            "held-out metrics stay honest). A window holds tens of thousands of SNPs "
-            "while the fit retains only a few hundred, so screening cuts "
-            "coordinate-descent time several-fold at essentially unchanged accuracy. "
+            "correlated with the target. In ensemble mode, one precision-weighted "
+            "screen is computed per gene and reused for every member and bootstrap. "
             "Use 0 to fit against every SNP in the window."
         ),
     )
@@ -309,39 +310,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--svb-slab",
-        choices=["gaussian", "laplace"],
-        default="gaussian",
-        help="SparseVB slab distribution for ensemble-member distillation.",
-    )
-    parser.add_argument(
-        "--svb-tol",
-        type=float,
-        default=1e-5,
-        help="SparseVB CAVI convergence tolerance.",
-    )
-    parser.add_argument(
-        "--svb-prior-scale",
-        type=float,
-        default=1.0,
-        help="Scale parameter of the SparseVB slab prior.",
-    )
-    parser.add_argument(
-        "--svb-alpha",
-        type=float,
-        default=None,
+        "--ensemble-bootstraps",
+        type=int,
+        default=5,
         help=(
-            "Optional shared alpha parameter of SparseVB's Beta inclusion "
-            "hyperprior. By default each fit initializes it from Lasso."
+            "Number B of cohort bootstraps per teacher member. Ensemble "
+            "distillation performs exactly B times M fixed-penalty elastic-net "
+            "fits per gene after alpha selection."
         ),
     )
     parser.add_argument(
-        "--svb-beta",
+        "--ensemble-alpha-mode",
+        choices=["shared", "member"],
+        default="shared",
+        help=(
+            "How to tune the elastic-net penalty for ensemble distillation. "
+            "'shared' performs one CV search per gene on the ensemble-mean "
+            "target and reuses its alpha for every member/bootstrap; 'member' "
+            "performs one CV search per member."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble-alpha",
         type=float,
         default=None,
         help=(
-            "Optional shared beta parameter of SparseVB's Beta inclusion "
-            "hyperprior. By default each fit initializes it from Lasso."
+            "Optional fixed elastic-net alpha for every member/bootstrap. "
+            "This skips alpha CV entirely and overrides --ensemble-alpha-mode."
         ),
     )
     parser.add_argument(
@@ -350,7 +345,7 @@ def parse_args() -> argparse.Namespace:
         default=1e-4,
         help=(
             "Floor applied to each teacher member's aleatoric standard "
-            "deviation before whitening."
+            "deviation before computing inverse-variance sample weights."
         ),
     )
     parser.add_argument(
@@ -358,8 +353,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help=(
-            "A SNP is written when at least one member has posterior inclusion "
-            "probability at or above this threshold."
+            "A SNP is written when the fraction of member-bootstrap elastic-net "
+            "fits in which its coefficient is non-zero reaches this threshold."
         ),
     )
     return parser.parse_args()
@@ -607,12 +602,13 @@ def prepare_ensemble_cell_type(
         )
 
     model = EnsembleLR(
+        l1_ratio=args.l1_ratio,
+        cv=args.cv,
+        alphas=args.alphas,
         max_iter=args.max_iter,
-        tol=args.svb_tol,
-        slab=args.svb_slab,
-        prior_scale=args.svb_prior_scale,
-        alpha=args.svb_alpha,
-        beta=args.svb_beta,
+        n_bootstraps=args.ensemble_bootstraps,
+        alpha_mode=args.ensemble_alpha_mode,
+        alpha=args.ensemble_alpha,
         sigma_floor=args.sigma_floor,
         pip_threshold=args.pip_threshold,
         seed=args.seed,
@@ -712,6 +708,35 @@ def main() -> None:
             "Percentile-normalized means have no compatible transformation for "
             "the member sigmas; use --norm-targets log or none."
         )
+        sys.exit(1)
+    if ensemble_mode and args.model_name != "elasticnet":
+        logging.error(
+            "Ensemble-member bootstrap distillation requires "
+            "--model-name elasticnet."
+        )
+        sys.exit(1)
+    if ensemble_mode and args.ensemble_bootstraps < 1:
+        logging.error("--ensemble-bootstraps must be at least 1.")
+        sys.exit(1)
+    if ensemble_mode and not 0.0 < args.l1_ratio <= 1.0:
+        logging.error(
+            "Ensemble-member bootstrap distillation requires --l1-ratio in "
+            "(0, 1]; a nonzero L1 component is needed for empirical PIPs."
+        )
+        sys.exit(1)
+    if ensemble_mode and (
+        args.ensemble_alpha is not None
+        and (not np.isfinite(args.ensemble_alpha) or args.ensemble_alpha <= 0.0)
+    ):
+        logging.error("--ensemble-alpha must be finite and positive.")
+        sys.exit(1)
+    if ensemble_mode and (
+        not np.isfinite(args.sigma_floor) or args.sigma_floor <= 0.0
+    ):
+        logging.error("--sigma-floor must be finite and positive.")
+        sys.exit(1)
+    if ensemble_mode and not 0.0 <= args.pip_threshold <= 1.0:
+        logging.error("--pip-threshold must be in [0, 1].")
         sys.exit(1)
 
     member_dirs = None
@@ -849,8 +874,8 @@ def main() -> None:
     else:
         if ensemble_mode:
             logging.info(
-                "SNP screening disabled: fitting SparseVB against every SNP in "
-                "each cis-window."
+                "SNP screening disabled: fitting every bootstrap elastic net "
+                "against every variable SNP in each cis-window."
             )
         else:
             logging.info(
@@ -865,12 +890,14 @@ def main() -> None:
         sys.exit(1)
     if ensemble_mode:
         logging.info(
-            "Ensemble Bayesian distillation enabled: fitting %d independent "
-            "heteroskedastic SparseVB posteriors per gene (slab=%s, "
-            "sigma_floor=%g), then combining SNP-weight moments as an equal "
-            "mixture.",
+            "Frequentist ensemble distillation enabled: %d teacher members x "
+            "%d shared cohort bootstraps = %d elastic-net fits per gene after "
+            "alpha selection (alpha_mode=%s, sigma_floor=%g). SNP screening "
+            "is computed once per gene and reused across all fits.",
             len(member_dirs),
-            args.svb_slab,
+            args.ensemble_bootstraps,
+            len(member_dirs) * args.ensemble_bootstraps,
+            "fixed" if args.ensemble_alpha is not None else args.ensemble_alpha_mode,
             args.sigma_floor,
         )
     elif probabilistic:
@@ -948,7 +975,7 @@ def main() -> None:
                 model.save_coefficients(path)
 
             if ensemble_mode:
-                model_label = "Ensemble spike-and-slab regression"
+                model_label = "Bootstrapped ensemble elastic net"
             elif probabilistic:
                 model_label = "Probabilistic Elastic Net"
             else:
