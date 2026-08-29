@@ -7,12 +7,10 @@ from pathlib import Path
 from typing import Optional
 
 import os
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
-from sklearn.exceptions import ConvergenceWarning
 from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
@@ -23,6 +21,7 @@ from src.distillation.models.ensemble_lr import (
 )
 from src.distillation.models.probabilistic_lr import ProbabilisticLR
 from src.distillation.dataset import GenotypeDataset
+from src.distillation.utils import configure_convergence_warnings
 from src.distillation.wandb_logger import WandBLogger
 
 """
@@ -645,7 +644,7 @@ def fit_batch_sharing_genotypes(jobs: list, n_jobs: int, verbose: bool) -> None:
     genes = list(dict.fromkeys(gene for _, dataset, _, _ in jobs for gene in dataset.genes))
     n     = len(genes)
 
-    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+    configure_convergence_warnings(verbose)
 
     def fit_gene(gene: str, i: int) -> None:
         design = None

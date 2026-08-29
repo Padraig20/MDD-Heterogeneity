@@ -1,10 +1,24 @@
 import random
+import warnings
 import zlib
 
 import numpy as np
 from scipy import stats
+from sklearn.exceptions import ConvergenceWarning
 
 from src.distillation.dataset import GenotypeDataset
+
+
+def configure_convergence_warnings(verbose: bool) -> None:
+    """Hide convergence warnings for quiet runs and expose them for verbose runs.
+
+    The filter is configured before any gene-level threads are started, since
+    Python's warnings filters are process-global rather than thread-local.
+    """
+    warnings.filterwarnings(
+        "default" if verbose else "ignore",
+        category=ConvergenceWarning,
+    )
 
 
 def safe_pearson(a, b) -> float:

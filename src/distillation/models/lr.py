@@ -1,12 +1,10 @@
 import json
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import ElasticNet, ElasticNetCV, Ridge, RidgeCV
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
@@ -15,6 +13,7 @@ from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.utils import (
+    configure_convergence_warnings,
     ld_prune,
     safe_pearson,
     safe_spearman,
@@ -430,9 +429,7 @@ class LR:
         n     = len(genes)
         n_jobs = max(1, int(self.n_jobs))
 
-        # A handful of ill-conditioned cis-windows may still hit max_iter even with
-        # the data-driven alpha path; silence those so the progress bar stays clean.
-        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+        configure_convergence_warnings(verbose)
 
         if n_jobs == 1:
             for i, gene in enumerate(genes, start=1):

@@ -10,14 +10,12 @@ teacher's *aleatoric* variance, and one predicting the teacher's *epistemic* var
 from __future__ import annotations
 
 import json
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.exceptions import ConvergenceWarning
 from sklearn.metrics import r2_score
 from threadpoolctl import threadpool_limits
 from tqdm import tqdm
@@ -25,6 +23,7 @@ from tqdm import tqdm
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.models.lr import LR, fitted_alpha, fitted_l1_ratio
 from src.distillation.utils import (
+    configure_convergence_warnings,
     ld_prune,
     safe_pearson,
     safe_spearman,
@@ -604,9 +603,7 @@ class ProbabilisticLR:
         n      = len(genes)
         n_jobs = max(1, int(self.n_jobs))
 
-        # A handful of ill-conditioned cis-windows may still hit max_iter even with
-        # the data-driven alpha path; silence those so the progress bar stays clean.
-        warnings.filterwarnings("ignore", category=ConvergenceWarning)
+        configure_convergence_warnings(verbose)
 
         if n_jobs == 1:
             for i, gene in enumerate(genes, start=1):

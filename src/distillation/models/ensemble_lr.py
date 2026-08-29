@@ -34,6 +34,7 @@ from tqdm import tqdm
 
 from src.distillation.dataset import GenotypeDataset
 from src.distillation.utils import (
+    configure_convergence_warnings,
     marginal_abs_corr,
     safe_pearson,
     safe_spearman,
@@ -749,6 +750,7 @@ class EnsembleLR:
             raise ValueError("Training and held-out ensemble member IDs differ.")
         genes = list(dataset.genes)
         n = len(genes)
+        configure_convergence_warnings(verbose)
 
         if self.n_jobs == 1:
             for i, gene in enumerate(genes, start=1):
