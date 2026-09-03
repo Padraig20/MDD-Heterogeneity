@@ -54,6 +54,25 @@ class SnpRecord:
     non_effect_allele: str
 
 
+def impute_to_float(values: np.ndarray) -> np.ndarray:
+    """
+    Convert a raw int8 dosage block to float64, replacing the missing sentinel
+    with each variant's mean.
+
+    Mean imputation matches how `GenotypeDataset` treats missing calls when it
+    computes MAF, and keeps a missing call from biasing the covariance.
+    """
+    dosages = values.astype(np.float64)
+    missing = dosages == MISSING_INT8
+    if missing.any():
+        dosages[missing] = np.nan
+        with np.errstate(invalid="ignore"):
+            column_means = np.nanmean(dosages, axis=0)
+        column_means = np.where(np.isfinite(column_means), column_means, 0.0)
+        dosages[missing] = np.take(column_means, np.nonzero(missing)[1])
+    return dosages
+
+
 class Reference:
     """A PLINK cohort restricted to a fixed set of individuals and SNPs."""
 
@@ -65,6 +84,7 @@ class Reference:
         row_index: dict[str, np.ndarray],
         individuals: list[str],
         selection: dict,
+        counts: dict[str, tuple[int, int]],
     ) -> None:
         self.genotype_dir = Path(genotype_dir)
         self.bed_template = bed_template
@@ -72,6 +92,12 @@ class Reference:
         self.row_index = row_index
         self.individuals = individuals
         self.selection = selection
+        # chromosome -> (iid_count, sid_count), taken from the .fam/.bim we
+        # already parsed. Handing these to open_bed is what makes reopening
+        # cheap: without them it counts the .bim's lines every single time,
+        # which on a UKB chromosome costs far more than the read itself.
+        self.counts = counts
+        self._handles: dict[str, object] = {}
 
     @property
     def n_individuals(self) -> int:
@@ -80,28 +106,48 @@ class Reference:
     def bed_path(self, chrom: str) -> Path:
         return self.genotype_dir / f"{self.bed_template.format(chrom=chrom)}.bed"
 
+    def handle(self, chrom: str):
+        """
+        A cached `open_bed` handle for one chromosome.
+
+        Handles are kept open for the lifetime of the reference so a sweep over
+        thousands of genes pays the open cost once per chromosome.
+        """
+        cached = self._handles.get(chrom)
+        if cached is None:
+            from bed_reader import open_bed
+
+            iid_count, sid_count = self.counts[chrom]
+            cached = open_bed(
+                str(self.bed_path(chrom)),
+                iid_count=iid_count,
+                sid_count=sid_count,
+            )
+            self._handles[chrom] = cached
+        return cached
+
+    def read_raw(self, chrom: str, var_indices: np.ndarray) -> np.ndarray:
+        """Raw int8 dosages of the given variants for the selected individuals."""
+        return self.handle(chrom).read(
+            index=np.s_[self.row_index[chrom], var_indices], dtype="int8"
+        )
+
     def read_dosages(self, chrom: str, var_indices: np.ndarray) -> np.ndarray:
-        """
-        Dosages of the given variants for the selected individuals, as float64
-        with the missing sentinel replaced by each variant's mean.
+        """Mean-imputed float64 dosages of the given variants."""
+        return impute_to_float(self.read_raw(chrom, var_indices))
 
-        Mean imputation matches how `GenotypeDataset` treats missing calls when
-        it computes MAF, and keeps a missing call from biasing the covariance.
-        """
-        from bed_reader import open_bed
+    def close(self) -> None:
+        for handle in self._handles.values():
+            close = getattr(handle, "close", None)
+            if close is not None:
+                close()
+        self._handles.clear()
 
-        rows = self.row_index[chrom]
-        with open_bed(str(self.bed_path(chrom))) as bed:
-            values = bed.read(index=np.s_[rows, var_indices], dtype="int8")
+    def __enter__(self) -> "Reference":
+        return self
 
-        dosages = values.astype(np.float64)
-        dosages[dosages == MISSING_INT8] = np.nan
-        missing = np.isnan(dosages)
-        if missing.any():
-            column_means = np.nanmean(dosages, axis=0)
-            column_means = np.where(np.isfinite(column_means), column_means, 0.0)
-            dosages[missing] = np.take(column_means, np.nonzero(missing)[1])
-        return dosages
+    def __exit__(self, *exception) -> None:
+        self.close()
 
 
 def split_contiguous(samples: list[str], split_idx: int, total_splits: int) -> list[str]:
@@ -242,6 +288,7 @@ def build_reference(
 
     snp_index: dict[str, SnpRecord] = {}
     row_index: dict[str, np.ndarray] = {}
+    counts: dict[str, tuple[int, int]] = {}
     individuals: Optional[list[str]] = None
     duplicates = 0
 
@@ -294,6 +341,7 @@ def build_reference(
         row_index[chrom] = np.array(
             [positions[ind] for ind in individuals], dtype=np.int64
         )
+        counts[chrom] = (len(fam_ids), len(bim))
         logging.info(
             "Indexed chromosome %s: %d of %d model SNPs found.",
             chrom, int(keep.sum()), len(wanted_snps),
@@ -325,6 +373,7 @@ def build_reference(
         snp_index=snp_index,
         row_index=row_index,
         individuals=list(individuals),
+        counts=counts,
         selection={
             "genotype_dir": str(genotype_dir),
             "genotype_template": genotype_template,
@@ -352,6 +401,7 @@ __all__ = [
     "apply_individual_split",
     "build_reference",
     "default_genotype_template",
+    "impute_to_float",
     "select_individual_ids",
     "split_contiguous",
 ]

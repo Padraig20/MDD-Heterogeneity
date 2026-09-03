@@ -218,6 +218,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Skip genes whose model has more SNPs than this. Defaults to no limit.",
     )
+    reference.add_argument(
+        "--ld-compression-level",
+        type=int,
+        choices=range(1, 10),
+        default=1,
+        metavar="1..9",
+        help=(
+            "Gzip compression level for newly built LD files. Level 1 is much "
+            "faster and only modestly larger than Python's level-9 default."
+        ),
+    )
 
     output = parser.add_argument_group("output")
     output.add_argument(
@@ -463,6 +474,7 @@ def process_cell_type(
             reference=reference,
             ld_dir=args.ld_dir,
             max_snps_in_gene=args.max_snps_in_gene,
+            compression_level=args.ld_compression_level,
             overwrite=args.rebuild_ld,
         )
     else:

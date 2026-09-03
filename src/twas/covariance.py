@@ -188,6 +188,7 @@ def build_covariance(
     reference: Reference,
     ld_dir: Path,
     max_snps_in_gene: Optional[int] = None,
+    compression_level: int = 1,
     overwrite: bool = False,
     show_progress: bool = True,
 ) -> LdReference:
@@ -231,8 +232,10 @@ def build_covariance(
     tmp_cov = cov_path.with_suffix(cov_path.suffix + ".partial")
     tmp_snp = snp_path.with_suffix(snp_path.suffix + ".partial")
     try:
-        with gzip.open(tmp_cov, "wt", newline="") as cov_out, gzip.open(
-            tmp_snp, "wt", newline=""
+        with gzip.open(
+            tmp_cov, "wt", newline="", compresslevel=compression_level
+        ) as cov_out, gzip.open(
+            tmp_snp, "wt", newline="", compresslevel=compression_level
         ) as snp_out:
             cov_out.write(COV_HEADER)
             snp_out.write(SNP_HEADER)
@@ -301,6 +304,7 @@ def build_covariance(
             "n_monomorphic_snps_dropped": n_constant_snps,
             "n_genes_skipped_too_large": n_skipped_large,
             "max_snps_in_gene": max_snps_in_gene,
+            "compression_level": compression_level,
             "reference": reference.selection,
             "genes": genes_meta,
         }
