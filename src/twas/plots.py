@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 import matplotlib
@@ -9,6 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.ticker import MaxNLocator
 
 from src.twas.aggregate import genomic_inflation
 
@@ -37,16 +39,69 @@ def _chrom_key(chrom: str) -> int:
     return int(text) if text.isdigit() else 99
 
 
+def _find_y_break(
+    y: np.ndarray, floor: float, min_gap_fraction: float = 0.35
+) -> Optional[tuple[float, float]]:
+    """
+    The widest empty band on the y-axis worth breaking, or None.
+
+    A handful of enormous associations (an MHC hit will do it on its own)
+    stretch the axis so far that everything at the significance threshold is
+    squashed into the bottom centimetre. Cutting the empty band out gives that
+    region the room back.
+
+    Only bands above `floor` -- the significance line -- are considered, so the
+    break can never fall through the part of the plot being read. The band also
+    has to be wide enough to be worth the discontinuity, and the points above it
+    few enough to really be a detached tail rather than the top of a dense
+    column that happens to have a hole in it.
+    """
+    finite = y[np.isfinite(y)]
+    values = np.unique(finite[finite > floor])
+    if values.size < 2:
+        return None
+
+    gaps = np.diff(values)
+    index = int(np.argmax(gaps))
+    low, high = float(values[index]), float(values[index + 1])
+    ymax = float(values[-1])
+    if (high - low) < max(min_gap_fraction * ymax, 5.0):
+        return None
+    if int((finite > low).sum()) > max(10, 0.02 * finite.size):
+        return None
+    return low, high
+
+
+def _draw_axis_break(upper: plt.Axes, lower: plt.Axes) -> None:
+    """The slanted tick pair marking the discontinuity on both spines."""
+    upper.spines["bottom"].set_visible(False)
+    lower.spines["top"].set_visible(False)
+    upper.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+    marks = dict(
+        marker=[(-1, -0.5), (1, 0.5)], markersize=9, linestyle="none",
+        color="k", mec="k", mew=1, clip_on=False,
+    )
+    upper.plot([0, 1], [0, 0], transform=upper.transAxes, **marks)
+    lower.plot([0, 1], [1, 1], transform=lower.transAxes, **marks)
+
+
 def manhattan(
     frame: pd.DataFrame,
     positions: dict[str, tuple[str, int]],
     cell_type: str,
     fdr: float = 0.05,
     label_top: int = 10,
+    y_break: Optional[tuple[float, float]] = None,
+    allow_y_break: bool = True,
 ) -> Optional[plt.Figure]:
     """
     Gene-level Manhattan plot, using each gene's cis-window midpoint in the LD
     reference as its x position.
+
+    When a few associations tower over the rest the y-axis is broken so the
+    signals near the significance threshold stay readable. Pass an explicit
+    `(low, high)` as `y_break` to place the cut by hand, or `allow_y_break=False`
+    for a plain continuous axis.
     """
     data = frame.dropna(subset=["pvalue"]).copy()
     data["chrom"] = data["gene"].map(lambda gene: positions.get(gene, (None, None))[0])
@@ -73,39 +128,76 @@ def manhattan(
 
     y = _neg_log10(data["pvalue"].to_numpy(dtype=float))
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    for index, (chrom_key, block) in enumerate(data.groupby("chrom_key", sort=True)):
-        ax.scatter(
-            x[block.index],
-            y[block.index],
-            s=6,
-            alpha=0.7,
-            color="0.30" if index % 2 == 0 else "0.60",
-        )
-
+    lines = []
     threshold = data["bonferroni_threshold"].dropna()
     if not threshold.empty:
-        ax.axhline(
-            -np.log10(float(threshold.iloc[0])),
-            color="firebrick",
-            linestyle="--",
-            linewidth=1,
-            label="Bonferroni (0.05)",
+        lines.append(
+            (-np.log10(float(threshold.iloc[0])), "firebrick", "--", "Bonferroni (0.05)")
         )
     significant = data[data.get("significant_fdr", False) == True]  # noqa: E712
     if not significant.empty:
-        ax.axhline(
+        lines.append((
             float(_neg_log10(significant["pvalue"].to_numpy(dtype=float)).min()),
-            color="steelblue",
-            linestyle=":",
-            linewidth=1,
-            label=f"BH FDR {fdr:g}",
+            "steelblue", ":", f"BH FDR {fdr:g}",
+        ))
+
+    # Keep the break clear of the significance lines, so the cut can never fall
+    # through the band the plot is read in.
+    floor = max([value for value, *_ in lines], default=float(np.nanmedian(y)))
+    if y_break is None and allow_y_break:
+        y_break = _find_y_break(y, floor)
+    elif y_break is not None:
+        hidden = int(((y > y_break[0]) & (y < y_break[1])).sum())
+        if hidden:
+            logging.warning(
+                "The requested y-axis break %s falls across %d gene(s), which "
+                "will not appear in either panel.", y_break, hidden,
+            )
+
+    if y_break is None:
+        fig, lower = plt.subplots(figsize=(12, 5))
+        upper = None
+        axes = [lower]
+    else:
+        # Constrained rather than tight layout: it is the one that knows how to
+        # place `supylabel` across a stack of axes.
+        fig, (upper, lower) = plt.subplots(
+            2, 1, figsize=(12, 5.6), sharex=True,
+            height_ratios=[1, 3], layout="constrained",
         )
+        fig.get_layout_engine().set(hspace=0.02)
+        axes = [upper, lower]
+
+    for ax in axes:
+        for index, (_, block) in enumerate(data.groupby("chrom_key", sort=True)):
+            ax.scatter(
+                x[block.index],
+                y[block.index],
+                s=6,
+                alpha=0.7,
+                color="0.30" if index % 2 == 0 else "0.60",
+            )
+        for value, color, style, label in lines:
+            ax.axhline(value, color=color, linestyle=style, linewidth=1, label=label)
+
+    if y_break is None:
+        lower.set_ylim(bottom=0)
+    else:
+        low, high = y_break
+        # A little air on either side of the cut so no marker sits on a spine.
+        lower.set_ylim(0, low * 1.06)
+        upper.set_ylim(high - 0.06 * (float(np.nanmax(y)) - high + 1.0), float(np.nanmax(y)) * 1.04)
+        upper.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
+        _draw_axis_break(upper, lower)
 
     if label_top:
         top = data.nsmallest(label_top, "pvalue")
         for row_index, row in top.iterrows():
-            ax.annotate(
+            # Annotate on whichever side of the break the gene actually landed.
+            target = (
+                upper if y_break is not None and y[row_index] >= y_break[1] else lower
+            )
+            target.annotate(
                 row.get("gene_name") or row["gene"],
                 (x[row_index], y[row_index]),
                 fontsize=7,
@@ -114,15 +206,21 @@ def manhattan(
                 ha="center",
             )
 
-    ax.set_xticks(ticks)
-    ax.set_xticklabels(tick_labels, fontsize=8)
-    ax.set_xlabel("Chromosome")
-    ax.set_ylabel(r"$-\log_{10}$ p")
-    ax.set_title(f"{cell_type} — S-PrediXcan gene-level association")
-    ax.set_xlim(-cumulative * 0.01, cumulative * 1.01)
-    if ax.get_legend_handles_labels()[0]:
-        ax.legend(loc="upper right", fontsize=8)
-    fig.tight_layout()
+    lower.set_xticks(ticks)
+    lower.set_xticklabels(tick_labels, fontsize=8)
+    lower.set_xlabel("Chromosome")
+    lower.set_xlim(-cumulative * 0.01, cumulative * 1.01)
+
+    title = f"{cell_type} — S-PrediXcan gene-level association"
+    if lower.get_legend_handles_labels()[0]:
+        lower.legend(loc="upper right", fontsize=8)
+    if y_break is None:
+        lower.set_ylabel(r"$-\log_{10}$ p")
+        lower.set_title(title)
+        fig.tight_layout()
+    else:
+        fig.supylabel(r"$-\log_{10}$ p")
+        upper.set_title(title)
     return fig
 
 
