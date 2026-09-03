@@ -12,17 +12,28 @@ from pathlib import Path
 from typing import Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from src.twas import plots
 from src.twas.aggregate import (
+    AGREEMENT_THRESHOLDS,
     aggregate_draws,
+    agreement_strata,
+    agreement_summary,
     annotate_significance,
     draw_spread,
     summarize,
 )
 from src.twas.covariance import build_covariance, load_ld_reference, snp_set_hash
+from src.twas.ld_blocks import (
+    LdBlocks,
+    agreement_block_curve,
+    block_metrics,
+    load_ld_blocks,
+    require_matching_build,
+)
 from src.twas.model_db import load_gene_name_map, write_model_db
 from src.twas.reference import BED_TEMPLATES, build_reference
 from src.twas.sprediXcan import GwasOptions, read_results, run_sprediXcan
@@ -230,6 +241,67 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    ld_blocks = parser.add_argument_group("LD blocks")
+    ld_blocks.add_argument(
+        "--ld-blocks",
+        type=Path,
+        default=None,
+        help=(
+            "BED of approximately independent LD blocks (`chr start stop`), used "
+            "to count how many distinct blocks the significant genes implicate. "
+            "The Berisa-Pickrell definitions live at "
+            "bitbucket.org/nygcresearch/ldetect-data (EUR/fourier_ls-all.bed has "
+            "the 1,703 blocks scPrediXcan reports against)."
+        ),
+    )
+    ld_blocks.add_argument(
+        "--ld-blocks-build",
+        type=str,
+        default=None,
+        choices=["hg19", "hg38", "GRCh37", "GRCh38"],
+        help=(
+            "Genome build of --ld-blocks. The ldetect files are hg19; lift them "
+            "over first if the reference panel is hg38."
+        ),
+    )
+    ld_blocks.add_argument(
+        "--genotype-build",
+        type=str,
+        default=None,
+        choices=["hg19", "hg38", "GRCh37", "GRCh38"],
+        help=(
+            "Genome build of the reference panel's .bim positions, which is what "
+            "genes are placed into blocks with. Required with --ld-blocks. UK "
+            "Biobank imputation v3 is hg19; OneK1K here is hg38."
+        ),
+    )
+    ld_blocks.add_argument(
+        "--ld-blocks-name",
+        type=str,
+        default=None,
+        help="Label for the block set in the outputs, e.g. 'Berisa-Pickrell EUR'.",
+    )
+    ld_blocks.add_argument(
+        "--agreement-criterion",
+        type=str,
+        default="bonferroni",
+        choices=["bonferroni", "fdr"],
+        help=(
+            "Per-draw significance rule counted for MI model agreement. Each draw "
+            "is corrected against its own gene count."
+        ),
+    )
+    ld_blocks.add_argument(
+        "--agreement-thresholds",
+        type=float,
+        nargs="+",
+        default=list(AGREEMENT_THRESHOLDS),
+        help=(
+            "Agreement fractions at which to report gene and LD-block counts. "
+            "0 means 'significant in at least one draw'."
+        ),
+    )
+
     output = parser.add_argument_group("output")
     output.add_argument(
         "-o", "--output-dir",
@@ -426,12 +498,77 @@ def run_draws(
     return results, model_stats
 
 
+def analyse_blocks_and_agreement(
+    final: pd.DataFrame,
+    ld,
+    blocks: Optional[LdBlocks],
+    args: argparse.Namespace,
+    is_mi: bool,
+) -> tuple[pd.DataFrame, dict, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """
+    Count how many independent LD blocks the hits span, and for an MI run how
+    that count survives demanding agreement between the member-bootstrap fits.
+
+    Genes are located by the midpoint of their model's cis window, taken from
+    the covariance metadata, which means the coordinates are the reference
+    panel's -- hence the build check against the block file.
+
+    Either half works alone: without `--ld-blocks` the agreement strata are
+    still produced, just without their block columns.
+    """
+    statistics: dict = {}
+    if blocks is not None:
+        assignment = blocks.assign_frame(ld.gene_positions(), final["gene"].tolist())
+        final = final.merge(assignment, on="gene", how="left")
+        final["block_index"] = final["block_index"].fillna(-1).astype(int)
+
+        statistics = {"ld_blocks": blocks.name, "ld_blocks_build": blocks.build}
+        for criterion in ("bonferroni", "fdr"):
+            column = f"significant_{criterion}"
+            if column in final.columns:
+                statistics.update(
+                    block_metrics(
+                        final,
+                        blocks,
+                        mask=final[column].fillna(False),
+                        prefix=f"{criterion}_",
+                    )
+                )
+
+    curve = strata = None
+    agreement_column = f"agreement_{args.agreement_criterion}"
+    if is_mi and agreement_column in final.columns:
+        # The strata table stands on its own; it only gains its block columns
+        # when a block file was supplied.
+        strata = agreement_strata(final, agreement_column=agreement_column)
+    if blocks is not None and strata is not None:
+        curve = agreement_block_curve(
+            final,
+            blocks,
+            agreement_column=agreement_column,
+            thresholds=args.agreement_thresholds,
+        )
+        at_80 = curve.loc[np.isclose(curve["threshold"], 0.8)]
+        if not at_80.empty:
+            statistics["n_ld_blocks_at_80pct_agreement"] = int(at_80["n_ld_blocks"].iloc[0])
+            statistics["n_genes_at_80pct_agreement"] = int(at_80["n_genes"].iloc[0])
+            statistics["frac_ld_blocks_retained_at_80pct"] = float(
+                at_80["frac_ld_blocks_retained"].iloc[0]
+            )
+            statistics["frac_genes_retained_at_80pct"] = float(
+                at_80["frac_genes_retained"].iloc[0]
+            )
+    return final, statistics, curve, strata
+
+
 def build_figures(
     final: pd.DataFrame,
     long: Optional[pd.DataFrame],
     ld,
     cell_type: str,
     fdr: float,
+    curve: Optional[pd.DataFrame] = None,
+    agreement_column: str = "agreement_bonferroni",
 ) -> dict[str, Optional[plt.Figure]]:
     figures = {
         "manhattan": plots.manhattan(final, ld.gene_positions(), cell_type, fdr=fdr),
@@ -445,6 +582,18 @@ def build_figures(
         figures["mi_draw_summary"] = plots.mi_draw_summary(
             draw_spread(long), cell_type
         )
+        figures["mi_agreement"] = plots.agreement_histogram(
+            final, cell_type, agreement_column=agreement_column
+        )
+        figures["mi_agreement_vs_strength"] = plots.agreement_vs_strength(
+            final, cell_type, agreement_column=agreement_column
+        )
+    if "block_index" in final.columns:
+        figures["ld_block_gene_counts"] = plots.ld_block_gene_counts(final, cell_type)
+    if curve is not None:
+        figures["mi_agreement_ld_blocks"] = plots.agreement_ld_block_curve(
+            curve, cell_type
+        )
     return figures
 
 
@@ -455,6 +604,7 @@ def process_cell_type(
     gene_names: dict[str, str],
     logger: TwasWandBLogger,
     reference=None,
+    blocks: Optional[LdBlocks] = None,
 ) -> dict:
     """Run the full three-step pipeline for one cell type."""
     spec = load_model_json(
@@ -516,11 +666,16 @@ def process_cell_type(
     else:
         final = annotate_significance(next(iter(per_draw.values())), fdr=args.fdr)
 
+    final, block_stats, curve, strata = analyse_blocks_and_agreement(
+        final, ld, blocks, args, is_mi=spec.kind == KIND_MI
+    )
+
     summary = summarize(
         final,
         fdr=args.fdr,
         extra={
             **model_stats,
+            **block_stats,
             "model_source": spec.source,
             "model_kind": spec.kind,
             "standardized_weights_rescaled": spec.standardized,
@@ -528,6 +683,10 @@ def process_cell_type(
             "n_genes_in_ld_reference": ld.meta["n_genes_written"],
         },
     )
+    if spec.kind == KIND_MI:
+        summary.update(
+            agreement_summary(final, agreement_column=f"agreement_{args.agreement_criterion}")
+        )
 
     # Persist everything before touching WandB, so a logging failure cannot lose
     # a run that took hours of S-PrediXcan.
@@ -537,10 +696,18 @@ def process_cell_type(
     if long is not None:
         long.to_csv(cell_dir / "per_draw_zscores.csv", index=False)
         draw_spread(long).to_csv(cell_dir / "draw_spread.csv", index=False)
+    if curve is not None:
+        curve.to_csv(cell_dir / "agreement_ld_block_curve.csv", index=False)
+    if strata is not None and not strata.empty:
+        strata.to_csv(cell_dir / "agreement_strata.csv", index=False)
     with (cell_dir / "summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
 
-    figures = build_figures(final, long, ld, cell_type, args.fdr)
+    figures = build_figures(
+        final, long, ld, cell_type, args.fdr,
+        curve=curve,
+        agreement_column=f"agreement_{args.agreement_criterion}",
+    )
     figure_dir = cell_dir / "figures"
     figure_dir.mkdir(exist_ok=True)
     for name, figure in figures.items():
@@ -550,6 +717,10 @@ def process_cell_type(
     tables = {"top_genes": top}
     if long is not None:
         tables["draw_spread"] = draw_spread(long)
+    if curve is not None:
+        tables["agreement_ld_block_curve"] = curve
+    if strata is not None and not strata.empty:
+        tables["agreement_strata"] = strata
 
     logger.start(cell_type, config=_wandb_config(args, spec))
     try:
@@ -566,6 +737,14 @@ def process_cell_type(
         cell_type, summary["n_genes_tested"], summary["n_significant_fdr"],
         args.fdr, summary["lambda_gc"],
     )
+    if "bonferroni_n_ld_blocks" in summary:
+        logging.info(
+            "Cell type '%s': %d Bonferroni-significant gene(s) from %d different "
+            "LD block(s) among %d pre-defined blocks (%.2f genes per block).",
+            cell_type, summary["n_significant_bonferroni"],
+            summary["bonferroni_n_ld_blocks"], summary["bonferroni_n_ld_blocks_total"],
+            summary["bonferroni_genes_per_ld_block"],
+        )
     return {"cell_type": cell_type, **summary}
 
 
@@ -581,6 +760,10 @@ def _wandb_config(args: argparse.Namespace, spec: ModelSpec) -> dict:
         "num_individuals": args.num_individuals,
         "individual_split": args.individual_split,
         "fdr": args.fdr,
+        "ld_blocks": str(args.ld_blocks) if args.ld_blocks else None,
+        "ld_blocks_build": args.ld_blocks_build,
+        "genotype_build": args.genotype_build,
+        "agreement_criterion": args.agreement_criterion,
     }
 
 
@@ -606,6 +789,17 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as error:
         logging.error("%s", error)
         sys.exit(1)
+
+    blocks = None
+    if args.ld_blocks is not None:
+        try:
+            blocks = load_ld_blocks(
+                args.ld_blocks, build=args.ld_blocks_build, name=args.ld_blocks_name
+            )
+            require_matching_build(blocks, args.genotype_build)
+        except (FileNotFoundError, ValueError) as error:
+            logging.error("%s", error)
+            sys.exit(1)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -640,7 +834,8 @@ def main() -> None:
         try:
             summaries.append(
                 process_cell_type(
-                    model_path, args, gwas, gene_names, logger, reference=reference
+                    model_path, args, gwas, gene_names, logger,
+                    reference=reference, blocks=blocks,
                 )
             )
         except Exception as error:  # noqa: BLE001 - one bad cell type must not kill the sweep

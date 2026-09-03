@@ -27,7 +27,13 @@ and does not absorb that spread, which makes it anti-conservative.
 # The columns S-PrediXcan emits (see `MetaxcanUtilities._results_column_order`).
 GENE_COLUMNS = ["gene", "gene_name"]
 
+# Per-draw columns carried into the tidy `long` frame.
+DRAW_COLUMNS = ["zscore", "pvalue", "effect_size", "n_snps_used", "best_gwas_p"]
+
 Z_CI_MULTIPLIER = 1.959963984540054  # two-sided 95%
+
+# Default cut points for the model-agreement curve.
+AGREEMENT_THRESHOLDS = (0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 1.0)
 
 
 def benjamini_hochberg(pvalues: Sequence[float]) -> np.ndarray:
@@ -102,8 +108,12 @@ def aggregate_draws(
     frames = []
     for draw_id, frame in per_draw.items():
         columns = [c for c in GENE_COLUMNS if c in frame.columns]
-        subset = frame[columns + _present(frame, ["zscore", "effect_size", "n_snps_used"])].copy()
+        subset = frame[columns + _present(frame, DRAW_COLUMNS)].copy()
         subset["draw"] = draw_id
+        if "pvalue" in subset.columns:
+            # Each draw is a complete, independently corrected TWAS, so its own
+            # gene count sets its own multiple-testing burden.
+            subset = annotate_significance(subset, fdr=fdr)
         frames.append(subset)
     long = pd.concat(frames, ignore_index=True)
 
@@ -118,6 +128,15 @@ def aggregate_draws(
         specification["effect_size_mean"] = ("effect_size", "mean")
     if "n_snps_used" in long.columns:
         specification["mean_n_snps_used"] = ("n_snps_used", "mean")
+    if "best_gwas_p" in long.columns:
+        # Identical across draws up to which SNPs each fit kept, so the minimum
+        # is the strength of the GWAS signal available at the locus.
+        specification["best_gwas_p"] = ("best_gwas_p", "min")
+    # How many member-bootstrap fits independently call the gene significant.
+    for criterion in ("bonferroni", "fdr"):
+        column = f"significant_{criterion}"
+        if column in long.columns:
+            specification[f"n_draws_significant_{criterion}"] = (column, "sum")
     aggregated = long.groupby("gene", sort=False).agg(**specification).reset_index()
 
     if "gene_name" in long.columns:
@@ -127,6 +146,21 @@ def aggregate_draws(
     # A single draw has no between-fit spread to report.
     aggregated.loc[aggregated["n_draws"] < 2, "zscore_var"] = np.nan
     aggregated["zscore_sd"] = np.sqrt(aggregated["zscore_var"])
+
+    # Model agreement: the share of fits that call the gene significant on their
+    # own. This is a stability measure independent of E[z] -- a gene can carry a
+    # large mean z-score that only a handful of fits actually support.
+    draw_counts = aggregated["n_draws"].to_numpy(dtype=float)
+    for criterion in ("bonferroni", "fdr"):
+        column = f"n_draws_significant_{criterion}"
+        if column in aggregated.columns:
+            aggregated[column] = aggregated[column].astype(int)
+            aggregated[f"agreement_{criterion}"] = np.divide(
+                aggregated[column].to_numpy(dtype=float),
+                draw_counts,
+                out=np.full(len(aggregated), np.nan),
+                where=draw_counts > 0,
+            )
 
     zscores = aggregated["zscore_mean"].to_numpy(dtype=float)
     aggregated["zscore"] = zscores
@@ -159,13 +193,150 @@ def aggregate_draws(
         "zscore_min",
         "zscore_max",
         "n_draws",
+        "n_draws_significant_bonferroni",
+        "agreement_bonferroni",
+        "n_draws_significant_fdr",
+        "agreement_fdr",
         "mean_n_snps_used",
+        "best_gwas_p",
         "significant_fdr",
         "significant_bonferroni",
         "bonferroni_threshold",
     ]
     aggregated = aggregated[[c for c in ordered if c in aggregated.columns]]
     return aggregated, long
+
+
+def agreement_strata(
+    frame: pd.DataFrame,
+    agreement_column: str = "agreement_bonferroni",
+    edges: Sequence[float] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+) -> pd.DataFrame:
+    """
+    Compare genes by how many member-bootstrap fits agree they are significant.
+
+    Genes are binned on the share of fits calling them significant, and each bin
+    is described by the quantities that plausibly separate a 5-of-25 gene from a
+    20-of-25 one:
+
+    `abs_zscore_*`     how strong the pooled association is,
+    `zscore_sd_*`      how much the association moves between fits,
+    `stability_*`      |E[z]| / sd(z), i.e. signal relative to that movement,
+    `best_gwas_p_*`    the strongest GWAS signal in the gene's cis window,
+    `n_snps_used_*`    how many variants the fits actually put weight on.
+
+    The distinction that matters is between a gene the fits disagree on because
+    the underlying GWAS locus is weak (`best_gwas_p` is unremarkable) and one
+    they disagree on because the elastic net keeps reshuffling which correlated
+    variant carries the weight (`best_gwas_p` is strong but `stability` is low).
+    Only the second is a fine-mapping problem.
+
+    `n_ld_blocks` is filled in when the frame has been annotated with a
+    `block_index` column by `ld_blocks.assign_frame`.
+    """
+    if agreement_column not in frame.columns:
+        raise KeyError(
+            f"{agreement_column} is not present; agreement is only defined for "
+            "multiple-imputation runs (--model-kind mi)."
+        )
+
+    data = frame[frame[agreement_column].notna()].copy()
+    if data.empty:
+        return pd.DataFrame()
+
+    edges = list(edges)
+    labels = [f"({edges[i]:.0%}, {edges[i + 1]:.0%}]" for i in range(len(edges) - 1)]
+    # `include_lowest=False` keeps the zero-agreement genes -- the ones no fit
+    # ever calls significant -- in their own row rather than folded into the
+    # weakest bin.
+    data["agreement_bin"] = pd.cut(
+        data[agreement_column], bins=edges, labels=labels, include_lowest=False
+    )
+    data["agreement_bin"] = data["agreement_bin"].cat.add_categories(["0%"]).fillna("0%")
+    data["agreement_bin"] = data["agreement_bin"].cat.reorder_categories(
+        ["0%"] + labels, ordered=True
+    )
+
+    data["abs_zscore"] = data["zscore"].abs()
+    if "zscore_sd" in data.columns:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            data["stability"] = data["abs_zscore"] / data["zscore_sd"]
+
+    rows = []
+    for label, group in data.groupby("agreement_bin", observed=False, sort=True):
+        row = {
+            "agreement_bin": str(label),
+            "n_genes": int(len(group)),
+            "n_draws_significant_median": _median(group.get(
+                agreement_column.replace("agreement_", "n_draws_significant_")
+            )),
+        }
+        if "block_index" in group.columns:
+            assigned = group.loc[group["block_index"] >= 0, "block_index"]
+            row["n_ld_blocks"] = int(assigned.nunique())
+            row["genes_per_ld_block"] = (
+                len(assigned) / assigned.nunique() if assigned.nunique() else float("nan")
+            )
+        for column, name in (
+            ("abs_zscore", "abs_zscore"),
+            ("zscore_sd", "zscore_sd"),
+            ("stability", "stability"),
+            ("best_gwas_p", "best_gwas_p"),
+            ("mean_n_snps_used", "n_snps_used"),
+            ("n_snps_used", "n_snps_used"),
+        ):
+            if column in group.columns and name + "_median" not in row:
+                row[f"{name}_median"] = _median(group[column])
+                row[f"{name}_mean"] = _mean(group[column])
+        row["frac_significant_pooled"] = (
+            float(group["significant_bonferroni"].mean())
+            if "significant_bonferroni" in group.columns
+            else float("nan")
+        )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def agreement_summary(
+    frame: pd.DataFrame, agreement_column: str = "agreement_bonferroni"
+) -> dict:
+    """Scalar model-agreement statistics over the genes any fit calls significant."""
+    if agreement_column not in frame.columns:
+        return {}
+    agreement = frame[agreement_column]
+    ever = frame[agreement.fillna(0.0) > 0.0]
+    summary = {
+        "n_genes_significant_in_any_draw": int(len(ever)),
+        "n_genes_significant_in_all_draws": int((agreement >= 1.0).sum()),
+        "n_genes_agreement_at_least_80pct": int((agreement >= 0.8).sum()),
+        "n_genes_agreement_at_least_50pct": int((agreement >= 0.5).sum()),
+    }
+    if len(ever):
+        summary["mean_agreement_among_ever_significant"] = float(
+            ever[agreement_column].mean()
+        )
+        summary["median_agreement_among_ever_significant"] = float(
+            ever[agreement_column].median()
+        )
+    return summary
+
+
+def _median(values) -> float:
+    return _reduce(values, "median")
+
+
+def _mean(values) -> float:
+    return _reduce(values, "mean")
+
+
+def _reduce(values, how: str) -> float:
+    """`values.median()`/`.mean()`, but NaN rather than a warning when empty."""
+    if values is None or len(values) == 0:
+        return float("nan")
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty:
+        return float("nan")
+    return float(getattr(numeric, how)())
 
 
 def draw_spread(long: pd.DataFrame) -> pd.DataFrame:
@@ -229,7 +400,10 @@ def _present(frame: pd.DataFrame, columns: Sequence[str]) -> list[str]:
 
 
 __all__ = [
+    "AGREEMENT_THRESHOLDS",
     "aggregate_draws",
+    "agreement_strata",
+    "agreement_summary",
     "annotate_significance",
     "benjamini_hochberg",
     "draw_spread",

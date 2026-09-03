@@ -320,6 +320,200 @@ def mi_draw_summary(spread: pd.DataFrame, cell_type: str) -> Optional[plt.Figure
     return fig
 
 
+def agreement_histogram(
+    frame: pd.DataFrame,
+    cell_type: str,
+    agreement_column: str = "agreement_bonferroni",
+) -> Optional[plt.Figure]:
+    """
+    How many member-bootstrap fits call each gene significant.
+
+    Only genes at least one fit picks up are shown; the overwhelming majority
+    that no fit ever calls significant would flatten everything else. A hit list
+    worth trusting piles up on the right, near unanimity.
+    """
+    if agreement_column not in frame.columns or "n_draws" not in frame.columns:
+        return None
+    counts_column = agreement_column.replace("agreement_", "n_draws_significant_")
+    if counts_column not in frame.columns:
+        return None
+
+    data = frame[frame[agreement_column].fillna(0.0) > 0.0]
+    if data.empty:
+        return None
+
+    counts = data[counts_column].to_numpy(dtype=int)
+    n_draws = int(frame["n_draws"].max())
+    edges = np.arange(0.5, n_draws + 1.5, 1.0)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(counts, bins=edges, color="#3f6fb0", edgecolor="white")
+    for threshold, style in ((0.5, ":"), (0.8, "--")):
+        ax.axvline(
+            threshold * n_draws, color="firebrick", linestyle=style, linewidth=1.2,
+            label=f"{threshold:.0%} agreement",
+        )
+    ax.set_xlabel(f"Member-bootstrap fits calling the gene significant (of {n_draws})")
+    ax.set_ylabel("Genes")
+    criterion = agreement_column.replace("agreement_", "")
+    ax.set_title(f"{cell_type} — MI model agreement ({criterion})")
+    ax.text(
+        0.03, 0.95,
+        f"{len(data):,} gene(s) significant in >=1 fit\n"
+        f"{int((data[agreement_column] >= 0.8).sum()):,} at >=80% agreement\n"
+        f"{int((data[agreement_column] >= 1.0).sum()):,} unanimous",
+        transform=ax.transAxes,
+        va="top",
+    )
+    ax.legend(loc="upper center", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def agreement_vs_strength(
+    frame: pd.DataFrame,
+    cell_type: str,
+    agreement_column: str = "agreement_bonferroni",
+) -> Optional[plt.Figure]:
+    """
+    What separates a gene few fits agree on from one they nearly all agree on.
+
+    Left: pooled association strength against agreement — if the cloud rises
+    steeply, low agreement simply means a weak gene. Right: the strength of the
+    best GWAS variant in the cis window against agreement — if *that* is flat
+    while agreement varies, the disagreement is the model reshuffling weight
+    among correlated variants rather than a weak locus, which is the regime
+    where requiring agreement does real fine-mapping work.
+    """
+    if agreement_column not in frame.columns:
+        return None
+    data = frame[frame[agreement_column].notna()].copy()
+    data = data[data[agreement_column] > 0.0]
+    if data.empty:
+        return None
+
+    agreement = data[agreement_column].to_numpy(dtype=float)
+    absolute_z = np.abs(data["zscore"].to_numpy(dtype=float))
+
+    has_gwas = "best_gwas_p" in data.columns and data["best_gwas_p"].notna().any()
+    fig, axes = plt.subplots(1, 2 if has_gwas else 1, figsize=(12 if has_gwas else 6.5, 5))
+    axes = np.atleast_1d(axes)
+
+    sizes = None
+    if "mean_n_snps_used" in data.columns:
+        snps = data["mean_n_snps_used"].to_numpy(dtype=float)
+        sizes = 8.0 + 40.0 * (snps - np.nanmin(snps)) / max(np.ptp(snps[np.isfinite(snps)]), 1e-9)
+
+    axes[0].scatter(agreement, absolute_z, s=sizes if sizes is not None else 16,
+                    alpha=0.6, color="#3f6fb0", edgecolor="none")
+    axes[0].set_xlabel("Fraction of fits calling the gene significant")
+    axes[0].set_ylabel(r"$|\mathrm{E}[z]|$")
+    axes[0].set_title("Agreement vs pooled association strength")
+    if sizes is not None:
+        axes[0].text(0.03, 0.95, "marker size = mean SNPs used",
+                     transform=axes[0].transAxes, va="top", fontsize=8)
+
+    if has_gwas:
+        gwas = _neg_log10(data["best_gwas_p"].to_numpy(dtype=float))
+        axes[1].scatter(agreement, gwas, s=16, alpha=0.6, color="#b06a3f",
+                        edgecolor="none")
+        axes[1].set_xlabel("Fraction of fits calling the gene significant")
+        axes[1].set_ylabel(r"$-\log_{10}$ best GWAS $p$ in the cis window")
+        axes[1].set_title("Agreement vs strength of the underlying locus")
+
+    fig.suptitle(f"{cell_type} — what drives MI model agreement")
+    fig.tight_layout()
+    return fig
+
+
+def agreement_ld_block_curve(
+    curve: pd.DataFrame, cell_type: str, n_blocks_total: Optional[int] = None
+) -> Optional[plt.Figure]:
+    """
+    The fine-mapping argument in one figure.
+
+    Genes and distinct LD blocks are plotted against how much model agreement is
+    demanded. Genes falling away while the block count holds means the ensemble
+    is pruning redundant genes inside loci rather than losing loci; the
+    genes-per-block trace underneath is that same statement as a single number
+    heading towards 1.
+    """
+    if curve is None or curve.empty:
+        return None
+
+    thresholds = curve["threshold"].to_numpy(dtype=float)
+    fig, (top, bottom) = plt.subplots(
+        2, 1, figsize=(8, 7), sharex=True, height_ratios=[2, 1]
+    )
+
+    top.plot(thresholds, curve["n_genes"], "o-", color="#3f6fb0", label="Significant genes")
+    top.set_ylabel("Genes", color="#3f6fb0")
+    top.tick_params(axis="y", labelcolor="#3f6fb0")
+
+    twin = top.twinx()
+    twin.plot(thresholds, curve["n_ld_blocks"], "s-", color="#b03f3f",
+              label="Distinct LD blocks")
+    twin.set_ylabel("LD blocks", color="#b03f3f")
+    twin.tick_params(axis="y", labelcolor="#b03f3f")
+    twin.set_ylim(bottom=0)
+    top.set_ylim(bottom=0)
+
+    total = n_blocks_total or int(curve["n_ld_blocks_total"].iloc[0])
+    top.set_title(
+        f"{cell_type} — significant genes and LD blocks vs required model agreement\n"
+        f"(out of {total:,} pre-defined LD blocks)"
+    )
+    handles = top.get_legend_handles_labels()[0] + twin.get_legend_handles_labels()[0]
+    labels = top.get_legend_handles_labels()[1] + twin.get_legend_handles_labels()[1]
+    top.legend(handles, labels, loc="upper right", fontsize=8)
+
+    bottom.plot(thresholds, curve["genes_per_ld_block"], "d-", color="0.3")
+    bottom.axhline(1.0, color="grey", linestyle=":", linewidth=1,
+                   label="one gene per block")
+    bottom.set_ylabel("Genes per LD block")
+    bottom.set_xlabel("Required fraction of fits calling the gene significant")
+    bottom.set_ylim(bottom=0)
+    bottom.legend(loc="upper right", fontsize=8)
+
+    fig.tight_layout()
+    return fig
+
+
+def ld_block_gene_counts(
+    frame: pd.DataFrame, cell_type: str, significance_column: str = "significant_bonferroni"
+) -> Optional[plt.Figure]:
+    """
+    How many significant genes each implicated LD block contains.
+
+    A long tail of blocks carrying many genes each is the signature of LD
+    dragging neighbours along; a distribution concentrated at one gene per block
+    is what a fine-mapped result looks like.
+    """
+    if "block_index" not in frame.columns or significance_column not in frame.columns:
+        return None
+    hits = frame[frame[significance_column].fillna(False) & (frame["block_index"] >= 0)]
+    if hits.empty:
+        return None
+
+    counts = hits["block_index"].value_counts().to_numpy(dtype=int)
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(counts, bins=np.arange(0.5, counts.max() + 1.5, 1.0),
+            color="#4f7f5f", edgecolor="white")
+    ax.set_xlabel("Significant genes in the LD block")
+    ax.set_ylabel("LD blocks")
+    ax.set_title(f"{cell_type} — significant genes per implicated LD block")
+    ax.text(
+        0.97, 0.95,
+        f"{counts.size:,} block(s), {counts.sum():,} gene(s)\n"
+        f"{counts.mean():.2f} genes per block",
+        transform=ax.transAxes,
+        va="top",
+        ha="right",
+    )
+    fig.tight_layout()
+    return fig
+
+
 def top_genes(frame: pd.DataFrame, n: int = 25) -> pd.DataFrame:
     """The strongest associations, for logging as a table."""
     columns = [
@@ -327,6 +521,8 @@ def top_genes(frame: pd.DataFrame, n: int = 25) -> pd.DataFrame:
         for c in (
             "gene", "gene_name", "zscore", "pvalue", "qvalue", "effect_size",
             "zscore_sd", "n_snps_used", "mean_n_snps_used", "n_draws",
+            "n_draws_significant_bonferroni", "agreement_bonferroni",
+            "best_gwas_p", "block",
         )
         if c in frame.columns
     ]
@@ -334,6 +530,10 @@ def top_genes(frame: pd.DataFrame, n: int = 25) -> pd.DataFrame:
 
 
 __all__ = [
+    "agreement_histogram",
+    "agreement_ld_block_curve",
+    "agreement_vs_strength",
+    "ld_block_gene_counts",
     "manhattan",
     "mi_draw_spread",
     "mi_draw_summary",
