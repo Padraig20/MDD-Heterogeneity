@@ -349,6 +349,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-aleatoric-weighting",
+        dest="aleatoric_weighting",
+        action="store_false",
+        help=(
+            "Disable inverse-aleatoric-variance weighting in ensemble "
+            "distillation. SNP screening, alpha selection, and elastic-net "
+            "fitting then weight donors equally (apart from bootstrap "
+            "multiplicities)."
+        ),
+    )
+    parser.add_argument(
         "--pip-threshold",
         type=float,
         default=0.5,
@@ -610,6 +621,7 @@ def prepare_ensemble_cell_type(
         alpha_mode=args.ensemble_alpha_mode,
         alpha=args.ensemble_alpha,
         sigma_floor=args.sigma_floor,
+        aleatoric_weighting=args.aleatoric_weighting,
         pip_threshold=args.pip_threshold,
         seed=args.seed,
         n_jobs=jobs,

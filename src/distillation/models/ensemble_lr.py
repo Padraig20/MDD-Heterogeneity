@@ -2,9 +2,9 @@
 
 For every gene, one common SNP screen is shared by all teacher members and all
 bootstrap replicates.  Each member mean is then distilled with an ordinary
-elastic net using inverse aleatoric variance as its sample weight.  Bootstrap
-resampling is represented by integer donor multiplicities in ``sample_weight``;
-the genotype matrix is never physically resampled.
+elastic net, optionally using inverse aleatoric variance as its sample weight.
+Bootstrap resampling is represented by integer donor multiplicities in
+``sample_weight``; the genotype matrix is never physically resampled.
 
 The resulting ``n_members * n_bootstraps`` raw-dosage coefficient vectors form
 an empirical SNP-weight distribution.  Its non-zero frequency is the empirical
@@ -277,6 +277,7 @@ class EnsembleLR:
         alpha_mode: str = "shared",
         alpha: Optional[float] = None,
         sigma_floor: float = 1e-4,
+        aleatoric_weighting: bool = True,
         pip_threshold: float = 0.5,
         zero_tol: float = DEFAULT_ZERO_TOL,
         seed: int = 42,
@@ -312,6 +313,7 @@ class EnsembleLR:
         self.alpha_mode = alpha_mode
         self.alpha = None if alpha is None else float(alpha)
         self.sigma_floor = float(sigma_floor)
+        self.aleatoric_weighting = bool(aleatoric_weighting)
         self.pip_threshold = float(pip_threshold)
         self.zero_tol = float(zero_tol)
         self.seed = int(seed)
@@ -346,10 +348,14 @@ class EnsembleLR:
         X_variable = X[:, keep]
         scores = np.zeros(keep.size, dtype=np.float64)
         for mean, sigma in zip(means, sigmas):
-            precision = np.maximum(sigma, self.sigma_floor) ** -2
+            weights = (
+                np.maximum(sigma, self.sigma_floor) ** -2
+                if self.aleatoric_weighting
+                else None
+            )
             scores = np.maximum(
                 scores,
-                marginal_abs_corr(X_variable, mean, weights=precision),
+                marginal_abs_corr(X_variable, mean, weights=weights),
             )
         top = np.argpartition(-scores, self.screen - 1)[: self.screen]
         return keep[np.sort(top)]
@@ -476,11 +482,15 @@ class EnsembleLR:
         sigma_safe = np.maximum(sigmas, self.sigma_floor)
         if self.alpha_mode == "shared":
             reference_y = means.mean(axis=0)
-            reference_variance = np.mean(sigma_safe**2, axis=0)
+            sample_weight = (
+                np.mean(sigma_safe**2, axis=0) ** -1
+                if self.aleatoric_weighting
+                else np.ones(means.shape[1], dtype=np.float64)
+            )
             alpha = self._cv_alpha(
                 X_scaled,
                 reference_y,
-                reference_variance**-1,
+                sample_weight,
                 base_seed,
             )
             return np.full(n_members, alpha, dtype=np.float64)
@@ -490,7 +500,11 @@ class EnsembleLR:
                 self._cv_alpha(
                     X_scaled,
                     mean,
-                    sigma**-2,
+                    (
+                        sigma**-2
+                        if self.aleatoric_weighting
+                        else np.ones_like(sigma)
+                    ),
                     (base_seed + member_idx + 1) % (2**32),
                 )
                 for member_idx, (mean, sigma) in enumerate(
@@ -531,7 +545,11 @@ class EnsembleLR:
         alphas = self._select_alphas(gene, X_scaled, means, sigmas)
         counts = self._bootstrap_counts(gene, X.shape[0])
         sigma_safe = np.maximum(sigmas, self.sigma_floor)
-        precision = sigma_safe**-2
+        precision = (
+            sigma_safe**-2
+            if self.aleatoric_weighting
+            else np.ones_like(sigma_safe)
+        )
 
         n_members = means.shape[0]
         n_snps = X.shape[1]
@@ -1185,6 +1203,7 @@ class EnsembleLR:
                     "l1_ratio": self.l1_ratio,
                     "alpha_mode": model.alpha_mode_,
                     "sigma_floor": self.sigma_floor,
+                    "aleatoric_weighting": self.aleatoric_weighting,
                     "pip_threshold": self.pip_threshold,
                     "pip_definition": "fraction_nonzero_across_member_bootstrap_fits",
                     "evaluation": model.evaluation_,
