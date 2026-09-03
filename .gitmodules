@@ -1,3 +1,6 @@
 [submodule "variantformer"]
 	path = variantformer
 	url = https://github.com/Padraig20/variantformer.git
+[submodule "metaxcan"]
+	path = metaxcan
+	url = https://github.com/hakyimlab/metaxcan
