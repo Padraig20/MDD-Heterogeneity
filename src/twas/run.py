@@ -8,7 +8,6 @@ import shutil
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -28,18 +27,14 @@ from src.twas.aggregate import (
     summarize,
 )
 from src.twas.compare import (
-    DEFAULT_COVARIANCE_SUFFIX,
-    ID_STYLE_VARID,
-    LctpredModel,
     comparison_metrics,
-    discover_lctpred_models,
+    discover_ctpred_models,
     gene_overlap_report,
     log_overlap_report,
+    log_snp_set_merge,
     match_model,
     matched_pvalues,
-    read_covariance_metadata,
-    read_db_metadata,
-    run_lctpred,
+    merge_snp_sets,
 )
 from src.twas.covariance import build_covariance, load_ld_reference, snp_set_hash
 from src.twas.ld_blocks import (
@@ -76,6 +71,15 @@ For each cell type the pipeline runs the same three steps:
      previously built one from --ld-dir. One covariance serves every draw.
   3. Run S-PrediXcan per draw, then aggregate, plot and log the results.
 
+Comparing against ctPred
+------------------------
+`--ctpred-models-dir` points at a second directory of weights JSONs, distilled
+by the same `src/distillation/train.py` from a ctPred teacher
+(`src/training/models/ctpred.py`). That arm then runs through steps 1 and 3
+unchanged and against the *same* covariance from step 2, so the only difference
+between the two sets of results is the teacher the elastic net was distilled
+from. Outputs are namespaced `this-study/`, `ctPred/` and `comparison/`.
+
 Example
 -------
     python -m src.twas.run \\
@@ -84,7 +88,8 @@ Example
         --snp-column SNP --effect-allele-column A1 --non-effect-allele-column A2 \\
         --beta-column BETA --se-column SE \\
         --genotypes /data/ukb --genotype-template UKB \\
-        --ld-dir ld/ukb --output-dir results/mdd --wandb-project mdd-twas
+        --ld-dir ld/ukb --output-dir results/mdd --wandb-project mdd-twas \\
+        --ctpred-models-dir models/ctpred
 """
 
 DEFAULT_METAXCAN_DIR = Path("metaxcan/software")
@@ -324,40 +329,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    comparison = parser.add_argument_group("l-ctPred comparison")
+    comparison = parser.add_argument_group("ctPred comparison")
     comparison.add_argument(
-        "--lctpred-model-dir",
+        "--ctpred-models-dir",
         type=Path,
         default=None,
         help=(
-            "Directory of scPrediXcan l-ctPred models, holding a <cell type>.db "
-            "beside its <cell type>_covariances.txt.gz. Supplying it runs a second "
-            "S-PrediXcan on the same GWAS with those models and reports the two "
-            "side by side. Omit to skip the comparison entirely."
+            "Directory of weights JSONs distilled from a ctPred teacher, laid out "
+            "exactly like --models-dir. Supplying it runs a second S-PrediXcan on "
+            "the same GWAS through the same covariance and reports the two side by "
+            "side. Omit to skip the comparison entirely."
         ),
     )
     comparison.add_argument(
-        "--lctpred-covariance-suffix",
+        "--ctpred-model-kind",
         type=str,
-        default=DEFAULT_COVARIANCE_SUFFIX,
-        help="Suffix pairing a covariance file with its .db.",
-    )
-    comparison.add_argument(
-        "--lctpred-snp-column",
-        type=str,
-        default=None,
+        default=KIND_AUTO,
+        choices=list(MODEL_KINDS),
         help=(
-            "GWAS column holding the variant ids the l-ctPred DB uses, when it "
-            "differs from --snp-column. Their models are keyed on "
-            "chr1_12345_A_G_b38 style ids rather than rs numbers, so an rs-id "
-            "GWAS needs either this or --lctpred-snp-map-file to match anything."
+            "Draw expansion for the ctPred arm. Distillation forbids "
+            "--norm-targets percentiles in ensemble mode, so a ctPred JSON is "
+            "normally a single point estimate and 'auto' is right."
         ),
-    )
-    comparison.add_argument(
-        "--lctpred-snp-map-file",
-        type=str,
-        default=None,
-        help="S-PrediXcan --snp_map_file translating GWAS ids to l-ctPred model ids.",
     )
 
     output = parser.add_argument_group("output")
@@ -556,6 +549,67 @@ def run_draws(
     return results, model_stats
 
 
+def run_arm(
+    spec: ModelSpec,
+    ld,
+    snp_table,
+    gene_names: dict[str, str],
+    gwas: GwasOptions,
+    args: argparse.Namespace,
+    cell_dir: Path,
+    arm: str,
+) -> tuple[pd.DataFrame, Optional[pd.DataFrame], dict]:
+    """
+    Every draw of one model, reduced to the one result table for that arm.
+
+    Both arms go through this against the same LD reference and the same GWAS,
+    so neither is advantaged by different draw handling: an MI model is pooled
+    across its member-bootstrap fits, anything else is the single draw it has,
+    and both come out corrected the same way.
+    """
+    # The scratch dir lives under the output dir rather than /tmp: an MI sweep
+    # writes one model DB per draw, which for a full transcriptome adds up to
+    # more than a small /tmp can take.
+    work_dir = (
+        cell_dir / arm / "draws"
+        if args.keep_intermediate
+        else Path(tempfile.mkdtemp(prefix="draws_", dir=cell_dir))
+    )
+    try:
+        per_draw, model_stats = run_draws(
+            spec=spec,
+            ld=ld,
+            snp_table=snp_table,
+            gene_names=gene_names,
+            gwas=gwas,
+            metaxcan_dir=args.metaxcan_dir,
+            work_dir=work_dir,
+            jobs=args.jobs,
+        )
+    finally:
+        if not args.keep_intermediate and work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    long = None
+    if spec.kind == KIND_MI:
+        final, long = aggregate_draws(per_draw, fdr=args.fdr)
+    else:
+        final = annotate_significance(next(iter(per_draw.values())), fdr=args.fdr)
+
+    model_stats.update({
+        "model_path": str(spec.path),
+        "model_source": spec.source,
+        "model_kind": spec.kind,
+        "n_genes_in_model": len(spec.snp_sets),
+        # ctPred is distilled against a percentile target and ours usually
+        # against a log one, but that is a per-gene rescale of the weights and
+        # cancels out of the z-score. The standardized-design correction below
+        # is per-SNP and does not, so it is recorded per arm.
+        "standardized_weights_rescaled": spec.standardized,
+    })
+    return final, long, model_stats
+
+
 def _prefix(mapping: dict, arm: str) -> dict:
     """Namespace one arm's keys, which is what groups them in WandB."""
     return {f"{arm}/{key}": value for key, value in mapping.items()}
@@ -574,10 +628,10 @@ def analyse_arm(
     """
     The full single-model analysis, run identically for either arm.
 
-    Both this study's models and l-ctPred's go through the same significance
-    correction, the same LD-block counting and the same figures, so the two
-    sides of the comparison are never advantaged by different post-processing.
-    Everything comes back namespaced under `arm`.
+    Both this study's models and the ctPred ones go through the same
+    significance correction, the same LD-block counting and the same figures,
+    so neither side of the comparison is advantaged by different
+    post-processing. Everything comes back namespaced under `arm`.
     """
     if annotate:
         frame = annotate_significance(frame, fdr=fdr)
@@ -610,72 +664,6 @@ def analyse_arm(
 
     tables = {"results": frame, "top_genes": plots.top_genes(frame, n=top_n)}
     return frame, _prefix(statistics, arm), _prefix(figures, arm), _prefix(tables, arm)
-
-
-def compare_to_lctpred(
-    model: LctpredModel,
-    args: argparse.Namespace,
-    gwas: GwasOptions,
-    blocks: Optional[LdBlocks],
-    cell_dir: Path,
-) -> tuple[pd.DataFrame, object, object]:
-    """
-    Run S-PrediXcan against one l-ctPred model, returning its results and the
-    metadata read off its DB.
-
-    Their DB is used exactly as shipped, with their covariance, so the only
-    thing that differs between the two arms is the prediction model itself.
-    """
-    logging.info(
-        "Comparing '%s' against the l-ctPred model %s.", cell_dir.name, model.db_path.name
-    )
-    metadata = read_db_metadata(model.db_path)
-    covariance_metadata = read_covariance_metadata(model.covariance_path)
-    model_covariance_overlap = len(metadata.genes & covariance_metadata.genes)
-    if model_covariance_overlap < metadata.n_genes:
-        logging.warning(
-            "The l-ctPred DB contains %d genes but its covariance contains %d; "
-            "only %d occur in both. Genes absent from the covariance cannot be "
-            "tested, regardless of the GWAS.",
-            metadata.n_genes,
-            covariance_metadata.n_genes,
-            model_covariance_overlap,
-        )
-
-    if blocks is not None and metadata.build and metadata.build != blocks.build:
-        # Their coordinates come from the varIDs, so a build clash here is just
-        # as fatal to the block count as it is on our own side.
-        raise ValueError(
-            f"The l-ctPred model {model.db_path.name} is on {metadata.build} but the "
-            f"LD blocks are {blocks.build}; its LD-block count would be meaningless."
-        )
-
-    # Their models live in a different identifier space, so the GWAS may have to
-    # be read through a different column or mapping for this arm. MetaXcan also
-    # discards any variant whose id does not start with 'rs' unless told not to,
-    # which would throw away every varID before it ever reached the model.
-    their_gwas = replace(
-        gwas,
-        snp_column=args.lctpred_snp_column or gwas.snp_column,
-        snp_map_file=args.lctpred_snp_map_file or gwas.snp_map_file,
-        keep_non_rsid=gwas.keep_non_rsid or metadata.id_style == ID_STYLE_VARID,
-    )
-
-    comparison_dir = cell_dir / ARM_CTPRED
-    comparison_dir.mkdir(parents=True, exist_ok=True)
-    theirs = run_lctpred(
-        model=model,
-        gwas=their_gwas,
-        metaxcan_dir=args.metaxcan_dir,
-        output_path=comparison_dir / "results.csv",
-        fdr=args.fdr,
-        metadata=metadata,
-    )
-    if "gene_name" not in theirs.columns or theirs["gene_name"].isna().all():
-        theirs["gene_name"] = (
-            theirs["gene"].astype(str).str.split(".").str[0].map(metadata.gene_names)
-        )
-    return theirs, metadata, covariance_metadata
 
 
 def analyse_agreement(
@@ -753,7 +741,7 @@ def process_cell_type(
     logger: TwasWandBLogger,
     reference=None,
     blocks: Optional[LdBlocks] = None,
-    lctpred: Optional[LctpredModel] = None,
+    ctpred_path: Optional[Path] = None,
 ) -> dict:
     """Run the full three-step pipeline for one cell type."""
     spec = load_model_json(
@@ -765,11 +753,33 @@ def process_cell_type(
         cell_type, spec.source, spec.kind, len(spec.snp_sets), len(spec.draws),
     )
 
-    # Step 2: the LD reference, shared by every draw of this cell type.
+    ctpred_spec = None
+    if ctpred_path is not None:
+        ctpred_spec = load_model_json(
+            ctpred_path,
+            kind=args.ctpred_model_kind,
+            mi_draws=args.mi_draws,
+            seed=args.sample_seed,
+        )
+        logging.info(
+            "Cell type '%s' [ctPred]: %s model, kind=%s, %d gene(s), %d draw(s).",
+            cell_type, ctpred_spec.source, ctpred_spec.kind,
+            len(ctpred_spec.snp_sets), len(ctpred_spec.draws),
+        )
+
+    # Step 2: one LD reference, shared by every draw of both arms. Distilling
+    # ctPred on the same genotypes is what buys that, and it is the point of
+    # training it here rather than importing a foreign one: with the covariance
+    # held fixed the two arms differ only in their teacher.
+    snp_sets = spec.snp_sets
+    if ctpred_spec is not None:
+        snp_sets = merge_snp_sets(spec.snp_sets, ctpred_spec.snp_sets)
+        log_snp_set_merge(spec.snp_sets, ctpred_spec.snp_sets, snp_sets)
+
     if reference is not None:
         ld = build_covariance(
             cell_type=cell_type,
-            snp_sets=spec.snp_sets,
+            snp_sets=snp_sets,
             reference=reference,
             ld_dir=args.ld_dir,
             max_snps_in_gene=args.max_snps_in_gene,
@@ -778,51 +788,30 @@ def process_cell_type(
         )
     else:
         ld = load_ld_reference(
-            args.ld_dir, cell_type, expected_hash=snp_set_hash(spec.snp_sets)
+            args.ld_dir, cell_type, expected_hash=snp_set_hash(snp_sets)
         )
         logging.info("Using the pre-built LD reference at %s.", ld.cov_path)
     snp_table = ld.load_snp_table()
+    positions = ld.gene_positions()
 
     # Step 1 + 3: one model DB and one S-PrediXcan run per draw.
     cell_dir = Path(args.output_dir) / cell_type
     cell_dir.mkdir(parents=True, exist_ok=True)
-    # The scratch dir lives under the output dir rather than /tmp: an MI sweep
-    # writes one model DB per draw, which for a full transcriptome adds up to
-    # more than a small /tmp can take.
-    work_dir = (
-        cell_dir / "draws"
-        if args.keep_intermediate
-        else Path(tempfile.mkdtemp(prefix="draws_", dir=cell_dir))
+    final, long, model_stats = run_arm(
+        spec, ld, snp_table, gene_names, gwas, args, cell_dir, arm=ARM_OURS
     )
-    try:
-        per_draw, model_stats = run_draws(
-            spec=spec,
-            ld=ld,
-            snp_table=snp_table,
-            gene_names=gene_names,
-            gwas=gwas,
-            metaxcan_dir=args.metaxcan_dir,
-            work_dir=work_dir,
-            jobs=args.jobs,
-        )
-    finally:
-        if not args.keep_intermediate and work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
-
-    long = None
-    if spec.kind == KIND_MI:
-        final, long = aggregate_draws(per_draw, fdr=args.fdr)
-    else:
-        final = annotate_significance(next(iter(per_draw.values())), fdr=args.fdr)
+    # An MI model's per-draw z-scores, kept per arm so neither is thrown away.
+    per_draw_zscores: dict[str, pd.DataFrame] = {}
+    if long is not None:
+        per_draw_zscores[ARM_OURS] = long
 
     # This study's arm: significance, LD blocks, summary statistics, figures.
     final, summary, figures, tables = analyse_arm(
-        final, ld.gene_positions(), blocks, cell_type,
+        final, positions, blocks, cell_type,
         arm=ARM_OURS, fdr=args.fdr, top_n=args.top_n, annotate=False,
     )
     summary.update(_prefix({
         **model_stats,
-        "n_genes_in_model": len(spec.snp_sets),
         "n_reference_individuals": ld.meta["reference"]["n_individuals"],
         "n_genes_in_ld_reference": ld.meta["n_genes_written"],
     }, ARM_OURS))
@@ -856,69 +845,31 @@ def process_cell_type(
     if strata is not None and not strata.empty:
         tables[f"{ARM_OURS}/agreement_strata"] = strata
 
-    # l-ctPred's arm, through exactly the same analysis, plus the head-to-head.
-    if lctpred is not None:
+    # ctPred's arm, through exactly the same analysis, plus the head-to-head.
+    if ctpred_spec is not None:
         try:
-            theirs, metadata, covariance_metadata = compare_to_lctpred(
-                lctpred, args, gwas, blocks, cell_dir
+            theirs, their_long, their_stats = run_arm(
+                ctpred_spec, ld, snp_table, gene_names, gwas, args,
+                cell_dir, arm=ARM_CTPRED,
             )
+            if their_long is not None:
+                per_draw_zscores[ARM_CTPRED] = their_long
+            # Gene positions come from the shared covariance, so both arms are
+            # placed on the same coordinates and their LD-block counts are
+            # counted against the same blocks.
             theirs, their_summary, their_figures, their_tables = analyse_arm(
-                theirs, metadata.positions, blocks, cell_type,
+                theirs, positions, blocks, cell_type,
                 arm=ARM_CTPRED, fdr=args.fdr, top_n=args.top_n, annotate=False,
             )
             summary.update(their_summary)
-            summary.update(_prefix({
-                "model": lctpred.name,
-                "build": metadata.build,
-                "n_genes_in_model": metadata.n_genes,
-                "n_genes_in_covariance": covariance_metadata.n_genes,
-                "n_genes_shared_by_model_and_covariance": len(
-                    metadata.genes & covariance_metadata.genes
-                ),
-                "n_covariance_rows": covariance_metadata.n_rows,
-                "snp_id_style": metadata.id_style,
-            }, ARM_CTPRED))
+            summary.update(_prefix(their_stats, ARM_CTPRED))
             figures.update(their_figures)
             tables.update(their_tables)
 
-            overlap = gene_overlap_report(spec.snp_sets, metadata.genes, final, theirs)
-            covariance_eligible = metadata.genes & covariance_metadata.genes
-            tested_ctpred = {
-                str(gene).split(".")[0].upper() for gene in theirs["gene"]
-            }
-            eligible_tested = len(covariance_eligible & tested_ctpred)
-            eligible_fraction = (
-                eligible_tested / len(covariance_eligible)
-                if covariance_eligible else float("nan")
+            overlap = gene_overlap_report(
+                spec.snp_sets, ctpred_spec.snp_sets, final, theirs
             )
-            overlap.update({
-                "n_lctpred_genes_eligible_from_model_and_covariance": len(
-                    covariance_eligible
-                ),
-                "n_lctpred_eligible_genes_tested": eligible_tested,
-                "frac_lctpred_eligible_genes_tested": eligible_fraction,
-            })
-            logging.info(
-                "ctPred gene attrition: %d in DB -> %d with covariance -> %d "
-                "with a computable GWAS association (%.1f%% of covariance-eligible).",
-                metadata.n_genes,
-                len(covariance_eligible),
-                eligible_tested,
-                100 * eligible_fraction,
-            )
-            if covariance_eligible and eligible_fraction < 0.5:
-                logging.warning(
-                    "Most ctPred genes have covariance but no computable TWAS "
-                    "statistic. This is a GWAS-variant matching problem, not a "
-                    "gene-identifier problem. Check ctPred/frac_model_snps_used "
-                    "and the exact chr_pos_ref_alt_b38 values supplied through "
-                    "--lctpred-snp-column."
-                )
-            log_overlap_report(
-                overlap,
-                id_style=metadata.id_style,
-                frac_snps_used=their_summary.get(f"{ARM_CTPRED}/frac_model_snps_used"),
-            )
+            log_overlap_report(overlap)
             matched = matched_pvalues(final, theirs)
             summary.update(_prefix(
                 {**overlap, **comparison_metrics(final, theirs, matched)},
@@ -933,7 +884,7 @@ def process_cell_type(
             if not args.continue_on_error:
                 raise
             logging.error(
-                "The l-ctPred comparison for '%s' failed: %s", cell_type, error
+                "The ctPred comparison for '%s' failed: %s", cell_type, error
             )
 
     # Persist everything before touching WandB, so a logging failure cannot lose
@@ -942,8 +893,9 @@ def process_cell_type(
         path = cell_dir / f"{name}.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(path, index=False)
-    if long is not None:
-        long.to_csv(cell_dir / f"{ARM_OURS}/per_draw_zscores.csv", index=False)
+    for arm, frame in per_draw_zscores.items():
+        (cell_dir / arm).mkdir(parents=True, exist_ok=True)
+        frame.to_csv(cell_dir / f"{arm}/per_draw_zscores.csv", index=False)
     with (cell_dir / "summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
 
@@ -1002,6 +954,10 @@ def _wandb_config(args: argparse.Namespace, spec: ModelSpec) -> dict:
         "ld_blocks_build": args.ld_blocks_build,
         "genotype_build": args.genotype_build,
         "agreement_criterion": args.agreement_criterion,
+        "ctpred_models_dir": (
+            str(args.ctpred_models_dir) if args.ctpred_models_dir else None
+        ),
+        "ctpred_model_kind": args.ctpred_model_kind,
     }
 
 
@@ -1028,13 +984,10 @@ def main() -> None:
         logging.error("%s", error)
         sys.exit(1)
 
-    lctpred_models: dict = {}
-    if args.lctpred_model_dir is not None:
+    ctpred_models: dict[str, Path] = {}
+    if args.ctpred_models_dir is not None:
         try:
-            lctpred_models = discover_lctpred_models(
-                args.lctpred_model_dir,
-                covariance_suffix=args.lctpred_covariance_suffix,
-            )
+            ctpred_models = discover_ctpred_models(args.ctpred_models_dir)
         except (FileNotFoundError, NotADirectoryError) as error:
             logging.error("%s", error)
             sys.exit(1)
@@ -1055,17 +1008,30 @@ def main() -> None:
     gene_names = load_gene_name_map(args.gene_name_map)
     logger = TwasWandBLogger(project=args.wandb_project, entity=args.wandb_entity)
 
+    # Pair the two arms up front: the ctPred models feed the shared covariance,
+    # so their SNPs have to be in the reference index before it is built.
+    paired: dict[Path, Optional[Path]] = {
+        model_path: (
+            match_model(ctpred_models, model_path.stem) if ctpred_models else None
+        )
+        for model_path in model_paths
+    }
+    unmatched = [
+        path.stem for path, other in paired.items() if ctpred_models and other is None
+    ]
+
     # Index the reference once for the whole sweep. Walking 22 UKB .bim files
     # costs far more than re-parsing the weights JSONs, so the SNP universe is
     # collected in a cheap first pass rather than per cell type.
     reference = None
     if args.genotypes is not None:
         wanted_snps: set[str] = set()
-        for model_path in tqdm(model_paths, desc="Collecting model SNPs", leave=False):
-            wanted_snps |= read_snp_universe(model_path)
+        json_paths = [p for pair in paired.items() for p in pair if p is not None]
+        for path in tqdm(json_paths, desc="Collecting model SNPs", leave=False):
+            wanted_snps |= read_snp_universe(path)
         logging.info(
-            "%d distinct model SNP(s) across %d cell type(s).",
-            len(wanted_snps), len(model_paths),
+            "%d distinct model SNP(s) across %d cell type(s) and %d weights file(s).",
+            len(wanted_snps), len(model_paths), len(json_paths),
         )
         reference = build_reference(
             genotype_dir=args.genotypes,
@@ -1079,16 +1045,12 @@ def main() -> None:
     logging.info("Running TWAS for %d cell type(s).", len(model_paths))
     summaries: list[dict] = []
     failures: list[str] = []
-    unmatched: list[str] = []
-    for model_path in tqdm(model_paths, desc="Cell types"):
-        lctpred = match_model(lctpred_models, model_path.stem) if lctpred_models else None
-        if lctpred_models and lctpred is None:
-            unmatched.append(model_path.stem)
+    for model_path, ctpred_path in tqdm(paired.items(), desc="Cell types"):
         try:
             summaries.append(
                 process_cell_type(
                     model_path, args, gwas, gene_names, logger,
-                    reference=reference, blocks=blocks, lctpred=lctpred,
+                    reference=reference, blocks=blocks, ctpred_path=ctpred_path,
                 )
             )
         except Exception as error:  # noqa: BLE001 - one bad cell type must not kill the sweep
@@ -1105,9 +1067,9 @@ def main() -> None:
         logging.info("Wrote the cross-cell-type overview to %s.", output_dir / "summary.csv")
     if unmatched:
         logging.warning(
-            "%d cell type(s) had no l-ctPred counterpart in %s and were run "
+            "%d cell type(s) had no ctPred counterpart in %s and were run "
             "without a comparison: %s",
-            len(unmatched), args.lctpred_model_dir, unmatched,
+            len(unmatched), args.ctpred_models_dir, unmatched,
         )
     if failures:
         logging.warning("%d cell type(s) failed: %s", len(failures), failures)

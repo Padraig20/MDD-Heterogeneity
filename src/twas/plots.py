@@ -617,7 +617,7 @@ def qq_comparison(
     theirs: pd.DataFrame,
     cell_type: str,
     ours_label: str = "This study",
-    theirs_label: str = "l-ctPred (scPrediXcan)",
+    theirs_label: str = "ctPred",
 ) -> Optional[plt.Figure]:
     """
     Quantile-quantile plot of the two methods' evidence, ours on the y-axis.
@@ -665,8 +665,8 @@ def pvalue_scatter(
     matched: pd.DataFrame,
     cell_type: str,
     ours_label: str = "This study",
-    theirs_label: str = "l-ctPred (scPrediXcan)",
-    suffixes: tuple[str, str] = ("_ours", "_lctpred"),
+    theirs_label: str = "ctPred",
+    suffixes: tuple[str, str] = ("_ours", "_ctpred"),
     label_top: int = 8,
 ) -> Optional[plt.Figure]:
     """
@@ -674,8 +674,8 @@ def pvalue_scatter(
 
     Unlike the Q-Q plot this pairs genes, so it shows whether the two methods
     agree case by case. Genes far off the diagonal are the interesting ones:
-    they are where the cell-type-specific model and l-ctPred disagree about the
-    same gene rather than merely about the transcriptome overall.
+    they are where the two teachers disagree about the same gene rather than
+    merely about the transcriptome overall.
     """
     ours_suffix, theirs_suffix = suffixes
     x_column, y_column = f"pvalue{theirs_suffix}", f"pvalue{ours_suffix}"

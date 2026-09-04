@@ -56,6 +56,9 @@ GWAS_FLAGS = {
     "handle_empty_columns": "--handle_empty_columns",
 }
 
+# Options naming a file rather than a column. `run_sprediXcan` runs the
+# subprocess with `metaxcan_dir` as its working directory, which would
+# re-anchor any of these given as a relative path.
 GWAS_PATH_OPTIONS = {"gwas_file", "gwas_folder", "snp_map_file"}
 
 

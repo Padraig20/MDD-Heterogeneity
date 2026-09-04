@@ -1,337 +1,173 @@
 from __future__ import annotations
 
-import gzip
 import logging
 import re
-import sqlite3
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
 
-from src.twas.aggregate import annotate_significance
-from src.twas.ld_blocks import LdBlocks, block_metrics
-from src.twas.sprediXcan import GwasOptions, read_results, run_sprediXcan
+from src.twas.weights import GeneSnps
 
 """
 compare.py
 
-Head-to-head against the l-ctPred models scPrediXcan ships.
+Head-to-head against ctPred, the single-cell-type predictor from scPrediXcan.
 
-scPrediXcan distributes a finished S-PrediXcan prediction model DB and its
-matching covariance per cell type, so the comparison is simply a second
-S-PrediXcan run on the same GWAS with their DB in place of ours. Everything
-downstream -- multiple-testing correction, LD-block counting -- is then the
-same machinery both sides go through, which is the only way the numbers mean
-anything next to each other.
+Rather than consuming the prediction model DBs scPrediXcan ships, the ctPred
+arm is distilled here: `src/training/models/ctpred.py` supplies the teacher and
+`src/distillation/train.py` writes the elastic net exactly as it does for our
+own models. The comparison therefore takes a directory of weights JSONs and
+nothing else, and `discover_ctpred_models` / `match_model` are the whole of the
+plumbing.
 
-SNP identifier spaces
----------------------
-Their `weights.rsid` column does not hold rs numbers. It repeats `varID`, which
-looks like
+That is not just a simplification. Both arms are then distilled from the same
+individuals, over the same cis-windows, into the same identifier space, so the
+only thing that differs between them is the teacher -- which is the comparison
+the numbers are supposed to be making. Reading a foreign DB instead means the
+two arms also differ in their reference panel, their variant identifiers and
+their genome build, and any one of those can dominate the result.
 
-    chr21_17276203_G_T_b38
+One covariance for both arms
+----------------------------
+`merge_snp_sets` unions the two models' per-gene SNP sets so a single
+covariance covers both. Because the two are distilled from the same genotypes
+over the same windows, the union is normally equal to either side and the
+covariance is bit-for-bit the one our arm would have had on its own; the union
+only matters if the two runs used different windows or MAF filters, in which
+case it keeps both arms fully covered rather than silently dropping the weights
+one of them puts on a variant the other never saw.
 
-while our models are keyed on the reference panel's rs ids. S-PrediXcan matches
-the GWAS to a model purely on that string, so pointing it at their DB with an
-rs-id GWAS silently matches nothing and returns a table of NAs rather than an
-error. `check_snp_overlap` therefore inspects the result and fails loudly.
+The percentile target needs no rescaling
+----------------------------------------
+ctPred is distilled against rank/percentile-normalized expression
+(`--norm-targets percentiles`) while our models are usually distilled against
+log expression, so its coefficients come out on a completely different scale.
+That scale does not reach the z-score. As `model_db.py` sets out, S-PrediXcan
+forms
 
-To bridge the two, either point `--lctpred-snp-column` at a GWAS column already
-in `chr_pos_ref_alt_b38` form, or supply `--lctpred-snp-map-file` (S-PrediXcan's
-own `--snp_map_file`, a table translating GWAS ids to model ids).
+    z = sum_l w_l z_l sigma_l / sqrt(w' COV w)
 
-That identifier format also carries the genome build, so `DbMetadata` reads the
-build straight off the varIDs and the caller can check it against the LD blocks
-instead of trusting a flag.
+which is invariant to multiplying a gene's whole weight vector by a constant:
+the numerator and the square root pick up the same factor. A change in the
+units of the *target* is exactly such a per-gene constant, so it cancels, and
+the z-scores and p-values of the two arms are directly comparable.
+
+What does not cancel is a per-SNP rescale, which is the standardized-design
+correction `model_db.py` applies. That is driven by `ModelSpec.standardized`
+and is read off the JSON layout, so it is handled per arm without either side
+needing to know what the other did.
+
+The one quantity that is *not* comparable across the arms is `effect_size`: it
+is an effect per unit of expression and so carries the target's units. Every
+comparison here is on z-scores, p-values and significance calls for that
+reason.
 """
 
-DEFAULT_COVARIANCE_SUFFIX = "_covariances.txt.gz"
-
-# chr21_17276203_G_T_b38
-VARID_PATTERN = re.compile(
-    r"^chr([0-9XYM]+|[0-9]+)_(\d+)_([ACGTN]+)_([ACGTN]+)_b(\d+)$", re.IGNORECASE
-)
-RSID_PATTERN = re.compile(r"^rs\d+$", re.IGNORECASE)
-
-ID_STYLE_VARID = "varid"
-ID_STYLE_RSID = "rsid"
-ID_STYLE_UNKNOWN = "unknown"
+# Suffixes distinguishing the two arms once their result tables are joined.
+SUFFIX_OURS = "_ours"
+SUFFIX_CTPRED = "_ctpred"
+SUFFIXES = (SUFFIX_OURS, SUFFIX_CTPRED)
 
 
 def normalize_cell_type(name: str) -> str:
     """
     Fold a cell-type name to a comparable key.
 
-    Their file names and ours are the same labels through different pipelines,
-    so 'CD14-low_CD16-positive_monocyte' and 'CD14 low CD16 positive monocyte'
+    The two directories hold the same labels written by two runs, so
+    'CD14-low_CD16-positive_monocyte' and 'CD14 low CD16 positive monocyte'
     have to land on the same key.
     """
     return re.sub(r"[^a-z0-9]+", "", str(name).lower())
 
 
-@dataclass
-class LctpredModel:
-    """One cell type's prediction model DB and its covariance."""
-
-    name: str
-    db_path: Path
-    covariance_path: Path
-
-
-@dataclass
-class DbMetadata:
-    """What a prediction model DB can tell us without running anything."""
-
-    n_genes: int
-    id_style: str
-    build: Optional[str]
-    genes: set[str] = field(default_factory=set)
-    gene_names: dict[str, str] = field(default_factory=dict)
-    positions: dict[str, tuple[str, int]] = field(default_factory=dict)
-
-
-@dataclass
-class CovarianceMetadata:
-    """Gene coverage of a MetaXcan text covariance."""
-
-    n_genes: int
-    genes: set[str] = field(default_factory=set)
-    n_rows: int = 0
-
-
-def read_covariance_metadata(path: Path) -> CovarianceMetadata:
+def discover_ctpred_models(directory: Path) -> dict[str, Path]:
     """
-    Count the genes represented in a gzipped MetaXcan covariance.
+    Index a directory of ctPred weights JSONs by folded cell-type name.
 
-    A DB can contain many more genes than its companion covariance. Those genes
-    can never receive a TWAS statistic, irrespective of GWAS variant matching,
-    so this separates a broken/incomplete ctPred package from a GWAS-to-model
-    identifier mismatch.
-    """
-    genes: set[str] = set()
-    n_rows = 0
-    with gzip.open(path, "rt") as handle:
-        header = handle.readline().strip().split()
-        if not header or header[0].upper() != "GENE":
-            raise ValueError(
-                f"{path} is not a MetaXcan covariance: expected a GENE header."
-            )
-        for line_number, line in enumerate(handle, start=2):
-            if not line.strip():
-                continue
-            fields = line.split(maxsplit=1)
-            if len(fields) < 2:
-                raise ValueError(f"Malformed covariance row {line_number} in {path}.")
-            genes.add(fields[0].split(".")[0].upper())
-            n_rows += 1
-    logging.info(
-        "%s: %d gene(s) and %d covariance row(s).",
-        path.name, len(genes), n_rows,
-    )
-    return CovarianceMetadata(n_genes=len(genes), genes=genes, n_rows=n_rows)
-
-
-def discover_lctpred_models(
-    directory: Path, covariance_suffix: str = DEFAULT_COVARIANCE_SUFFIX
-) -> dict[str, LctpredModel]:
-    """
-    Pair every `<name>.db` in a directory with its `<name><suffix>` covariance.
-
-    Returns a dict keyed on the normalized cell-type name. A DB without a
-    covariance beside it is skipped with a warning rather than failing the run;
-    the comparison is an extra, not the point of the pipeline.
+    Same layout as `--models-dir`: one `<cell type>.json` per cell type, as
+    written by `src/distillation/train.py`.
     """
     directory = Path(directory)
     if not directory.is_dir():
-        raise NotADirectoryError(f"--lctpred-model-dir is not a directory: {directory}")
-
-    models: dict[str, LctpredModel] = {}
-    orphans: list[str] = []
-    for db_path in sorted(directory.glob("*.db")):
-        name = db_path.stem
-        covariance = directory / f"{name}{covariance_suffix}"
-        if not covariance.exists():
-            # Tolerate the other common spelling before giving up.
-            alternatives = sorted(directory.glob(f"{name}*cov*.txt.gz"))
-            if not alternatives:
-                orphans.append(name)
-                continue
-            covariance = alternatives[0]
-        models[normalize_cell_type(name)] = LctpredModel(
-            name=name, db_path=db_path, covariance_path=covariance
+        raise NotADirectoryError(
+            f"--ctpred-models-dir is not a directory: {directory}"
         )
 
-    if orphans:
-        logging.warning(
-            "%d l-ctPred model(s) in %s have no '%s' covariance beside them and "
-            "will be skipped: %s",
-            len(orphans), directory, covariance_suffix, ", ".join(orphans[:5]),
-        )
+    models: dict[str, Path] = {}
+    for path in sorted(directory.glob("*.json")):
+        models[normalize_cell_type(path.stem)] = path
     if not models:
-        raise FileNotFoundError(
-            f"No usable <name>.db + <name>{covariance_suffix} pair found in {directory}."
-        )
-    logging.info("Found %d l-ctPred model(s) in %s.", len(models), directory)
+        raise FileNotFoundError(f"No weights JSON found in {directory}.")
+    logging.info("Found %d ctPred model(s) in %s.", len(models), directory)
     return models
 
 
-def match_model(
-    models: dict[str, LctpredModel], cell_type: str
-) -> Optional[LctpredModel]:
-    """The l-ctPred model for one of our cell types, matched on the folded name."""
+def match_model(models: dict[str, Path], cell_type: str) -> Optional[Path]:
+    """The ctPred JSON for one of our cell types, matched on the folded name."""
     return models.get(normalize_cell_type(cell_type))
 
 
-def read_db_metadata(db_path: Path, chunk_size: int = 500_000) -> DbMetadata:
+def merge_snp_sets(*snp_sets: Optional[dict[str, GeneSnps]]) -> dict[str, GeneSnps]:
     """
-    Gene list, symbols, cis-window midpoints and genome build from a model DB.
+    Per-gene union of several models' SNP sets, for one shared covariance.
 
-    Positions come from parsing the varIDs, which makes the gene coordinates
-    directly comparable to the ones we take from our own covariance metadata:
-    both are the midpoint of the window the model actually puts weight in.
-
-    The weights table runs to millions of rows, so it is streamed and reduced to
-    a per-gene min/max as it goes rather than materialised.
+    Order is preserved -- the first model's SNPs in its own order, then
+    whatever later models add -- so that a single model in, single model out is
+    the identity and leaves `snp_set_hash` unchanged. That matters: it is what
+    lets an `--ld-dir` built before the comparison existed still be a cache hit.
     """
-    db_path = Path(db_path)
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as connection:
-        gene_names: dict[str, str] = {}
-        try:
-            extra = pd.read_sql("SELECT gene, genename FROM extra", connection)
-            gene_names = {
-                str(gene).split(".")[0]: str(name)
-                for gene, name in zip(extra["gene"], extra["genename"])
-                if name is not None
-            }
-        except Exception as error:  # noqa: BLE001 - `extra` is optional here
-            logging.debug("Could not read `extra` from %s: %s", db_path.name, error)
+    provided = [entry for entry in snp_sets if entry]
+    if not provided:
+        return {}
+    if len(provided) == 1:
+        return dict(provided[0])
 
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(weights)")
-        }
-        id_column = "varID" if "varID" in columns else "rsid"
-
-        partials: list[pd.DataFrame] = []
-        id_style = ID_STYLE_UNKNOWN
-        build: Optional[str] = None
-        unparsed = 0
-
-        query = f"SELECT gene, {id_column} AS snp FROM weights"
-        for chunk in pd.read_sql(query, connection, chunksize=chunk_size):
-            parsed = chunk["snp"].astype(str).str.extract(VARID_PATTERN)
-            usable = parsed[1].notna()
-            if id_style == ID_STYLE_UNKNOWN:
-                if usable.any():
-                    id_style = ID_STYLE_VARID
-                elif chunk["snp"].astype(str).head(50).str.match(RSID_PATTERN).any():
-                    id_style = ID_STYLE_RSID
-            if not usable.any():
-                unparsed += len(chunk)
+    merged: dict[str, GeneSnps] = {}
+    for entry in provided:
+        for gene, genes_snps in entry.items():
+            existing = merged.get(gene)
+            if existing is None:
+                merged[gene] = genes_snps
                 continue
-            if build is None:
-                build = f"hg{parsed.loc[usable, 4].iloc[0]}"
-
-            block = pd.DataFrame({
-                "gene": chunk.loc[usable, "gene"].astype(str).str.split(".").str[0],
-                "chrom": parsed.loc[usable, 0].astype(str),
-                "bp": parsed.loc[usable, 1].astype(np.int64),
-            })
-            partials.append(
-                block.groupby("gene", sort=False).agg(
-                    chrom=("chrom", "first"), lo=("bp", "min"), hi=("bp", "max")
+            if existing.chrom != genes_snps.chrom:
+                raise ValueError(
+                    f"Gene {gene} is on chromosome {existing.chrom} in one model "
+                    f"and {genes_snps.chrom} in another; the two models were not "
+                    "built against the same annotation."
                 )
-            )
+            seen = set(existing.snp_ids)
+            extra = tuple(s for s in genes_snps.snp_ids if s not in seen)
+            if extra:
+                merged[gene] = GeneSnps(
+                    gene=existing.gene,
+                    chrom=existing.chrom,
+                    snp_ids=existing.snp_ids + extra,
+                )
+    return merged
 
-        genes = {
-            str(row[0]).split(".")[0]
-            for row in connection.execute("SELECT DISTINCT gene FROM weights")
-        }
-        n_genes = len(genes)
 
-    positions: dict[str, tuple[str, int]] = {}
-    if partials:
-        # Chunk boundaries can split a gene, so reduce the per-chunk extremes.
-        combined = pd.concat(partials).groupby(level=0).agg(
-            chrom=("chrom", "first"), lo=("lo", "min"), hi=("hi", "max")
-        )
-        midpoints = ((combined["lo"] + combined["hi"]) // 2).astype(np.int64)
-        positions = {
-            gene: (chrom, int(bp))
-            for gene, chrom, bp in zip(combined.index, combined["chrom"], midpoints)
-        }
-    if unparsed:
-        logging.debug(
-            "%s: %d weight row(s) had an unparseable variant id; those genes have "
-            "no position and are left out of the LD-block count.",
-            db_path.name, unparsed,
-        )
-    logging.info(
-        "%s: %d gene(s), %s-style variant ids, build %s, %d gene(s) positioned.",
-        db_path.name, n_genes, id_style, build or "unknown", len(positions),
+def log_snp_set_merge(
+    ours: dict[str, GeneSnps], theirs: dict[str, GeneSnps], merged: dict[str, GeneSnps]
+) -> None:
+    """Say whether the shared covariance had to grow to cover both arms."""
+    added_genes = len(merged) - len(ours)
+    added_snps = sum(len(e.snp_ids) for e in merged.values()) - sum(
+        len(e.snp_ids) for e in ours.values()
     )
-    return DbMetadata(
-        n_genes=n_genes,
-        id_style=id_style,
-        build=build,
-        genes=genes,
-        gene_names=gene_names,
-        positions=positions,
-    )
-
-
-def check_snp_overlap(results: pd.DataFrame, model: LctpredModel, metadata: DbMetadata) -> None:
-    """
-    Fail loudly when the GWAS and the model turn out to speak different id
-    dialects.
-
-    S-PrediXcan does not treat "nothing matched" as an error -- it writes a
-    table of NAs -- so without this check a comparison would quietly report that
-    l-ctPred finds no genes at all, which looks like a result rather than a
-    misconfiguration.
-    """
-    if results.empty or "n_snps_used" not in results.columns:
-        used = 0
-    else:
-        used = int(pd.to_numeric(results["n_snps_used"], errors="coerce").fillna(0).sum())
-    if used > 0:
+    if not added_genes and not added_snps:
+        logging.info(
+            "Both arms define the same %d gene(s) over the same variants, so the "
+            "covariance is shared unchanged.", len(merged),
+        )
         return
-
-    hint = ""
-    if metadata.id_style == ID_STYLE_VARID:
-        hint = (
-            f" {model.db_path.name} is keyed on '{ID_STYLE_VARID}' identifiers such as "
-            f"chr1_12345_A_G_b38, not rs numbers. Point --lctpred-snp-column at a GWAS "
-            "column in that format, or pass --lctpred-snp-map-file to translate."
-        )
-    raise RuntimeError(
-        f"The l-ctPred run for '{model.name}' matched zero GWAS variants, so its "
-        f"results are all NA.{hint}"
+    logging.info(
+        "The ctPred model adds %d gene(s) and %d variant-in-gene entr(ies) beyond "
+        "ours (%d genes ours, %d theirs); the shared covariance covers the union "
+        "of %d gene(s).",
+        added_genes, added_snps, len(ours), len(theirs), len(merged),
     )
-
-
-def run_lctpred(
-    model: LctpredModel,
-    gwas: GwasOptions,
-    metaxcan_dir: Path,
-    output_path: Path,
-    fdr: float = 0.05,
-    metadata: Optional[DbMetadata] = None,
-) -> pd.DataFrame:
-    """Run S-PrediXcan against one l-ctPred model and correct its p-values."""
-    run_sprediXcan(
-        metaxcan_dir=metaxcan_dir,
-        model_db_path=model.db_path,
-        covariance_path=model.covariance_path,
-        output_path=output_path,
-        gwas=gwas,
-    )
-    results = read_results(output_path)
-    if metadata is not None:
-        check_snp_overlap(results, model, metadata)
-    return annotate_significance(results, fdr=fdr)
 
 
 def two_sample_quantiles(
@@ -359,7 +195,7 @@ def two_sample_quantiles(
 
 
 def matched_pvalues(
-    ours: pd.DataFrame, theirs: pd.DataFrame, suffixes: tuple[str, str] = ("_ours", "_lctpred")
+    ours: pd.DataFrame, theirs: pd.DataFrame, suffixes: tuple[str, str] = SUFFIXES
 ) -> pd.DataFrame:
     """
     Inner join of the two result tables on the versionless Ensembl id.
@@ -384,7 +220,7 @@ def matched_pvalues(
     return merged
 
 
-def gene_keys(values) -> set[str]:
+def gene_keys(values: Iterable) -> set[str]:
     """Versionless, case-folded Ensembl ids, for comparing gene sets."""
     return {
         str(value).split(".")[0].strip().upper()
@@ -394,8 +230,8 @@ def gene_keys(values) -> set[str]:
 
 
 def gene_overlap_report(
-    our_model_genes,
-    their_model_genes,
+    our_model_genes: Iterable,
+    their_model_genes: Iterable,
     our_results: pd.DataFrame,
     their_results: pd.DataFrame,
 ) -> dict:
@@ -403,11 +239,11 @@ def gene_overlap_report(
     Where genes are lost between the two model definitions and the two results.
 
     A small shared-gene count has two very different explanations and this
-    separates them. If the two *models* already barely overlap, the identifier
-    spaces or the trained transcriptomes differ. If the models overlap well but
-    the *results* do not, genes are being dropped downstream instead -- by the
-    LD reference, by `--max-snps-in-gene`, or by S-PrediXcan finding no usable
-    variant -- and `*_lost_from_model` says which side is doing the dropping.
+    separates them. If the two *models* already barely overlap, the two
+    distillation runs were given different gene lists. If the models overlap
+    well but the *results* do not, genes are being dropped downstream instead --
+    by `--max-snps-in-gene`, or by every variant of a gene being absent from the
+    GWAS -- and `*_lost_from_model` says which side is doing the dropping.
     """
     our_model, their_model = gene_keys(our_model_genes), gene_keys(their_model_genes)
     our_tested = gene_keys(our_results["gene"]) if len(our_results) else set()
@@ -415,13 +251,13 @@ def gene_overlap_report(
 
     report = {
         "n_genes_in_our_model": len(our_model),
-        "n_genes_in_lctpred_model": len(their_model),
+        "n_genes_in_ctpred_model": len(their_model),
         "n_genes_shared_by_models": len(our_model & their_model),
         "n_genes_in_our_results": len(our_tested),
-        "n_genes_in_lctpred_results": len(their_tested),
+        "n_genes_in_ctpred_results": len(their_tested),
         "n_genes_shared_by_results": len(our_tested & their_tested),
         "n_genes_ours_lost_from_model": len(our_model - our_tested),
-        "n_genes_lctpred_lost_from_model": len(their_model - their_tested),
+        "n_genes_ctpred_lost_from_model": len(their_model - their_tested),
     }
     shared_models = report["n_genes_shared_by_models"]
     if shared_models:
@@ -431,21 +267,20 @@ def gene_overlap_report(
     return report
 
 
-def log_overlap_report(
-    report: dict, id_style: Optional[str] = None, frac_snps_used: Optional[float] = None
-) -> None:
+def log_overlap_report(report: dict) -> None:
     """Explain the attrition at INFO, since a low overlap is easy to misread."""
     logging.info(
-        "Gene overlap: %d in our model, %d in the l-ctPred model, %d shared. "
+        "Gene overlap: %d in our model, %d in the ctPred model, %d shared. "
         "After the association: %d ours, %d theirs, %d shared.",
-        report["n_genes_in_our_model"], report["n_genes_in_lctpred_model"],
+        report["n_genes_in_our_model"], report["n_genes_in_ctpred_model"],
         report["n_genes_shared_by_models"], report["n_genes_in_our_results"],
-        report["n_genes_in_lctpred_results"], report["n_genes_shared_by_results"],
+        report["n_genes_in_ctpred_results"], report["n_genes_shared_by_results"],
     )
     if report["n_genes_shared_by_models"] == 0:
         logging.warning(
-            "The two models share no gene at all. The identifier spaces differ "
-            "-- check whether one side uses gene symbols or versioned Ensembl ids."
+            "The two models share no gene at all, which for two runs of the same "
+            "distillation should not happen -- check that both were given the "
+            "same --select-genes and the same targets directory."
         )
         return
 
@@ -455,37 +290,20 @@ def log_overlap_report(
     logging.warning(
         "Only %.0f%% of the %d gene(s) both models define survive into both "
         "result tables (%d ours, %d theirs dropped between model and result). "
-        "The gene identifiers line up, so the loss is downstream.",
+        "Both arms share one covariance and one GWAS, so this is a per-gene "
+        "weight difference: genes whose elastic net kept no variant the GWAS "
+        "also carries, or genes skipped by --max-snps-in-gene.",
         100 * fraction, report["n_genes_shared_by_models"],
         report["n_genes_ours_lost_from_model"],
-        report["n_genes_lctpred_lost_from_model"],
+        report["n_genes_ctpred_lost_from_model"],
     )
-    if frac_snps_used is not None and frac_snps_used < 0.5:
-        logging.warning(
-            "The l-ctPred arm used only %.0f%% of the variants its models "
-            "contain, so most of its genes were dropped for lack of a usable "
-            "variant rather than by any gene filter.%s",
-            100 * frac_snps_used,
-            (
-                " Its models are keyed on chr_pos_ref_alt_b38 ids: check that "
-                "--lctpred-snp-column names a GWAS column in exactly that "
-                "format, including the same reference/alternate order and the "
-                "'_b38' suffix."
-                if id_style == ID_STYLE_VARID else ""
-            ),
-        )
-    else:
-        logging.warning(
-            "Genes with no usable variant in the LD reference or the GWAS, or "
-            "genes skipped by --max-snps-in-gene, are the usual cause."
-        )
 
 
 def comparison_metrics(
     ours: pd.DataFrame,
     theirs: pd.DataFrame,
     matched: pd.DataFrame,
-    suffixes: tuple[str, str] = ("_ours", "_lctpred"),
+    suffixes: tuple[str, str] = SUFFIXES,
 ) -> dict:
     """
     How the two arms' hit lists relate on the genes they both test.
@@ -493,8 +311,11 @@ def comparison_metrics(
     Each arm's own significance counts and LD-block coverage are produced by the
     per-arm analysis; what is left here is strictly the overlap. Note that each
     side is corrected against its own gene count, which is right -- the two
-    models test different transcriptomes -- but does mean the two Bonferroni
-    thresholds differ.
+    models can end up testing slightly different gene sets -- but does mean the
+    two Bonferroni thresholds differ.
+
+    `effect_size` is deliberately absent: it carries the units of the
+    distillation target, and ctPred's percentile target is not our log target.
     """
     ours_suffix, theirs_suffix = suffixes
     statistics: dict = {"n_genes_shared": int(len(matched))}
@@ -508,13 +329,13 @@ def comparison_metrics(
         yours = matched[theirs_column].fillna(False)
         statistics[f"{criterion}_both"] = int((mine & yours).sum())
         statistics[f"{criterion}_ours_only"] = int((mine & ~yours).sum())
-        statistics[f"{criterion}_lctpred_only"] = int((~mine & yours).sum())
+        statistics[f"{criterion}_ctpred_only"] = int((~mine & yours).sum())
         union = int((mine | yours).sum())
         statistics[f"{criterion}_jaccard"] = (
             statistics[f"{criterion}_both"] / union if union else float("nan")
         )
 
-    for suffix, side in ((ours_suffix, "ours"), (theirs_suffix, "lctpred")):
+    for suffix, side in ((ours_suffix, "ours"), (theirs_suffix, "ctpred")):
         column = f"zscore{suffix}"
         if column in matched.columns:
             statistics[f"mean_abs_zscore_{side}"] = float(
@@ -529,24 +350,18 @@ def comparison_metrics(
 
 
 __all__ = [
-    "DEFAULT_COVARIANCE_SUFFIX",
-    "CovarianceMetadata",
-    "ID_STYLE_RSID",
-    "ID_STYLE_UNKNOWN",
-    "ID_STYLE_VARID",
-    "DbMetadata",
-    "LctpredModel",
-    "check_snp_overlap",
+    "SUFFIXES",
+    "SUFFIX_CTPRED",
+    "SUFFIX_OURS",
     "comparison_metrics",
-    "discover_lctpred_models",
+    "discover_ctpred_models",
     "gene_keys",
     "gene_overlap_report",
     "log_overlap_report",
+    "log_snp_set_merge",
     "match_model",
     "matched_pvalues",
+    "merge_snp_sets",
     "normalize_cell_type",
-    "read_db_metadata",
-    "read_covariance_metadata",
-    "run_lctpred",
     "two_sample_quantiles",
 ]
