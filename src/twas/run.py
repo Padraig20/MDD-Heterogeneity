@@ -37,6 +37,7 @@ from src.twas.compare import (
     log_overlap_report,
     match_model,
     matched_pvalues,
+    read_covariance_metadata,
     read_db_metadata,
     run_lctpred,
 )
@@ -617,7 +618,7 @@ def compare_to_lctpred(
     gwas: GwasOptions,
     blocks: Optional[LdBlocks],
     cell_dir: Path,
-) -> tuple[pd.DataFrame, object]:
+) -> tuple[pd.DataFrame, object, object]:
     """
     Run S-PrediXcan against one l-ctPred model, returning its results and the
     metadata read off its DB.
@@ -629,6 +630,17 @@ def compare_to_lctpred(
         "Comparing '%s' against the l-ctPred model %s.", cell_dir.name, model.db_path.name
     )
     metadata = read_db_metadata(model.db_path)
+    covariance_metadata = read_covariance_metadata(model.covariance_path)
+    model_covariance_overlap = len(metadata.genes & covariance_metadata.genes)
+    if model_covariance_overlap < metadata.n_genes:
+        logging.warning(
+            "The l-ctPred DB contains %d genes but its covariance contains %d; "
+            "only %d occur in both. Genes absent from the covariance cannot be "
+            "tested, regardless of the GWAS.",
+            metadata.n_genes,
+            covariance_metadata.n_genes,
+            model_covariance_overlap,
+        )
 
     if blocks is not None and metadata.build and metadata.build != blocks.build:
         # Their coordinates come from the varIDs, so a build clash here is just
@@ -663,7 +675,7 @@ def compare_to_lctpred(
         theirs["gene_name"] = (
             theirs["gene"].astype(str).str.split(".").str[0].map(metadata.gene_names)
         )
-    return theirs, metadata
+    return theirs, metadata, covariance_metadata
 
 
 def analyse_agreement(
@@ -847,7 +859,9 @@ def process_cell_type(
     # l-ctPred's arm, through exactly the same analysis, plus the head-to-head.
     if lctpred is not None:
         try:
-            theirs, metadata = compare_to_lctpred(lctpred, args, gwas, blocks, cell_dir)
+            theirs, metadata, covariance_metadata = compare_to_lctpred(
+                lctpred, args, gwas, blocks, cell_dir
+            )
             theirs, their_summary, their_figures, their_tables = analyse_arm(
                 theirs, metadata.positions, blocks, cell_type,
                 arm=ARM_CTPRED, fdr=args.fdr, top_n=args.top_n, annotate=False,
@@ -857,12 +871,49 @@ def process_cell_type(
                 "model": lctpred.name,
                 "build": metadata.build,
                 "n_genes_in_model": metadata.n_genes,
+                "n_genes_in_covariance": covariance_metadata.n_genes,
+                "n_genes_shared_by_model_and_covariance": len(
+                    metadata.genes & covariance_metadata.genes
+                ),
+                "n_covariance_rows": covariance_metadata.n_rows,
                 "snp_id_style": metadata.id_style,
             }, ARM_CTPRED))
             figures.update(their_figures)
             tables.update(their_tables)
 
             overlap = gene_overlap_report(spec.snp_sets, metadata.genes, final, theirs)
+            covariance_eligible = metadata.genes & covariance_metadata.genes
+            tested_ctpred = {
+                str(gene).split(".")[0].upper() for gene in theirs["gene"]
+            }
+            eligible_tested = len(covariance_eligible & tested_ctpred)
+            eligible_fraction = (
+                eligible_tested / len(covariance_eligible)
+                if covariance_eligible else float("nan")
+            )
+            overlap.update({
+                "n_lctpred_genes_eligible_from_model_and_covariance": len(
+                    covariance_eligible
+                ),
+                "n_lctpred_eligible_genes_tested": eligible_tested,
+                "frac_lctpred_eligible_genes_tested": eligible_fraction,
+            })
+            logging.info(
+                "ctPred gene attrition: %d in DB -> %d with covariance -> %d "
+                "with a computable GWAS association (%.1f%% of covariance-eligible).",
+                metadata.n_genes,
+                len(covariance_eligible),
+                eligible_tested,
+                100 * eligible_fraction,
+            )
+            if covariance_eligible and eligible_fraction < 0.5:
+                logging.warning(
+                    "Most ctPred genes have covariance but no computable TWAS "
+                    "statistic. This is a GWAS-variant matching problem, not a "
+                    "gene-identifier problem. Check ctPred/frac_model_snps_used "
+                    "and the exact chr_pos_ref_alt_b38 values supplied through "
+                    "--lctpred-snp-column."
+                )
             log_overlap_report(
                 overlap,
                 id_style=metadata.id_style,

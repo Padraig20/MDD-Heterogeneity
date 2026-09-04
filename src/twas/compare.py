@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import logging
 import re
 import sqlite3
@@ -90,6 +91,47 @@ class DbMetadata:
     genes: set[str] = field(default_factory=set)
     gene_names: dict[str, str] = field(default_factory=dict)
     positions: dict[str, tuple[str, int]] = field(default_factory=dict)
+
+
+@dataclass
+class CovarianceMetadata:
+    """Gene coverage of a MetaXcan text covariance."""
+
+    n_genes: int
+    genes: set[str] = field(default_factory=set)
+    n_rows: int = 0
+
+
+def read_covariance_metadata(path: Path) -> CovarianceMetadata:
+    """
+    Count the genes represented in a gzipped MetaXcan covariance.
+
+    A DB can contain many more genes than its companion covariance. Those genes
+    can never receive a TWAS statistic, irrespective of GWAS variant matching,
+    so this separates a broken/incomplete ctPred package from a GWAS-to-model
+    identifier mismatch.
+    """
+    genes: set[str] = set()
+    n_rows = 0
+    with gzip.open(path, "rt") as handle:
+        header = handle.readline().strip().split()
+        if not header or header[0].upper() != "GENE":
+            raise ValueError(
+                f"{path} is not a MetaXcan covariance: expected a GENE header."
+            )
+        for line_number, line in enumerate(handle, start=2):
+            if not line.strip():
+                continue
+            fields = line.split(maxsplit=1)
+            if len(fields) < 2:
+                raise ValueError(f"Malformed covariance row {line_number} in {path}.")
+            genes.add(fields[0].split(".")[0].upper())
+            n_rows += 1
+    logging.info(
+        "%s: %d gene(s) and %d covariance row(s).",
+        path.name, len(genes), n_rows,
+    )
+    return CovarianceMetadata(n_genes=len(genes), genes=genes, n_rows=n_rows)
 
 
 def discover_lctpred_models(
@@ -488,6 +530,7 @@ def comparison_metrics(
 
 __all__ = [
     "DEFAULT_COVARIANCE_SUFFIX",
+    "CovarianceMetadata",
     "ID_STYLE_RSID",
     "ID_STYLE_UNKNOWN",
     "ID_STYLE_VARID",
@@ -503,6 +546,7 @@ __all__ = [
     "matched_pvalues",
     "normalize_cell_type",
     "read_db_metadata",
+    "read_covariance_metadata",
     "run_lctpred",
     "two_sample_quantiles",
 ]

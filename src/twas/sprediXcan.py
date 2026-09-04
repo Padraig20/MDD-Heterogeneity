@@ -56,6 +56,8 @@ GWAS_FLAGS = {
     "handle_empty_columns": "--handle_empty_columns",
 }
 
+GWAS_PATH_OPTIONS = {"gwas_file", "gwas_folder", "snp_map_file"}
+
 
 @dataclass
 class GwasOptions:
@@ -106,6 +108,8 @@ class GwasOptions:
         for attribute, flag in GWAS_PASSTHROUGH.items():
             value = getattr(self, attribute)
             if value is not None and value != "":
+                if attribute in GWAS_PATH_OPTIONS:
+                    value = Path(value).resolve()
                 args.extend([flag, str(value)])
         for attribute, flag in GWAS_FLAGS.items():
             if getattr(self, attribute):
