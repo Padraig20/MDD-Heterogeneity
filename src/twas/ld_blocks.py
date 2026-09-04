@@ -128,10 +128,17 @@ class LdBlocks:
     def assign_frame(
         self, positions: dict[str, tuple[str, int]], genes: Sequence[str]
     ) -> pd.DataFrame:
-        """`gene -> block_index/block label` for the given genes."""
+        """
+        `gene -> block_index/block label` for the given genes.
+
+        Falls back to the versionless Ensembl id, since one side of a comparison
+        may carry `ENSG0000012345.7` where the other has `ENSG0000012345`.
+        """
         rows = []
         for gene in genes:
             chrom, bp = positions.get(gene, (None, None))
+            if chrom is None:
+                chrom, bp = positions.get(str(gene).split(".")[0], (None, None))
             if chrom is None:
                 rows.append((gene, UNASSIGNED, None))
                 continue

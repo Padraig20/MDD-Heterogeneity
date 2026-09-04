@@ -68,17 +68,21 @@ class TwasWandBLogger:
 
     def log_results(
         self,
-        results: pd.DataFrame,
         summary: dict,
         figures: dict[str, Optional[plt.Figure]],
         tables: Optional[dict[str, pd.DataFrame]] = None,
     ) -> None:
-        """Log one cell type's final table, scalar statistics and figures."""
+        """
+        Log one cell type's scalar statistics, figures and tables.
+
+        Keys are passed through untouched, so a caller that namespaces them as
+        `this-study/manhattan` and `ctPred/manhattan` gets one WandB section per
+        arm rather than a single flat list of near-identical panel names.
+        """
         if not self.enabled or self._run is None:
             return
 
         payload: dict = dict(summary)
-        payload["results_table"] = self._table(results)
         for name, table in (tables or {}).items():
             payload[name] = self._table(table)
         for name, figure in figures.items():

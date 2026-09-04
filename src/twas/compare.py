@@ -87,6 +87,7 @@ class DbMetadata:
     n_genes: int
     id_style: str
     build: Optional[str]
+    genes: set[str] = field(default_factory=set)
     gene_names: dict[str, str] = field(default_factory=dict)
     positions: dict[str, tuple[str, int]] = field(default_factory=dict)
 
@@ -202,9 +203,11 @@ def read_db_metadata(db_path: Path, chunk_size: int = 500_000) -> DbMetadata:
                 )
             )
 
-        n_genes = int(
-            connection.execute("SELECT COUNT(DISTINCT gene) FROM weights").fetchone()[0]
-        )
+        genes = {
+            str(row[0]).split(".")[0]
+            for row in connection.execute("SELECT DISTINCT gene FROM weights")
+        }
+        n_genes = len(genes)
 
     positions: dict[str, tuple[str, int]] = {}
     if partials:
@@ -231,6 +234,7 @@ def read_db_metadata(db_path: Path, chunk_size: int = 500_000) -> DbMetadata:
         n_genes=n_genes,
         id_style=id_style,
         build=build,
+        genes=genes,
         gene_names=gene_names,
         positions=positions,
     )
@@ -338,30 +342,120 @@ def matched_pvalues(
     return merged
 
 
+def gene_keys(values) -> set[str]:
+    """Versionless, case-folded Ensembl ids, for comparing gene sets."""
+    return {
+        str(value).split(".")[0].strip().upper()
+        for value in values
+        if value is not None and str(value) != "nan"
+    }
+
+
+def gene_overlap_report(
+    our_model_genes,
+    their_model_genes,
+    our_results: pd.DataFrame,
+    their_results: pd.DataFrame,
+) -> dict:
+    """
+    Where genes are lost between the two model definitions and the two results.
+
+    A small shared-gene count has two very different explanations and this
+    separates them. If the two *models* already barely overlap, the identifier
+    spaces or the trained transcriptomes differ. If the models overlap well but
+    the *results* do not, genes are being dropped downstream instead -- by the
+    LD reference, by `--max-snps-in-gene`, or by S-PrediXcan finding no usable
+    variant -- and `*_lost_from_model` says which side is doing the dropping.
+    """
+    our_model, their_model = gene_keys(our_model_genes), gene_keys(their_model_genes)
+    our_tested = gene_keys(our_results["gene"]) if len(our_results) else set()
+    their_tested = gene_keys(their_results["gene"]) if len(their_results) else set()
+
+    report = {
+        "n_genes_in_our_model": len(our_model),
+        "n_genes_in_lctpred_model": len(their_model),
+        "n_genes_shared_by_models": len(our_model & their_model),
+        "n_genes_in_our_results": len(our_tested),
+        "n_genes_in_lctpred_results": len(their_tested),
+        "n_genes_shared_by_results": len(our_tested & their_tested),
+        "n_genes_ours_lost_from_model": len(our_model - our_tested),
+        "n_genes_lctpred_lost_from_model": len(their_model - their_tested),
+    }
+    shared_models = report["n_genes_shared_by_models"]
+    if shared_models:
+        report["frac_shared_models_reaching_both_results"] = (
+            report["n_genes_shared_by_results"] / shared_models
+        )
+    return report
+
+
+def log_overlap_report(
+    report: dict, id_style: Optional[str] = None, frac_snps_used: Optional[float] = None
+) -> None:
+    """Explain the attrition at INFO, since a low overlap is easy to misread."""
+    logging.info(
+        "Gene overlap: %d in our model, %d in the l-ctPred model, %d shared. "
+        "After the association: %d ours, %d theirs, %d shared.",
+        report["n_genes_in_our_model"], report["n_genes_in_lctpred_model"],
+        report["n_genes_shared_by_models"], report["n_genes_in_our_results"],
+        report["n_genes_in_lctpred_results"], report["n_genes_shared_by_results"],
+    )
+    if report["n_genes_shared_by_models"] == 0:
+        logging.warning(
+            "The two models share no gene at all. The identifier spaces differ "
+            "-- check whether one side uses gene symbols or versioned Ensembl ids."
+        )
+        return
+
+    fraction = report.get("frac_shared_models_reaching_both_results", 1.0)
+    if fraction >= 0.5:
+        return
+    logging.warning(
+        "Only %.0f%% of the %d gene(s) both models define survive into both "
+        "result tables (%d ours, %d theirs dropped between model and result). "
+        "The gene identifiers line up, so the loss is downstream.",
+        100 * fraction, report["n_genes_shared_by_models"],
+        report["n_genes_ours_lost_from_model"],
+        report["n_genes_lctpred_lost_from_model"],
+    )
+    if frac_snps_used is not None and frac_snps_used < 0.5:
+        logging.warning(
+            "The l-ctPred arm used only %.0f%% of the variants its models "
+            "contain, so most of its genes were dropped for lack of a usable "
+            "variant rather than by any gene filter.%s",
+            100 * frac_snps_used,
+            (
+                " Its models are keyed on chr_pos_ref_alt_b38 ids: check that "
+                "--lctpred-snp-column names a GWAS column in exactly that "
+                "format, including the same reference/alternate order and the "
+                "'_b38' suffix."
+                if id_style == ID_STYLE_VARID else ""
+            ),
+        )
+    else:
+        logging.warning(
+            "Genes with no usable variant in the LD reference or the GWAS, or "
+            "genes skipped by --max-snps-in-gene, are the usual cause."
+        )
+
+
 def comparison_metrics(
     ours: pd.DataFrame,
     theirs: pd.DataFrame,
     matched: pd.DataFrame,
-    blocks: Optional[LdBlocks] = None,
-    their_positions: Optional[dict[str, tuple[str, int]]] = None,
     suffixes: tuple[str, str] = ("_ours", "_lctpred"),
 ) -> dict:
     """
-    Side-by-side significance and LD-block counts, plus their overlap.
+    How the two arms' hit lists relate on the genes they both test.
 
-    Each side is corrected against its own gene count, which is the right thing
-    to do -- the two models test different transcriptomes -- but it does mean
-    the Bonferroni thresholds differ, so `n_genes_tested` is reported for both.
+    Each arm's own significance counts and LD-block coverage are produced by the
+    per-arm analysis; what is left here is strictly the overlap. Note that each
+    side is corrected against its own gene count, which is right -- the two
+    models test different transcriptomes -- but does mean the two Bonferroni
+    thresholds differ.
     """
     ours_suffix, theirs_suffix = suffixes
-    statistics: dict = {
-        "lctpred_n_genes_tested": int(theirs["pvalue"].notna().sum()),
-        "lctpred_n_significant_fdr": int(theirs.get("significant_fdr", pd.Series(dtype=bool)).sum()),
-        "lctpred_n_significant_bonferroni": int(
-            theirs.get("significant_bonferroni", pd.Series(dtype=bool)).sum()
-        ),
-        "n_genes_shared_with_lctpred": int(len(matched)),
-    }
+    statistics: dict = {"n_genes_shared": int(len(matched))}
 
     for criterion in ("fdr", "bonferroni"):
         ours_column = f"significant_{criterion}{ours_suffix}"
@@ -370,28 +464,25 @@ def comparison_metrics(
             continue
         mine = matched[ours_column].fillna(False)
         yours = matched[theirs_column].fillna(False)
-        statistics[f"shared_{criterion}_both"] = int((mine & yours).sum())
-        statistics[f"shared_{criterion}_ours_only"] = int((mine & ~yours).sum())
-        statistics[f"shared_{criterion}_lctpred_only"] = int((~mine & yours).sum())
-
-    if blocks is not None and their_positions:
-        located = theirs.copy()
-        located["gene_key"] = located["gene"].astype(str).str.split(".").str[0]
-        assignment = blocks.assign_frame(their_positions, located["gene_key"].tolist())
-        located = located.merge(
-            assignment.rename(columns={"gene": "gene_key"}), on="gene_key", how="left"
+        statistics[f"{criterion}_both"] = int((mine & yours).sum())
+        statistics[f"{criterion}_ours_only"] = int((mine & ~yours).sum())
+        statistics[f"{criterion}_lctpred_only"] = int((~mine & yours).sum())
+        union = int((mine | yours).sum())
+        statistics[f"{criterion}_jaccard"] = (
+            statistics[f"{criterion}_both"] / union if union else float("nan")
         )
-        located["block_index"] = located["block_index"].fillna(-1).astype(int)
-        for criterion in ("bonferroni", "fdr"):
-            column = f"significant_{criterion}"
-            if column in located.columns:
-                statistics.update(
-                    block_metrics(
-                        located, blocks,
-                        mask=located[column].fillna(False),
-                        prefix=f"lctpred_{criterion}_",
-                    )
-                )
+
+    for suffix, side in ((ours_suffix, "ours"), (theirs_suffix, "lctpred")):
+        column = f"zscore{suffix}"
+        if column in matched.columns:
+            statistics[f"mean_abs_zscore_{side}"] = float(
+                matched[column].abs().mean()
+            )
+    left, right = f"zscore{ours_suffix}", f"zscore{theirs_suffix}"
+    if left in matched.columns and right in matched.columns:
+        pair = matched[[left, right]].dropna()
+        if len(pair) > 2:
+            statistics["zscore_correlation"] = float(pair[left].corr(pair[right]))
     return statistics
 
 
@@ -405,6 +496,9 @@ __all__ = [
     "check_snp_overlap",
     "comparison_metrics",
     "discover_lctpred_models",
+    "gene_keys",
+    "gene_overlap_report",
+    "log_overlap_report",
     "match_model",
     "matched_pvalues",
     "normalize_cell_type",

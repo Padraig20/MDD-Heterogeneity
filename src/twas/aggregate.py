@@ -28,7 +28,9 @@ and does not absorb that spread, which makes it anti-conservative.
 GENE_COLUMNS = ["gene", "gene_name"]
 
 # Per-draw columns carried into the tidy `long` frame.
-DRAW_COLUMNS = ["zscore", "pvalue", "effect_size", "n_snps_used", "best_gwas_p"]
+DRAW_COLUMNS = [
+    "zscore", "pvalue", "effect_size", "n_snps_used", "n_snps_in_model", "best_gwas_p",
+]
 
 Z_CI_MULTIPLIER = 1.959963984540054  # two-sided 95%
 
@@ -128,6 +130,8 @@ def aggregate_draws(
         specification["effect_size_mean"] = ("effect_size", "mean")
     if "n_snps_used" in long.columns:
         specification["mean_n_snps_used"] = ("n_snps_used", "mean")
+    if "n_snps_in_model" in long.columns:
+        specification["n_snps_in_model"] = ("n_snps_in_model", "mean")
     if "best_gwas_p" in long.columns:
         # Identical across draws up to which SNPs each fit kept, so the minimum
         # is the strength of the GWAS signal available at the locus.
@@ -198,6 +202,7 @@ def aggregate_draws(
         "n_draws_significant_fdr",
         "agreement_fdr",
         "mean_n_snps_used",
+        "n_snps_in_model",
         "best_gwas_p",
         "significant_fdr",
         "significant_bonferroni",
@@ -385,6 +390,15 @@ def summarize(
         summary["mean_n_snps_used"] = float(frame["n_snps_used"].mean())
     elif "mean_n_snps_used" in frame.columns:
         summary["mean_n_snps_used"] = float(frame["mean_n_snps_used"].mean())
+    if "n_snps_in_model" in frame.columns and "mean_n_snps_used" in summary:
+        # How much of each model actually survived the join against the GWAS and
+        # the covariance. A value far below 1 is the signature of the two sides
+        # disagreeing about variant identifiers rather than of a sparse model.
+        in_model = float(frame["n_snps_in_model"].mean())
+        summary["mean_n_snps_in_model"] = in_model
+        summary["frac_model_snps_used"] = (
+            summary["mean_n_snps_used"] / in_model if in_model else float("nan")
+        )
     if "zscore_sd" in frame.columns:
         sds = frame["zscore_sd"].to_numpy(dtype=float)
         if np.isfinite(sds).any():

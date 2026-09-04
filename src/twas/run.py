@@ -33,6 +33,8 @@ from src.twas.compare import (
     LctpredModel,
     comparison_metrics,
     discover_lctpred_models,
+    gene_overlap_report,
+    log_overlap_report,
     match_model,
     matched_pvalues,
     read_db_metadata,
@@ -86,6 +88,13 @@ Example
 
 DEFAULT_METAXCAN_DIR = Path("metaxcan/software")
 DEFAULT_GENE_NAME_MAP = Path("data/mdd_genes.tsv")
+
+# Every result is namespaced by which model produced it. The prefixes become
+# the section headings in WandB and the subdirectories on disk, so the two arms
+# stay legible side by side instead of interleaving in one flat list.
+ARM_OURS = "this-study"
+ARM_CTPRED = "ctPred"
+ARM_COMPARISON = "comparison"
 
 
 def parse_args() -> argparse.Namespace:
@@ -546,16 +555,72 @@ def run_draws(
     return results, model_stats
 
 
+def _prefix(mapping: dict, arm: str) -> dict:
+    """Namespace one arm's keys, which is what groups them in WandB."""
+    return {f"{arm}/{key}": value for key, value in mapping.items()}
+
+
+def analyse_arm(
+    frame: pd.DataFrame,
+    positions: dict[str, tuple[str, int]],
+    blocks: Optional[LdBlocks],
+    cell_type: str,
+    arm: str,
+    fdr: float,
+    top_n: int,
+    annotate: bool = True,
+) -> tuple[pd.DataFrame, dict, dict, dict]:
+    """
+    The full single-model analysis, run identically for either arm.
+
+    Both this study's models and l-ctPred's go through the same significance
+    correction, the same LD-block counting and the same figures, so the two
+    sides of the comparison are never advantaged by different post-processing.
+    Everything comes back namespaced under `arm`.
+    """
+    if annotate:
+        frame = annotate_significance(frame, fdr=fdr)
+
+    statistics: dict = {}
+    if blocks is not None and positions:
+        assignment = blocks.assign_frame(positions, frame["gene"].tolist())
+        frame = frame.merge(assignment, on="gene", how="left")
+        frame["block_index"] = frame["block_index"].fillna(-1).astype(int)
+        for criterion in ("bonferroni", "fdr"):
+            column = f"significant_{criterion}"
+            if column in frame.columns:
+                statistics.update(
+                    block_metrics(
+                        frame, blocks,
+                        mask=frame[column].fillna(False),
+                        prefix=f"{criterion}_",
+                    )
+                )
+    statistics.update(summarize(frame, fdr=fdr))
+
+    figures: dict[str, Optional[plt.Figure]] = {
+        "manhattan": plots.manhattan(frame, positions, cell_type, fdr=fdr),
+        "qq": plots.qq(frame, cell_type),
+        "volcano": plots.volcano(frame, cell_type, fdr=fdr),
+        "zscore_histogram": plots.zscore_histogram(frame, cell_type),
+    }
+    if "block_index" in frame.columns:
+        figures["ld_block_gene_counts"] = plots.ld_block_gene_counts(frame, cell_type)
+
+    tables = {"results": frame, "top_genes": plots.top_genes(frame, n=top_n)}
+    return frame, _prefix(statistics, arm), _prefix(figures, arm), _prefix(tables, arm)
+
+
 def compare_to_lctpred(
-    final: pd.DataFrame,
     model: LctpredModel,
     args: argparse.Namespace,
     gwas: GwasOptions,
     blocks: Optional[LdBlocks],
     cell_dir: Path,
-) -> tuple[dict, dict[str, Optional[plt.Figure]], dict[str, pd.DataFrame]]:
+) -> tuple[pd.DataFrame, object]:
     """
-    Run S-PrediXcan against one l-ctPred model and put the two results together.
+    Run S-PrediXcan against one l-ctPred model, returning its results and the
+    metadata read off its DB.
 
     Their DB is used exactly as shipped, with their covariance, so the only
     thing that differs between the two arms is the prediction model itself.
@@ -584,7 +649,7 @@ def compare_to_lctpred(
         keep_non_rsid=gwas.keep_non_rsid or metadata.id_style == ID_STYLE_VARID,
     )
 
-    comparison_dir = cell_dir / "lctpred"
+    comparison_dir = cell_dir / ARM_CTPRED
     comparison_dir.mkdir(parents=True, exist_ok=True)
     theirs = run_lctpred(
         model=model,
@@ -598,63 +663,24 @@ def compare_to_lctpred(
         theirs["gene_name"] = (
             theirs["gene"].astype(str).str.split(".").str[0].map(metadata.gene_names)
         )
-
-    matched = matched_pvalues(final, theirs)
-    statistics = comparison_metrics(
-        final, theirs, matched, blocks=blocks, their_positions=metadata.positions
-    )
-    statistics["lctpred_model"] = model.name
-    statistics["lctpred_build"] = metadata.build
-    statistics["lctpred_n_genes_in_model"] = metadata.n_genes
-
-    theirs.to_csv(comparison_dir / "results.csv", index=False)
-    matched.to_csv(comparison_dir / "matched_genes.csv", index=False)
-
-    figures = {
-        "lctpred_qq": plots.qq_comparison(final, theirs, cell_dir.name),
-        "lctpred_scatter": plots.pvalue_scatter(matched, cell_dir.name),
-    }
-    tables = {"lctpred_top_genes": plots.top_genes(theirs, n=args.top_n)}
-    return statistics, figures, tables
+    return theirs, metadata
 
 
-def analyse_blocks_and_agreement(
+def analyse_agreement(
     final: pd.DataFrame,
-    ld,
     blocks: Optional[LdBlocks],
     args: argparse.Namespace,
     is_mi: bool,
-) -> tuple[pd.DataFrame, dict, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+) -> tuple[dict, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
-    Count how many independent LD blocks the hits span, and for an MI run how
-    that count survives demanding agreement between the member-bootstrap fits.
+    For an MI run, how the LD-block count survives demanding agreement between
+    the member-bootstrap fits.
 
-    Genes are located by the midpoint of their model's cis window, taken from
-    the covariance metadata, which means the coordinates are the reference
-    panel's -- hence the build check against the block file.
-
-    Either half works alone: without `--ld-blocks` the agreement strata are
-    still produced, just without their block columns.
+    Expects `final` to already carry the `block_index` column `analyse_arm`
+    adds. Either half works alone: without `--ld-blocks` the agreement strata
+    are still produced, just without their block columns.
     """
     statistics: dict = {}
-    if blocks is not None:
-        assignment = blocks.assign_frame(ld.gene_positions(), final["gene"].tolist())
-        final = final.merge(assignment, on="gene", how="left")
-        final["block_index"] = final["block_index"].fillna(-1).astype(int)
-
-        statistics = {"ld_blocks": blocks.name, "ld_blocks_build": blocks.build}
-        for criterion in ("bonferroni", "fdr"):
-            column = f"significant_{criterion}"
-            if column in final.columns:
-                statistics.update(
-                    block_metrics(
-                        final,
-                        blocks,
-                        mask=final[column].fillna(False),
-                        prefix=f"{criterion}_",
-                    )
-                )
-
     curve = strata = None
     agreement_column = f"agreement_{args.agreement_criterion}"
     if is_mi and agreement_column in final.columns:
@@ -678,38 +704,28 @@ def analyse_blocks_and_agreement(
             statistics["frac_genes_retained_at_80pct"] = float(
                 at_80["frac_genes_retained"].iloc[0]
             )
-    return final, statistics, curve, strata
+    return statistics, curve, strata
 
 
-def build_figures(
+def mi_figures(
     final: pd.DataFrame,
-    long: Optional[pd.DataFrame],
-    ld,
+    long: pd.DataFrame,
     cell_type: str,
-    fdr: float,
     curve: Optional[pd.DataFrame] = None,
     agreement_column: str = "agreement_bonferroni",
 ) -> dict[str, Optional[plt.Figure]]:
+    """The multiple-imputation diagnostics, which only this study's arm has."""
     figures = {
-        "manhattan": plots.manhattan(final, ld.gene_positions(), cell_type, fdr=fdr),
-        "qq": plots.qq(final, cell_type),
-        "volcano": plots.volcano(final, cell_type, fdr=fdr),
-        "zscore_histogram": plots.zscore_histogram(final, cell_type),
+        "mi_stability": plots.mi_stability(final, cell_type),
+        "mi_draw_spread": plots.mi_draw_spread(long, cell_type),
+        "mi_draw_summary": plots.mi_draw_summary(draw_spread(long), cell_type),
+        "mi_agreement": plots.agreement_histogram(
+            final, cell_type, agreement_column=agreement_column
+        ),
+        "mi_agreement_vs_strength": plots.agreement_vs_strength(
+            final, cell_type, agreement_column=agreement_column
+        ),
     }
-    if long is not None:
-        figures["mi_stability"] = plots.mi_stability(final, cell_type)
-        figures["mi_draw_spread"] = plots.mi_draw_spread(long, cell_type)
-        figures["mi_draw_summary"] = plots.mi_draw_summary(
-            draw_spread(long), cell_type
-        )
-        figures["mi_agreement"] = plots.agreement_histogram(
-            final, cell_type, agreement_column=agreement_column
-        )
-        figures["mi_agreement_vs_strength"] = plots.agreement_vs_strength(
-            final, cell_type, agreement_column=agreement_column
-        )
-    if "block_index" in final.columns:
-        figures["ld_block_gene_counts"] = plots.ld_block_gene_counts(final, cell_type)
     if curve is not None:
         figures["mi_agreement_ld_blocks"] = plots.agreement_ld_block_curve(
             curve, cell_type
@@ -787,36 +803,81 @@ def process_cell_type(
     else:
         final = annotate_significance(next(iter(per_draw.values())), fdr=args.fdr)
 
-    final, block_stats, curve, strata = analyse_blocks_and_agreement(
-        final, ld, blocks, args, is_mi=spec.kind == KIND_MI
+    # This study's arm: significance, LD blocks, summary statistics, figures.
+    final, summary, figures, tables = analyse_arm(
+        final, ld.gene_positions(), blocks, cell_type,
+        arm=ARM_OURS, fdr=args.fdr, top_n=args.top_n, annotate=False,
     )
+    summary.update(_prefix({
+        **model_stats,
+        "n_genes_in_model": len(spec.snp_sets),
+        "n_reference_individuals": ld.meta["reference"]["n_individuals"],
+        "n_genes_in_ld_reference": ld.meta["n_genes_written"],
+    }, ARM_OURS))
+    summary.update({
+        "cell_type": cell_type,
+        "model_source": spec.source,
+        "model_kind": spec.kind,
+        "standardized_weights_rescaled": spec.standardized,
+    })
+    if blocks is not None:
+        summary.update({"ld_blocks": blocks.name, "ld_blocks_build": blocks.build})
 
-    summary = summarize(
-        final,
-        fdr=args.fdr,
-        extra={
-            **model_stats,
-            **block_stats,
-            "model_source": spec.source,
-            "model_kind": spec.kind,
-            "standardized_weights_rescaled": spec.standardized,
-            "n_reference_individuals": ld.meta["reference"]["n_individuals"],
-            "n_genes_in_ld_reference": ld.meta["n_genes_written"],
-        },
+    agreement_stats, curve, strata = analyse_agreement(
+        final, blocks, args, is_mi=spec.kind == KIND_MI
     )
     if spec.kind == KIND_MI:
-        summary.update(
+        agreement_stats.update(
             agreement_summary(final, agreement_column=f"agreement_{args.agreement_criterion}")
         )
+        figures.update(_prefix(
+            mi_figures(
+                final, long, cell_type, curve=curve,
+                agreement_column=f"agreement_{args.agreement_criterion}",
+            ),
+            ARM_OURS,
+        ))
+        tables[f"{ARM_OURS}/draw_spread"] = draw_spread(long)
+    summary.update(_prefix(agreement_stats, ARM_OURS))
+    if curve is not None:
+        tables[f"{ARM_OURS}/agreement_ld_block_curve"] = curve
+    if strata is not None and not strata.empty:
+        tables[f"{ARM_OURS}/agreement_strata"] = strata
 
-    comparison_figures: dict[str, Optional[plt.Figure]] = {}
-    comparison_tables: dict[str, pd.DataFrame] = {}
+    # l-ctPred's arm, through exactly the same analysis, plus the head-to-head.
     if lctpred is not None:
         try:
-            stats, comparison_figures, comparison_tables = compare_to_lctpred(
-                final, lctpred, args, gwas, blocks, cell_dir
+            theirs, metadata = compare_to_lctpred(lctpred, args, gwas, blocks, cell_dir)
+            theirs, their_summary, their_figures, their_tables = analyse_arm(
+                theirs, metadata.positions, blocks, cell_type,
+                arm=ARM_CTPRED, fdr=args.fdr, top_n=args.top_n, annotate=False,
             )
-            summary.update(stats)
+            summary.update(their_summary)
+            summary.update(_prefix({
+                "model": lctpred.name,
+                "build": metadata.build,
+                "n_genes_in_model": metadata.n_genes,
+                "snp_id_style": metadata.id_style,
+            }, ARM_CTPRED))
+            figures.update(their_figures)
+            tables.update(their_tables)
+
+            overlap = gene_overlap_report(spec.snp_sets, metadata.genes, final, theirs)
+            log_overlap_report(
+                overlap,
+                id_style=metadata.id_style,
+                frac_snps_used=their_summary.get(f"{ARM_CTPRED}/frac_model_snps_used"),
+            )
+            matched = matched_pvalues(final, theirs)
+            summary.update(_prefix(
+                {**overlap, **comparison_metrics(final, theirs, matched)},
+                ARM_COMPARISON,
+            ))
+            figures.update(_prefix({
+                "qq": plots.qq_comparison(final, theirs, cell_type),
+                "scatter": plots.pvalue_scatter(matched, cell_type),
+            }, ARM_COMPARISON))
+            tables[f"{ARM_COMPARISON}/matched_genes"] = matched
         except Exception as error:  # noqa: BLE001 - the comparison is an extra
             if not args.continue_on_error:
                 raise
@@ -826,64 +887,52 @@ def process_cell_type(
 
     # Persist everything before touching WandB, so a logging failure cannot lose
     # a run that took hours of S-PrediXcan.
-    final.to_csv(cell_dir / "results.csv", index=False)
-    top = plots.top_genes(final, n=args.top_n)
-    top.to_csv(cell_dir / "top_genes.csv", index=False)
+    for name, table in tables.items():
+        path = cell_dir / f"{name}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        table.to_csv(path, index=False)
     if long is not None:
-        long.to_csv(cell_dir / "per_draw_zscores.csv", index=False)
-        draw_spread(long).to_csv(cell_dir / "draw_spread.csv", index=False)
-    if curve is not None:
-        curve.to_csv(cell_dir / "agreement_ld_block_curve.csv", index=False)
-    if strata is not None and not strata.empty:
-        strata.to_csv(cell_dir / "agreement_strata.csv", index=False)
+        long.to_csv(cell_dir / f"{ARM_OURS}/per_draw_zscores.csv", index=False)
     with (cell_dir / "summary.json").open("w") as handle:
         json.dump(summary, handle, indent=2)
 
-    figures = build_figures(
-        final, long, ld, cell_type, args.fdr,
-        curve=curve,
-        agreement_column=f"agreement_{args.agreement_criterion}",
-    )
-    figures.update(comparison_figures)
     figure_dir = cell_dir / "figures"
-    figure_dir.mkdir(exist_ok=True)
     for name, figure in figures.items():
         if figure is not None:
-            figure.savefig(figure_dir / f"{name}.png", dpi=150)
-
-    tables = {"top_genes": top}
-    if long is not None:
-        tables["draw_spread"] = draw_spread(long)
-    if curve is not None:
-        tables["agreement_ld_block_curve"] = curve
-    if strata is not None and not strata.empty:
-        tables["agreement_strata"] = strata
-    tables.update(comparison_tables)
+            path = figure_dir / f"{name}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            figure.savefig(path, dpi=150)
 
     logger.start(cell_type, config=_wandb_config(args, spec))
     try:
-        logger.log_results(final, summary, figures, tables=tables)
+        logger.log_results(summary, figures, tables=tables)
     finally:
         logger.finish()
         for figure in figures.values():
             if figure is not None:
                 plt.close(figure)
 
-    logging.info(
-        "Cell type '%s': %d gene(s) tested, %d significant at BH FDR %g, "
-        "lambda_GC = %.3f.",
-        cell_type, summary["n_genes_tested"], summary["n_significant_fdr"],
-        args.fdr, summary["lambda_gc"],
-    )
-    if "bonferroni_n_ld_blocks" in summary:
+    for arm in (ARM_OURS, ARM_CTPRED):
+        if f"{arm}/n_genes_tested" not in summary:
+            continue
         logging.info(
-            "Cell type '%s': %d Bonferroni-significant gene(s) from %d different "
-            "LD block(s) among %d pre-defined blocks (%.2f genes per block).",
-            cell_type, summary["n_significant_bonferroni"],
-            summary["bonferroni_n_ld_blocks"], summary["bonferroni_n_ld_blocks_total"],
-            summary["bonferroni_genes_per_ld_block"],
+            "Cell type '%s' [%s]: %d gene(s) tested, %d significant at BH FDR %g, "
+            "lambda_GC = %.3f.",
+            cell_type, arm, summary[f"{arm}/n_genes_tested"],
+            summary[f"{arm}/n_significant_fdr"], args.fdr,
+            summary[f"{arm}/lambda_gc"],
         )
-    return {"cell_type": cell_type, **summary}
+        if f"{arm}/bonferroni_n_ld_blocks" in summary:
+            logging.info(
+                "Cell type '%s' [%s]: %d Bonferroni-significant gene(s) from %d "
+                "different LD block(s) among %d pre-defined blocks (%.2f genes "
+                "per block).",
+                cell_type, arm, summary[f"{arm}/n_significant_bonferroni"],
+                summary[f"{arm}/bonferroni_n_ld_blocks"],
+                summary[f"{arm}/bonferroni_n_ld_blocks_total"],
+                summary[f"{arm}/bonferroni_genes_per_ld_block"],
+            )
+    return summary
 
 
 def _wandb_config(args: argparse.Namespace, spec: ModelSpec) -> dict:
@@ -998,7 +1047,9 @@ def main() -> None:
             failures.append(model_path.stem)
 
     if summaries:
-        overview = pd.DataFrame(summaries).sort_values("n_significant_fdr", ascending=False)
+        overview = pd.DataFrame(summaries).sort_values(
+            f"{ARM_OURS}/n_significant_fdr", ascending=False
+        )
         overview.to_csv(output_dir / "summary.csv", index=False)
         logging.info("Wrote the cross-cell-type overview to %s.", output_dir / "summary.csv")
     if unmatched:
