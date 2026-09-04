@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,17 @@ from src.twas.aggregate import (
     annotate_significance,
     draw_spread,
     summarize,
+)
+from src.twas.compare import (
+    DEFAULT_COVARIANCE_SUFFIX,
+    ID_STYLE_VARID,
+    LctpredModel,
+    comparison_metrics,
+    discover_lctpred_models,
+    match_model,
+    matched_pvalues,
+    read_db_metadata,
+    run_lctpred,
 )
 from src.twas.covariance import build_covariance, load_ld_reference, snp_set_hash
 from src.twas.ld_blocks import (
@@ -302,6 +314,42 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    comparison = parser.add_argument_group("l-ctPred comparison")
+    comparison.add_argument(
+        "--lctpred-model-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of scPrediXcan l-ctPred models, holding a <cell type>.db "
+            "beside its <cell type>_covariances.txt.gz. Supplying it runs a second "
+            "S-PrediXcan on the same GWAS with those models and reports the two "
+            "side by side. Omit to skip the comparison entirely."
+        ),
+    )
+    comparison.add_argument(
+        "--lctpred-covariance-suffix",
+        type=str,
+        default=DEFAULT_COVARIANCE_SUFFIX,
+        help="Suffix pairing a covariance file with its .db.",
+    )
+    comparison.add_argument(
+        "--lctpred-snp-column",
+        type=str,
+        default=None,
+        help=(
+            "GWAS column holding the variant ids the l-ctPred DB uses, when it "
+            "differs from --snp-column. Their models are keyed on "
+            "chr1_12345_A_G_b38 style ids rather than rs numbers, so an rs-id "
+            "GWAS needs either this or --lctpred-snp-map-file to match anything."
+        ),
+    )
+    comparison.add_argument(
+        "--lctpred-snp-map-file",
+        type=str,
+        default=None,
+        help="S-PrediXcan --snp_map_file translating GWAS ids to l-ctPred model ids.",
+    )
+
     output = parser.add_argument_group("output")
     output.add_argument(
         "-o", "--output-dir",
@@ -498,6 +546,78 @@ def run_draws(
     return results, model_stats
 
 
+def compare_to_lctpred(
+    final: pd.DataFrame,
+    model: LctpredModel,
+    args: argparse.Namespace,
+    gwas: GwasOptions,
+    blocks: Optional[LdBlocks],
+    cell_dir: Path,
+) -> tuple[dict, dict[str, Optional[plt.Figure]], dict[str, pd.DataFrame]]:
+    """
+    Run S-PrediXcan against one l-ctPred model and put the two results together.
+
+    Their DB is used exactly as shipped, with their covariance, so the only
+    thing that differs between the two arms is the prediction model itself.
+    """
+    logging.info(
+        "Comparing '%s' against the l-ctPred model %s.", cell_dir.name, model.db_path.name
+    )
+    metadata = read_db_metadata(model.db_path)
+
+    if blocks is not None and metadata.build and metadata.build != blocks.build:
+        # Their coordinates come from the varIDs, so a build clash here is just
+        # as fatal to the block count as it is on our own side.
+        raise ValueError(
+            f"The l-ctPred model {model.db_path.name} is on {metadata.build} but the "
+            f"LD blocks are {blocks.build}; its LD-block count would be meaningless."
+        )
+
+    # Their models live in a different identifier space, so the GWAS may have to
+    # be read through a different column or mapping for this arm. MetaXcan also
+    # discards any variant whose id does not start with 'rs' unless told not to,
+    # which would throw away every varID before it ever reached the model.
+    their_gwas = replace(
+        gwas,
+        snp_column=args.lctpred_snp_column or gwas.snp_column,
+        snp_map_file=args.lctpred_snp_map_file or gwas.snp_map_file,
+        keep_non_rsid=gwas.keep_non_rsid or metadata.id_style == ID_STYLE_VARID,
+    )
+
+    comparison_dir = cell_dir / "lctpred"
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    theirs = run_lctpred(
+        model=model,
+        gwas=their_gwas,
+        metaxcan_dir=args.metaxcan_dir,
+        output_path=comparison_dir / "results.csv",
+        fdr=args.fdr,
+        metadata=metadata,
+    )
+    if "gene_name" not in theirs.columns or theirs["gene_name"].isna().all():
+        theirs["gene_name"] = (
+            theirs["gene"].astype(str).str.split(".").str[0].map(metadata.gene_names)
+        )
+
+    matched = matched_pvalues(final, theirs)
+    statistics = comparison_metrics(
+        final, theirs, matched, blocks=blocks, their_positions=metadata.positions
+    )
+    statistics["lctpred_model"] = model.name
+    statistics["lctpred_build"] = metadata.build
+    statistics["lctpred_n_genes_in_model"] = metadata.n_genes
+
+    theirs.to_csv(comparison_dir / "results.csv", index=False)
+    matched.to_csv(comparison_dir / "matched_genes.csv", index=False)
+
+    figures = {
+        "lctpred_qq": plots.qq_comparison(final, theirs, cell_dir.name),
+        "lctpred_scatter": plots.pvalue_scatter(matched, cell_dir.name),
+    }
+    tables = {"lctpred_top_genes": plots.top_genes(theirs, n=args.top_n)}
+    return statistics, figures, tables
+
+
 def analyse_blocks_and_agreement(
     final: pd.DataFrame,
     ld,
@@ -605,6 +725,7 @@ def process_cell_type(
     logger: TwasWandBLogger,
     reference=None,
     blocks: Optional[LdBlocks] = None,
+    lctpred: Optional[LctpredModel] = None,
 ) -> dict:
     """Run the full three-step pipeline for one cell type."""
     spec = load_model_json(
@@ -688,6 +809,21 @@ def process_cell_type(
             agreement_summary(final, agreement_column=f"agreement_{args.agreement_criterion}")
         )
 
+    comparison_figures: dict[str, Optional[plt.Figure]] = {}
+    comparison_tables: dict[str, pd.DataFrame] = {}
+    if lctpred is not None:
+        try:
+            stats, comparison_figures, comparison_tables = compare_to_lctpred(
+                final, lctpred, args, gwas, blocks, cell_dir
+            )
+            summary.update(stats)
+        except Exception as error:  # noqa: BLE001 - the comparison is an extra
+            if not args.continue_on_error:
+                raise
+            logging.error(
+                "The l-ctPred comparison for '%s' failed: %s", cell_type, error
+            )
+
     # Persist everything before touching WandB, so a logging failure cannot lose
     # a run that took hours of S-PrediXcan.
     final.to_csv(cell_dir / "results.csv", index=False)
@@ -708,6 +844,7 @@ def process_cell_type(
         curve=curve,
         agreement_column=f"agreement_{args.agreement_criterion}",
     )
+    figures.update(comparison_figures)
     figure_dir = cell_dir / "figures"
     figure_dir.mkdir(exist_ok=True)
     for name, figure in figures.items():
@@ -721,6 +858,7 @@ def process_cell_type(
         tables["agreement_ld_block_curve"] = curve
     if strata is not None and not strata.empty:
         tables["agreement_strata"] = strata
+    tables.update(comparison_tables)
 
     logger.start(cell_type, config=_wandb_config(args, spec))
     try:
@@ -790,6 +928,17 @@ def main() -> None:
         logging.error("%s", error)
         sys.exit(1)
 
+    lctpred_models: dict = {}
+    if args.lctpred_model_dir is not None:
+        try:
+            lctpred_models = discover_lctpred_models(
+                args.lctpred_model_dir,
+                covariance_suffix=args.lctpred_covariance_suffix,
+            )
+        except (FileNotFoundError, NotADirectoryError) as error:
+            logging.error("%s", error)
+            sys.exit(1)
+
     blocks = None
     if args.ld_blocks is not None:
         try:
@@ -830,12 +979,16 @@ def main() -> None:
     logging.info("Running TWAS for %d cell type(s).", len(model_paths))
     summaries: list[dict] = []
     failures: list[str] = []
+    unmatched: list[str] = []
     for model_path in tqdm(model_paths, desc="Cell types"):
+        lctpred = match_model(lctpred_models, model_path.stem) if lctpred_models else None
+        if lctpred_models and lctpred is None:
+            unmatched.append(model_path.stem)
         try:
             summaries.append(
                 process_cell_type(
                     model_path, args, gwas, gene_names, logger,
-                    reference=reference, blocks=blocks,
+                    reference=reference, blocks=blocks, lctpred=lctpred,
                 )
             )
         except Exception as error:  # noqa: BLE001 - one bad cell type must not kill the sweep
@@ -848,6 +1001,12 @@ def main() -> None:
         overview = pd.DataFrame(summaries).sort_values("n_significant_fdr", ascending=False)
         overview.to_csv(output_dir / "summary.csv", index=False)
         logging.info("Wrote the cross-cell-type overview to %s.", output_dir / "summary.csv")
+    if unmatched:
+        logging.warning(
+            "%d cell type(s) had no l-ctPred counterpart in %s and were run "
+            "without a comparison: %s",
+            len(unmatched), args.lctpred_model_dir, unmatched,
+        )
     if failures:
         logging.warning("%d cell type(s) failed: %s", len(failures), failures)
     logging.info("Done.")

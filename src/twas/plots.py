@@ -612,6 +612,128 @@ def ld_block_gene_counts(
     return fig
 
 
+def qq_comparison(
+    ours: pd.DataFrame,
+    theirs: pd.DataFrame,
+    cell_type: str,
+    ours_label: str = "This study",
+    theirs_label: str = "l-ctPred (scPrediXcan)",
+) -> Optional[plt.Figure]:
+    """
+    Quantile-quantile plot of the two methods' evidence, ours on the y-axis.
+
+    Both sets of p-values are sorted independently and matched quantile against
+    quantile, so this asks whether one method's *distribution* of evidence sits
+    above the other's rather than whether the two agree gene by gene. Points
+    above the diagonal mean we carry more signal at the same quantile; the
+    companion `pvalue_scatter` answers the per-gene question.
+    """
+    from src.twas.compare import two_sample_quantiles
+
+    x, y = two_sample_quantiles(
+        _neg_log10(theirs["pvalue"].to_numpy(dtype=float)),
+        _neg_log10(ours["pvalue"].to_numpy(dtype=float)),
+    )
+    if x.size == 0:
+        return None
+
+    limit = float(max(x.max(), y.max())) * 1.05 or 1.0
+    fig, ax = plt.subplots(figsize=(6.5, 6.2))
+    ax.plot([0, limit], [0, limit], "--", color="0.55", linewidth=1.6, label="y = x")
+    ax.scatter(x, y, s=14, color="black", alpha=0.75, edgecolor="none")
+    ax.set_xlim(0, limit)
+    ax.set_ylim(0, limit)
+    ax.set_aspect("equal")
+    ax.set_xlabel(rf"{theirs_label}  $-\log_{{10}}$ p")
+    ax.set_ylabel(rf"{ours_label}  $-\log_{{10}}$ p")
+    ax.set_title(f"Quantile-quantile plot of TWAS $-\\log_{{10}}$p\n{cell_type}", fontsize=11)
+    above = float(np.mean(y > x)) if y.size else float("nan")
+    ax.text(
+        0.03, 0.97,
+        f"{above:.0%} of quantiles above y = x\n"
+        f"{len(ours):,} vs {len(theirs):,} genes tested",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=8,
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def pvalue_scatter(
+    matched: pd.DataFrame,
+    cell_type: str,
+    ours_label: str = "This study",
+    theirs_label: str = "l-ctPred (scPrediXcan)",
+    suffixes: tuple[str, str] = ("_ours", "_lctpred"),
+    label_top: int = 8,
+) -> Optional[plt.Figure]:
+    """
+    Gene-matched evidence, coloured by which method calls the gene significant.
+
+    Unlike the Q-Q plot this pairs genes, so it shows whether the two methods
+    agree case by case. Genes far off the diagonal are the interesting ones:
+    they are where the cell-type-specific model and l-ctPred disagree about the
+    same gene rather than merely about the transcriptome overall.
+    """
+    ours_suffix, theirs_suffix = suffixes
+    x_column, y_column = f"pvalue{theirs_suffix}", f"pvalue{ours_suffix}"
+    if x_column not in matched.columns or y_column not in matched.columns:
+        return None
+    data = matched.dropna(subset=[x_column, y_column]).reset_index(drop=True)
+    if data.empty:
+        return None
+
+    x = _neg_log10(data[x_column].to_numpy(dtype=float))
+    y = _neg_log10(data[y_column].to_numpy(dtype=float))
+    mine = data.get(f"significant_bonferroni{ours_suffix}", pd.Series(False, index=data.index)).fillna(False).to_numpy(bool)
+    yours = data.get(f"significant_bonferroni{theirs_suffix}", pd.Series(False, index=data.index)).fillna(False).to_numpy(bool)
+
+    groups = [
+        (~mine & ~yours, "0.75", "Neither", 8),
+        (mine & yours, "#4f7f5f", "Both", 20),
+        (mine & ~yours, "#3f6fb0", f"{ours_label} only", 20),
+        (~mine & yours, "#b06a3f", f"{theirs_label} only", 20),
+    ]
+    limit = float(max(x.max(), y.max())) * 1.05 or 1.0
+
+    fig, ax = plt.subplots(figsize=(6.8, 6.4))
+    ax.plot([0, limit], [0, limit], "--", color="0.55", linewidth=1.4)
+    for mask, color, label, size in groups:
+        if mask.any():
+            ax.scatter(x[mask], y[mask], s=size, color=color, alpha=0.75,
+                       edgecolor="none", label=f"{label} ({int(mask.sum()):,})")
+    ax.set_xlim(0, limit)
+    ax.set_ylim(0, limit)
+    ax.set_aspect("equal")
+    ax.set_xlabel(rf"{theirs_label}  $-\log_{{10}}$ p")
+    ax.set_ylabel(rf"{ours_label}  $-\log_{{10}}$ p")
+    ax.set_title(f"{cell_type} — gene-matched association strength", fontsize=11)
+
+    if label_top:
+        # Label the genes the two methods disagree about most, but only among
+        # those at least one of them actually calls: a large gap between two
+        # null p-values is not a disagreement worth naming.
+        called = np.flatnonzero(mine | yours)
+        order = called[np.argsort(-np.abs(y[called] - x[called]))][:label_top]
+        names = data.get(f"gene_name{ours_suffix}", data.get("gene_name", data["gene_key"]))
+        for index in order:
+            # Labels near the left edge would otherwise run off the axes.
+            left = x[index] < limit / 2
+            ax.annotate(
+                str(names.iloc[index]) if names is not None else data["gene_key"].iloc[index],
+                (x[index], y[index]),
+                fontsize=7,
+                xytext=(4 if left else -4, 3),
+                textcoords="offset points",
+                ha="left" if left else "right",
+            )
+    ax.legend(loc="lower right", fontsize=7)
+    fig.tight_layout()
+    return fig
+
+
 def top_genes(frame: pd.DataFrame, n: int = 25) -> pd.DataFrame:
     """The strongest associations, for logging as a table."""
     columns = [
@@ -636,7 +758,9 @@ __all__ = [
     "mi_draw_spread",
     "mi_draw_summary",
     "mi_stability",
+    "pvalue_scatter",
     "qq",
+    "qq_comparison",
     "top_genes",
     "volcano",
     "zscore_histogram",
