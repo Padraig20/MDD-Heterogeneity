@@ -201,6 +201,32 @@ def load_model_json(
                 f"'{RAW_DOSAGE_SCALE}' is supported for ensemble models."
             )
 
+    snp_sets = _build_snp_sets(payload, source, path)
+
+    if kind == KIND_MI:
+        draws = _mi_draws(payload, snp_sets, mi_draws=mi_draws, seed=seed)
+    else:
+        draws = [_point_estimate_draw(payload, snp_sets, source)]
+
+    return ModelSpec(
+        cell_type=path.stem,
+        path=path,
+        source=source,
+        kind=kind,
+        standardized=standardized,
+        snp_sets=snp_sets,
+        draws=draws,
+    )
+
+
+def _build_snp_sets(payload: dict, source: str, path: Path) -> dict[str, GeneSnps]:
+    """
+    Each gene's SNP set, in the order the coefficients are stored in.
+
+    Genes with no SNPs (intercept-only fits, which `train.py` does produce) are
+    dropped: they carry no genotype signal, so there is nothing for
+    S-PrediXcan to associate and nothing to put in a covariance.
+    """
     snp_sets: dict[str, GeneSnps] = {}
     n_empty = 0
     for gene, entry in payload.items():
@@ -217,21 +243,64 @@ def load_model_json(
         )
     if not snp_sets:
         raise ValueError(f"{path}: every gene's model is empty.")
+    return snp_sets
 
-    if kind == KIND_MI:
-        draws = _mi_draws(payload, snp_sets, mi_draws=mi_draws, seed=seed)
-    else:
-        draws = [_point_estimate_draw(payload, snp_sets, source)]
 
-    return ModelSpec(
-        cell_type=path.stem,
-        path=path,
-        source=source,
-        kind=kind,
-        standardized=standardized,
-        snp_sets=snp_sets,
-        draws=draws,
+def load_snp_sets(path: Path) -> dict[str, GeneSnps]:
+    """
+    Just the gene -> SNP mapping of a weights JSON.
+
+    This is all a covariance depends on, and it is identical to
+    `load_model_json(path).snp_sets` -- including the `snp_set_hash` computed
+    from it -- while skipping the draw expansion, which for an ensemble JSON
+    means not materialising every member-bootstrap coefficient vector.
+    """
+    path = Path(path)
+    with path.open() as handle:
+        payload = json.load(handle)
+    if not payload:
+        raise ValueError(f"{path} contains no genes.")
+    return _build_snp_sets(payload, detect_source(payload), path)
+
+
+def discover_models(models_dir: Path, requested: Optional[list[str]]) -> list[Path]:
+    """
+    The weights JSONs of a model directory.
+
+    `train.py` writes `<cell type with spaces replaced by underscores>.json`, so
+    a requested cell type is accepted in either spelling. Covariance metadata
+    sidecars live in the same directory and are also `.json`, so they are
+    filtered out rather than mistaken for a twenty-third cell type.
+    """
+    from src.twas.covariance import META_SUFFIX
+
+    available = sorted(
+        path for path in Path(models_dir).glob("*.json")
+        if not path.name.endswith(META_SUFFIX)
     )
+    if not available:
+        raise FileNotFoundError(f"No *.json weights files found in {models_dir}.")
+    if requested is None:
+        return available
+
+    by_name: dict[str, Path] = {}
+    for path in available:
+        by_name[path.stem] = path
+        by_name[path.stem.replace("_", " ")] = path
+
+    selected, missing = [], []
+    for cell_type in requested:
+        path = by_name.get(cell_type) or by_name.get(cell_type.replace(" ", "_"))
+        if path is None:
+            missing.append(cell_type)
+        elif path not in selected:
+            selected.append(path)
+    if missing:
+        raise ValueError(
+            f"Requested cell type(s) not found in {models_dir}: {missing}. "
+            f"Available: {sorted({p.stem for p in available})}"
+        )
+    return selected
 
 
 def _ensemble_coefficient_scale(payload: dict) -> str:

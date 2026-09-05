@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import random
@@ -74,7 +75,15 @@ def impute_to_float(values: np.ndarray) -> np.ndarray:
 
 
 class Reference:
-    """A PLINK cohort restricted to a fixed set of individuals and SNPs."""
+    """
+    A PLINK cohort restricted to a fixed set of individuals and SNPs.
+
+    This is an index, not a reader: it says where each model SNP sits in which
+    .bed and which rows of that file the selected individuals occupy, and the
+    dosages themselves are read by the covariance workers in
+    `src/twas/covariance.py`. Keeping it read-free is what lets it be built
+    once in the parent process and used from many.
+    """
 
     def __init__(
         self,
@@ -85,6 +94,7 @@ class Reference:
         individuals: list[str],
         selection: dict,
         counts: dict[str, tuple[int, int]],
+        fam_ids: dict[str, np.ndarray],
     ) -> None:
         self.genotype_dir = Path(genotype_dir)
         self.bed_template = bed_template
@@ -93,61 +103,75 @@ class Reference:
         self.individuals = individuals
         self.selection = selection
         # chromosome -> (iid_count, sid_count), taken from the .fam/.bim we
-        # already parsed. Handing these to open_bed is what makes reopening
+        # already parsed. Handing these to open_bed is what makes opening
         # cheap: without them it counts the .bim's lines every single time,
         # which on a UKB chromosome costs far more than the read itself.
         self.counts = counts
-        self._handles: dict[str, object] = {}
+        # Kept so `with_individuals` can re-derive the row index without
+        # touching the .bim files again, which is the expensive part.
+        self.fam_ids = fam_ids
 
     @property
     def n_individuals(self) -> int:
         return len(self.individuals)
 
     def bed_path(self, chrom: str) -> Path:
-        return self.genotype_dir / f"{self.bed_template.format(chrom=chrom)}.bed"
+        return bed_path(self.genotype_dir, self.bed_template, chrom)
 
-    def handle(self, chrom: str):
+    def with_individuals(self, individuals: list[str], source: str) -> "Reference":
         """
-        A cached `open_bed` handle for one chromosome.
+        The same SNP index restricted to a different cohort.
 
-        Handles are kept open for the lifetime of the reference so a sweep over
-        thousands of genes pays the open cost once per chromosome.
+        Cell types are distilled on whichever donors their target CSV covers,
+        which need not be the same across cell types, so the cohort is resolved
+        per cell type. Only the row index changes; the SNP index -- the part
+        that costs 22 .bim passes -- is shared.
+
+        Individuals absent from the .fam are dropped rather than raising, which
+        is what `GenotypeDataset.gene_design` does when it maps target columns
+        onto BED rows.
         """
-        cached = self._handles.get(chrom)
-        if cached is None:
-            from bed_reader import open_bed
-
-            iid_count, sid_count = self.counts[chrom]
-            cached = open_bed(
-                str(self.bed_path(chrom)),
-                iid_count=iid_count,
-                sid_count=sid_count,
+        row_index, kept = _row_index_for(self.fam_ids, individuals)
+        missing = len(individuals) - len(kept)
+        if missing:
+            logging.warning(
+                "%d of %d individual(s) from %s are absent from the genotype "
+                ".fam and were dropped, leaving %d. `train.py` drops the same "
+                "ones, so this matches training.",
+                missing, len(individuals), source, len(kept),
             )
-            self._handles[chrom] = cached
-        return cached
-
-    def read_raw(self, chrom: str, var_indices: np.ndarray) -> np.ndarray:
-        """Raw int8 dosages of the given variants for the selected individuals."""
-        return self.handle(chrom).read(
-            index=np.s_[self.row_index[chrom], var_indices], dtype="int8"
+        if not kept:
+            raise ValueError(
+                f"None of the {len(individuals)} individual(s) from {source} are "
+                "present in the genotype .fam files. Check that "
+                "--genotype-template matches the cohort the models were "
+                "distilled on."
+            )
+        return Reference(
+            genotype_dir=self.genotype_dir,
+            bed_template=self.bed_template,
+            snp_index=self.snp_index,
+            row_index=row_index,
+            individuals=kept,
+            counts=self.counts,
+            fam_ids=self.fam_ids,
+            selection={
+                **self.selection,
+                "individuals_from": source,
+                "num_individuals": str(len(kept)),
+                "sample_seed": None,
+                "individual_split": None,
+                "n_individuals": len(kept),
+                "n_individuals_missing_from_fam": missing,
+                "individuals_hash": individuals_hash(kept),
+            },
         )
 
-    def read_dosages(self, chrom: str, var_indices: np.ndarray) -> np.ndarray:
-        """Mean-imputed float64 dosages of the given variants."""
-        return impute_to_float(self.read_raw(chrom, var_indices))
 
-    def close(self) -> None:
-        for handle in self._handles.values():
-            close = getattr(handle, "close", None)
-            if close is not None:
-                close()
-        self._handles.clear()
-
-    def __enter__(self) -> "Reference":
-        return self
-
-    def __exit__(self, *exception) -> None:
-        self.close()
+def bed_path(genotype_dir: Path, bed_template: str, chrom: str) -> Path:
+    """The .bed of one chromosome. Also used by the covariance workers, which
+    carry the directory and template rather than a whole `Reference`."""
+    return Path(genotype_dir) / f"{bed_template.format(chrom=chrom)}.bed"
 
 
 def split_contiguous(samples: list[str], split_idx: int, total_splits: int) -> list[str]:
@@ -248,6 +272,88 @@ def select_individual_ids(
     return chosen
 
 
+# What `dataset.py` treats as non-individual columns of a target CSV.
+TARGET_METADATA_COLUMNS = ("gene", "chrom", "tss")
+
+
+def individuals_hash(individuals: list[str]) -> str:
+    """
+    Fingerprint of *which* individuals a covariance was estimated on.
+
+    Order-independent, because a covariance does not depend on the order of the
+    rows. Recorded in the covariance metadata so two model directories can be
+    checked for having used the same people without comparing the paths the
+    lists happened to come from -- the two arms may well read different target
+    files while covering an identical cohort.
+    """
+    digest = hashlib.sha256()
+    for individual in sorted(individuals):
+        digest.update(individual.encode())
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def find_target_csv(targets: Path, cell_type: str) -> Path:
+    """
+    The target CSV of one cell type, from a file or a `--targets` directory.
+
+    `train.py` names each CSV after the cell type as it is written in the
+    single-cell data ('memory B cell.csv') but names the weights JSON with
+    underscores ('memory_B_cell.json'), so the two are matched on the folded
+    name rather than literally.
+    """
+    targets = Path(targets)
+    if targets.is_file():
+        return targets
+    if not targets.is_dir():
+        raise FileNotFoundError(f"--targets is neither a file nor a directory: {targets}")
+
+    wanted = cell_type.replace(" ", "_").lower()
+    for path in sorted(targets.glob("*.csv")):
+        if path.stem.replace(" ", "_").lower() == wanted:
+            return path
+    raise FileNotFoundError(
+        f"No target CSV for cell type '{cell_type}' in {targets}. Found: "
+        f"{sorted(p.stem for p in targets.glob('*.csv'))[:10]}"
+    )
+
+
+def read_target_individuals(
+    path: Path, max_individuals: Optional[int] = None
+) -> list[str]:
+    """
+    The individuals a model was distilled on, read off its target CSV.
+
+    This is the same derivation `GenotypeDataset.__init__` performs, and it is
+    the only reliable way to reproduce the training cohort: the individuals
+    were chosen by `get_feats_from_seqs.py` sampling the *VCF header* order,
+    which a .fam-order sample with the same seed does not reproduce. The
+    columns of the target CSV are what actually reached the elastic net, so
+    they are taken as the definition.
+
+    Order does not matter for a covariance -- only the set does -- but the
+    `max_individuals` truncation does, and it is a prefix of the column order,
+    so the column order is preserved here too.
+    """
+    path = Path(path)
+    header = pd.read_csv(path, nrows=0).columns.tolist()
+
+    if "individual" in header:
+        # Long format: one row per (gene, individual).
+        column = pd.read_csv(path, usecols=["individual"])["individual"]
+        individuals = column.astype(str).drop_duplicates().tolist()
+    else:
+        individuals = [
+            str(column) for column in header
+            if column not in TARGET_METADATA_COLUMNS
+        ]
+    if not individuals:
+        raise ValueError(f"{path} has no individual columns.")
+    if max_individuals is not None:
+        individuals = individuals[:max_individuals]
+    return individuals
+
+
 def _read_fam(fam_path: Path, genotype_template: str) -> np.ndarray:
     ids = pd.read_csv(
         fam_path,
@@ -287,8 +393,8 @@ def build_reference(
     chromosomes = chromosomes or CHROMOSOMES
 
     snp_index: dict[str, SnpRecord] = {}
-    row_index: dict[str, np.ndarray] = {}
     counts: dict[str, tuple[int, int]] = {}
+    all_fam_ids: dict[str, np.ndarray] = {}
     individuals: Optional[list[str]] = None
     duplicates = 0
 
@@ -326,21 +432,18 @@ def build_reference(
             )
 
         fam_ids = _read_fam(fam_path, genotype_template)
+        all_fam_ids[chrom] = fam_ids
         if individuals is None:
             individuals = select_individual_ids(
                 list(fam_ids), num_individuals, sample_seed, individual_split
             )
-        positions = {ind: index for index, ind in enumerate(fam_ids)}
-        missing = [ind for ind in individuals if ind not in positions]
+        missing = set(individuals) - set(fam_ids.tolist())
         if missing:
             raise ValueError(
                 f"{len(missing)} selected individual(s) are absent from {fam_path} "
-                f"(first few: {missing[:5]}); the cohort must be identical across "
-                "chromosomes."
+                f"(first few: {sorted(missing)[:5]}); the cohort must be identical "
+                "across chromosomes."
             )
-        row_index[chrom] = np.array(
-            [positions[ind] for ind in individuals], dtype=np.int64
-        )
         counts[chrom] = (len(fam_ids), len(bim))
         logging.info(
             "Indexed chromosome %s: %d of %d model SNPs found.",
@@ -367,22 +470,49 @@ def build_reference(
             "models were trained against this cohort."
         )
 
+    row_index, kept = _row_index_for(all_fam_ids, individuals)
     return Reference(
         genotype_dir=genotype_dir,
         bed_template=bed_template,
         snp_index=snp_index,
         row_index=row_index,
-        individuals=list(individuals),
+        individuals=kept,
         counts=counts,
+        fam_ids=all_fam_ids,
         selection={
             "genotype_dir": str(genotype_dir),
             "genotype_template": genotype_template,
+            "individuals_from": "--num-individuals sample of the .fam order",
             "num_individuals": num_individuals,
             "sample_seed": sample_seed,
             "individual_split": individual_split,
-            "n_individuals": len(individuals),
+            "n_individuals": len(kept),
+            "individuals_hash": individuals_hash(kept),
         },
     )
+
+
+def _row_index_for(
+    fam_ids: dict[str, np.ndarray], individuals: list[str]
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    """
+    Per-chromosome .bed row numbers for the individuals present in every .fam.
+
+    An individual missing from any chromosome is dropped from all of them, so
+    every chromosome's covariance is estimated on the same people.
+    """
+    present = set(individuals)
+    for ids in fam_ids.values():
+        present &= set(ids.tolist())
+    kept = [ind for ind in individuals if ind in present]
+
+    row_index = {}
+    for chrom, ids in fam_ids.items():
+        positions = {ind: index for index, ind in enumerate(ids)}
+        row_index[chrom] = np.array(
+            [positions[ind] for ind in kept], dtype=np.int64
+        )
+    return row_index, kept
 
 
 def default_genotype_template(genotype_dir: Path) -> Optional[str]:
@@ -398,10 +528,14 @@ __all__ = [
     "CHROMOSOMES",
     "Reference",
     "SnpRecord",
+    "TARGET_METADATA_COLUMNS",
     "apply_individual_split",
+    "bed_path",
     "build_reference",
     "default_genotype_template",
+    "find_target_csv",
     "impute_to_float",
+    "read_target_individuals",
     "select_individual_ids",
     "split_contiguous",
 ]

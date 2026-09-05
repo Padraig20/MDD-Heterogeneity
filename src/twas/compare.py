@@ -8,8 +8,6 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
-from src.twas.weights import GeneSnps
-
 """
 compare.py
 
@@ -29,15 +27,14 @@ the numbers are supposed to be making. Reading a foreign DB instead means the
 two arms also differ in their reference panel, their variant identifiers and
 their genome build, and any one of those can dominate the result.
 
-One covariance for both arms
-----------------------------
-`merge_snp_sets` unions the two models' per-gene SNP sets so a single
-covariance covers both. Because the two are distilled from the same genotypes
-over the same windows, the union is normally equal to either side and the
-covariance is bit-for-bit the one our arm would have had on its own; the union
-only matters if the two runs used different windows or MAF filters, in which
-case it keeps both arms fully covered rather than silently dropping the weights
-one of them puts on a variant the other never saw.
+One reference panel, one covariance each
+----------------------------------------
+Each arm carries its own covariance, built over the SNPs its own elastic net
+selected by `src/twas/get_covariance_matrices.py`. What has to match is not the
+covariance but the *cohort* underneath it, since an LD estimate from a
+different panel is not comparable; `warn_on_reference_mismatch` checks that the
+two directories were prepared from the same genotypes and the same individual
+selection, which they are when both were built by one run of that script.
 
 The percentile target needs no rescaling
 ----------------------------------------
@@ -87,19 +84,22 @@ def discover_ctpred_models(directory: Path) -> dict[str, Path]:
     Index a directory of ctPred weights JSONs by folded cell-type name.
 
     Same layout as `--models-dir`: one `<cell type>.json` per cell type, as
-    written by `src/distillation/train.py`.
+    written by `src/distillation/train.py`, with the covariance files beside
+    it. `discover_models` does the globbing so that the covariance metadata
+    sidecar -- also a `.json` in this directory -- is filtered out here too.
     """
+    from src.twas.weights import discover_models
+
     directory = Path(directory)
     if not directory.is_dir():
         raise NotADirectoryError(
             f"--ctpred-models-dir is not a directory: {directory}"
         )
 
-    models: dict[str, Path] = {}
-    for path in sorted(directory.glob("*.json")):
-        models[normalize_cell_type(path.stem)] = path
-    if not models:
-        raise FileNotFoundError(f"No weights JSON found in {directory}.")
+    models = {
+        normalize_cell_type(path.stem): path
+        for path in discover_models(directory, requested=None)
+    }
     logging.info("Found %d ctPred model(s) in %s.", len(models), directory)
     return models
 
@@ -109,64 +109,46 @@ def match_model(models: dict[str, Path], cell_type: str) -> Optional[Path]:
     return models.get(normalize_cell_type(cell_type))
 
 
-def merge_snp_sets(*snp_sets: Optional[dict[str, GeneSnps]]) -> dict[str, GeneSnps]:
+# Fields of a covariance's `reference` block that must agree between the arms
+# for their LD estimates to be comparable. `individuals_hash` is the one that
+# matters and is compared on the set of individuals rather than on how it was
+# chosen, since the two arms legitimately read different target files.
+REFERENCE_FIELDS = (
+    "genotype_dir",
+    "genotype_template",
+    "n_individuals",
+    "individuals_hash",
+)
+
+
+def warn_on_reference_mismatch(ours: dict, theirs: dict, cell_type: str) -> None:
     """
-    Per-gene union of several models' SNP sets, for one shared covariance.
+    Check that both arms' covariances were estimated on the same cohort.
 
-    Order is preserved -- the first model's SNPs in its own order, then
-    whatever later models add -- so that a single model in, single model out is
-    the identity and leaves `snp_set_hash` unchanged. That matters: it is what
-    lets an `--ld-dir` built before the comparison existed still be a cache hit.
+    The two arms use separate covariances -- each over the SNPs its own elastic
+    net selected -- which is fine, but only as long as the LD underneath them
+    comes from the same individuals. If one directory was prepared with a
+    different `--num-individuals`, or against different genotypes entirely,
+    then a difference in z-scores between the arms is partly a difference in
+    reference panel rather than in the models, and the comparison is not clean.
     """
-    provided = [entry for entry in snp_sets if entry]
-    if not provided:
-        return {}
-    if len(provided) == 1:
-        return dict(provided[0])
-
-    merged: dict[str, GeneSnps] = {}
-    for entry in provided:
-        for gene, genes_snps in entry.items():
-            existing = merged.get(gene)
-            if existing is None:
-                merged[gene] = genes_snps
-                continue
-            if existing.chrom != genes_snps.chrom:
-                raise ValueError(
-                    f"Gene {gene} is on chromosome {existing.chrom} in one model "
-                    f"and {genes_snps.chrom} in another; the two models were not "
-                    "built against the same annotation."
-                )
-            seen = set(existing.snp_ids)
-            extra = tuple(s for s in genes_snps.snp_ids if s not in seen)
-            if extra:
-                merged[gene] = GeneSnps(
-                    gene=existing.gene,
-                    chrom=existing.chrom,
-                    snp_ids=existing.snp_ids + extra,
-                )
-    return merged
-
-
-def log_snp_set_merge(
-    ours: dict[str, GeneSnps], theirs: dict[str, GeneSnps], merged: dict[str, GeneSnps]
-) -> None:
-    """Say whether the shared covariance had to grow to cover both arms."""
-    added_genes = len(merged) - len(ours)
-    added_snps = sum(len(e.snp_ids) for e in merged.values()) - sum(
-        len(e.snp_ids) for e in ours.values()
-    )
-    if not added_genes and not added_snps:
-        logging.info(
-            "Both arms define the same %d gene(s) over the same variants, so the "
-            "covariance is shared unchanged.", len(merged),
-        )
+    ours_reference = ours.get("reference") or {}
+    theirs_reference = theirs.get("reference") or {}
+    differing = [
+        (field, ours_reference.get(field), theirs_reference.get(field))
+        for field in REFERENCE_FIELDS
+        if ours_reference.get(field) != theirs_reference.get(field)
+    ]
+    if not differing:
         return
-    logging.info(
-        "The ctPred model adds %d gene(s) and %d variant-in-gene entr(ies) beyond "
-        "ours (%d genes ours, %d theirs); the shared covariance covers the union "
-        "of %d gene(s).",
-        added_genes, added_snps, len(ours), len(theirs), len(merged),
+    logging.warning(
+        "The two arms' covariances for '%s' were built against different "
+        "reference panels (%s). Rebuild both model directories with one run of "
+        "src/twas/get_covariance_matrices.py, or the comparison also measures "
+        "the difference between the panels.",
+        cell_type,
+        "; ".join(f"{field}: ours={ours!r}, ctPred={theirs!r}"
+                  for field, ours, theirs in differing),
     )
 
 
@@ -350,6 +332,7 @@ def comparison_metrics(
 
 
 __all__ = [
+    "REFERENCE_FIELDS",
     "SUFFIXES",
     "SUFFIX_CTPRED",
     "SUFFIX_OURS",
@@ -358,10 +341,9 @@ __all__ = [
     "gene_keys",
     "gene_overlap_report",
     "log_overlap_report",
-    "log_snp_set_merge",
     "match_model",
     "matched_pvalues",
-    "merge_snp_sets",
     "normalize_cell_type",
     "two_sample_quantiles",
+    "warn_on_reference_mismatch",
 ]

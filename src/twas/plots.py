@@ -10,6 +10,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.cbook import boxplot_stats
 from matplotlib.ticker import MaxNLocator
 
 from src.twas.aggregate import genomic_inflation
@@ -85,6 +86,182 @@ def _draw_axis_break(upper: plt.Axes, lower: plt.Axes) -> None:
     lower.plot([0, 1], [1, 1], transform=lower.transAxes, **marks)
 
 
+class _GenomeLayout:
+    """Genes placed along one genome-wide x axis, with chromosome ticks."""
+
+    def __init__(self, data: pd.DataFrame, x: np.ndarray, ticks: list[float],
+                 tick_labels: list[str], span: float) -> None:
+        self.data = data
+        self.x = x
+        self.ticks = ticks
+        self.tick_labels = tick_labels
+        self.span = span
+
+
+def _genome_layout(
+    frame: pd.DataFrame, positions: dict[str, tuple[str, int]]
+) -> Optional[_GenomeLayout]:
+    """
+    Lay genes out along the genome by cis-window midpoint, or None if none of
+    them can be placed.
+
+    Shared by the two Manhattan plots so that a gene sits at the same x in
+    both, and the chromosome ticks line up between them.
+    """
+    data = frame.dropna(subset=["pvalue"]).copy()
+    data["chrom"] = data["gene"].map(lambda gene: positions.get(gene, (None, None))[0])
+    data["bp"] = data["gene"].map(lambda gene: positions.get(gene, (None, None))[1])
+    data = data.dropna(subset=["chrom", "bp"])
+    if data.empty:
+        return None
+
+    data["chrom_key"] = data["chrom"].map(_chrom_key)
+    data = data.sort_values(["chrom_key", "bp"]).reset_index(drop=True)
+
+    ticks: list[float] = []
+    tick_labels: list[str] = []
+    cumulative = 0.0
+    x = np.empty(len(data))
+    for _, block in data.groupby("chrom_key", sort=True):
+        span = float(block["bp"].max()) or 1.0
+        x[block.index] = cumulative + block["bp"].to_numpy(dtype=float)
+        ticks.append(cumulative + span / 2.0)
+        tick_labels.append(str(block["chrom"].iloc[0]).removeprefix("chr"))
+        cumulative += span * 1.02
+    return _GenomeLayout(data, x, ticks, tick_labels, cumulative)
+
+
+def _setup_manhattan_axes(
+    y_for_break: np.ndarray,
+    lines: list[tuple],
+    y_break: Optional[tuple[float, float]],
+    allow_y_break: bool,
+    figsize: tuple[float, float],
+) -> tuple[plt.Figure, Optional[plt.Axes], plt.Axes, list[plt.Axes], Optional[tuple[float, float]]]:
+    """
+    The shared Manhattan figure: one axis, or a broken pair, with the
+    significance-line floor already applied to the break search.
+    """
+    floor = max([value for value, *_ in lines], default=float(np.nanmedian(y_for_break)))
+    if y_break is None and allow_y_break:
+        y_break = _find_y_break(y_for_break, floor)
+
+    if y_break is None:
+        fig, lower = plt.subplots(figsize=figsize)
+        return fig, None, lower, [lower], None
+
+    fig, (upper, lower) = plt.subplots(
+        2, 1, figsize=(figsize[0], figsize[1] + 0.6), sharex=True,
+        height_ratios=[1, 3], layout="constrained",
+    )
+    fig.get_layout_engine().set(hspace=0.02)
+    return fig, upper, lower, [upper, lower], y_break
+
+
+def _finish_manhattan(
+    fig: plt.Figure,
+    upper: Optional[plt.Axes],
+    lower: plt.Axes,
+    layout: _GenomeLayout,
+    y_break: Optional[tuple[float, float]],
+    ymax: float,
+    title: str,
+) -> plt.Figure:
+    """Chromosome ticks, limits, labels and the optional axis break."""
+    if y_break is None:
+        lower.set_ylim(bottom=0)
+    else:
+        low, high = y_break
+        lower.set_ylim(0, low * 1.06)
+        upper.set_ylim(high - 0.06 * (ymax - high + 1.0), ymax * 1.04)
+        upper.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
+        _draw_axis_break(upper, lower)
+
+    lower.set_xticks(layout.ticks)
+    lower.set_xticklabels(layout.tick_labels, fontsize=8)
+    lower.set_xlabel("Chromosome")
+    lower.set_xlim(-layout.span * 0.01, layout.span * 1.01)
+    if lower.get_legend_handles_labels()[0]:
+        lower.legend(loc="upper right", fontsize=8)
+    if y_break is None:
+        lower.set_ylabel(r"$-\log_{10}$ p")
+        lower.set_title(title)
+        fig.tight_layout()
+    else:
+        fig.supylabel(r"$-\log_{10}$ p")
+        upper.set_title(title)
+    return fig
+
+
+GENE_SETS = ("expectation", "all", "any")
+GENE_SET_TITLES = {
+    "expectation": "E[z] significant",
+    "all": "significant in every MI fit",
+    "any": "significant in at least one MI fit",
+}
+
+
+def _gene_set_mask(
+    data: pd.DataFrame, criterion: str, gene_set: str
+) -> Optional[np.ndarray]:
+    """
+    Which genes a Manhattan boxplot is drawn for.
+
+    `expectation` is the call on E[z] -- what the ordinary TWAS table reports.
+    `all` / `any` are the two ends of the MI agreement: every member-bootstrap
+    fit independently significant, or at least one. Those two are only defined
+    when the agreement columns are present, i.e. after an MI aggregation.
+    """
+    gene_set = gene_set.lower()
+    if gene_set not in GENE_SETS:
+        raise ValueError(
+            f"Unknown gene set {gene_set!r}; expected one of {GENE_SETS}."
+        )
+    if gene_set == "expectation":
+        flags = data.get(f"significant_{criterion}")
+        if flags is None:
+            return None
+        return flags.fillna(False).to_numpy(dtype=bool)
+
+    agreement = data.get(f"agreement_{criterion}")
+    if agreement is not None:
+        fraction = agreement.fillna(0.0).to_numpy(dtype=float)
+    else:
+        counts = data.get(f"n_draws_significant_{criterion}")
+        n_draws = data.get("n_draws")
+        if counts is None or n_draws is None:
+            return None
+        draws = n_draws.to_numpy(dtype=float)
+        fraction = np.divide(
+            counts.fillna(0).to_numpy(dtype=float),
+            draws,
+            out=np.zeros(len(data), dtype=float),
+            where=draws > 0,
+        )
+    if gene_set == "all":
+        return fraction >= (1.0 - 1e-12)
+    return fraction > 0.0
+
+
+def _significance_lines(data: pd.DataFrame, fdr: float) -> list[tuple]:
+    """The Bonferroni and BH threshold lines, as `(y, colour, style, label)`."""
+    lines = []
+    if "bonferroni_threshold" in data.columns:
+        threshold = data["bonferroni_threshold"].dropna()
+        if not threshold.empty:
+            lines.append((
+                -np.log10(float(threshold.iloc[0])),
+                "firebrick", "--", "Bonferroni (0.05)",
+            ))
+    significant = data[data.get("significant_fdr", False) == True]  # noqa: E712
+    if not significant.empty:
+        lines.append((
+            float(_neg_log10(significant["pvalue"].to_numpy(dtype=float)).min()),
+            "steelblue", ":", f"BH FDR {fdr:g}",
+        ))
+    return lines
+
+
 def manhattan(
     frame: pd.DataFrame,
     positions: dict[str, tuple[str, int]],
@@ -103,70 +280,16 @@ def manhattan(
     `(low, high)` as `y_break` to place the cut by hand, or `allow_y_break=False`
     for a plain continuous axis.
     """
-    data = frame.dropna(subset=["pvalue"]).copy()
-    data["chrom"] = data["gene"].map(lambda gene: positions.get(gene, (None, None))[0])
-    data["bp"] = data["gene"].map(lambda gene: positions.get(gene, (None, None))[1])
-    data = data.dropna(subset=["chrom", "bp"])
-    if data.empty:
+    layout = _genome_layout(frame, positions)
+    if layout is None:
         return None
-
-    data["chrom_key"] = data["chrom"].map(_chrom_key)
-    data = data.sort_values(["chrom_key", "bp"]).reset_index(drop=True)
-
-    offsets: dict[int, float] = {}
-    ticks: list[float] = []
-    tick_labels: list[str] = []
-    cumulative = 0.0
-    x = np.empty(len(data))
-    for chrom_key, block in data.groupby("chrom_key", sort=True):
-        offsets[chrom_key] = cumulative
-        span = float(block["bp"].max()) or 1.0
-        x[block.index] = cumulative + block["bp"].to_numpy(dtype=float)
-        ticks.append(cumulative + span / 2.0)
-        tick_labels.append(str(block["chrom"].iloc[0]).removeprefix("chr"))
-        cumulative += span * 1.02
+    data, x = layout.data, layout.x
 
     y = _neg_log10(data["pvalue"].to_numpy(dtype=float))
-
-    lines = []
-    threshold = data["bonferroni_threshold"].dropna()
-    if not threshold.empty:
-        lines.append(
-            (-np.log10(float(threshold.iloc[0])), "firebrick", "--", "Bonferroni (0.05)")
-        )
-    significant = data[data.get("significant_fdr", False) == True]  # noqa: E712
-    if not significant.empty:
-        lines.append((
-            float(_neg_log10(significant["pvalue"].to_numpy(dtype=float)).min()),
-            "steelblue", ":", f"BH FDR {fdr:g}",
-        ))
-
-    # Keep the break clear of the significance lines, so the cut can never fall
-    # through the band the plot is read in.
-    floor = max([value for value, *_ in lines], default=float(np.nanmedian(y)))
-    if y_break is None and allow_y_break:
-        y_break = _find_y_break(y, floor)
-    elif y_break is not None:
-        hidden = int(((y > y_break[0]) & (y < y_break[1])).sum())
-        if hidden:
-            logging.warning(
-                "The requested y-axis break %s falls across %d gene(s), which "
-                "will not appear in either panel.", y_break, hidden,
-            )
-
-    if y_break is None:
-        fig, lower = plt.subplots(figsize=(12, 5))
-        upper = None
-        axes = [lower]
-    else:
-        # Constrained rather than tight layout: it is the one that knows how to
-        # place `supylabel` across a stack of axes.
-        fig, (upper, lower) = plt.subplots(
-            2, 1, figsize=(12, 5.6), sharex=True,
-            height_ratios=[1, 3], layout="constrained",
-        )
-        fig.get_layout_engine().set(hspace=0.02)
-        axes = [upper, lower]
+    lines = _significance_lines(data, fdr)
+    fig, upper, lower, axes, y_break = _setup_manhattan_axes(
+        y, lines, y_break, allow_y_break, figsize=(12, 5)
+    )
 
     for ax in axes:
         for index, (_, block) in enumerate(data.groupby("chrom_key", sort=True)):
@@ -179,16 +302,6 @@ def manhattan(
             )
         for value, color, style, label in lines:
             ax.axhline(value, color=color, linestyle=style, linewidth=1, label=label)
-
-    if y_break is None:
-        lower.set_ylim(bottom=0)
-    else:
-        low, high = y_break
-        # A little air on either side of the cut so no marker sits on a spine.
-        lower.set_ylim(0, low * 1.06)
-        upper.set_ylim(high - 0.06 * (float(np.nanmax(y)) - high + 1.0), float(np.nanmax(y)) * 1.04)
-        upper.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
-        _draw_axis_break(upper, lower)
 
     if label_top:
         top = data.nsmallest(label_top, "pvalue")
@@ -206,12 +319,258 @@ def manhattan(
                 ha="center",
             )
 
+    return _finish_manhattan(
+        fig, upper, lower, layout, y_break, float(np.nanmax(y)),
+        f"{cell_type} — S-PrediXcan gene-level association",
+    )
+
+
+def manhattan_boxplots(
+    frame: pd.DataFrame,
+    positions: dict[str, tuple[str, int]],
+    cell_type: str,
+    fdr: float = 0.05,
+    criterion: str = "fdr",
+    gene_set: str = "expectation",
+    y_break: Optional[tuple[float, float]] = None,
+    allow_y_break: bool = True,
+) -> Optional[plt.Figure]:
+    """
+    The Manhattan layout, but each selected gene is folded into a chromosome
+    boxplot of -log10 p instead of being drawn as its own point.
+
+    `gene_set` chooses which genes go in the boxes: the E[z] call
+    (`expectation`), genes every MI fit called significant (`all`), or genes
+    at least one fit called (`any`). The last two are the two ends of the
+    agreement spectrum and only exist after an MI aggregation.
+
+    A cloud of hits at one locus is hard to read as dots -- they stack, and the
+    only thing the eye takes away is that the chromosome is busy. The box shows
+    the distribution: a tight box sitting well above the threshold is a
+    chromosome of uniformly strong associations, a box whose whisker just
+    clears it is a chromosome carried by one or two genes. Genes outside the
+    selected set stay as faint dots so the rest of the genome is still in view.
+
+    Positions and chromosome ticks come from the same layout as `manhattan`,
+    so the figures overlay.
+    """
+    layout = _genome_layout(frame, positions)
+    if layout is None:
+        return None
+    data, x = layout.data, layout.x
+
+    significant = _gene_set_mask(data, criterion, gene_set)
+    if significant is None:
+        return None
+    if not significant.any():
+        logging.info(
+            "No gene of '%s' is %s at %s, so the boxplot Manhattan was skipped.",
+            cell_type, GENE_SET_TITLES[gene_set.lower()], criterion,
+        )
+        return None
+
+    background = _neg_log10(data["pvalue"].to_numpy(dtype=float))
+    boxes, box_x, box_colors = [], [], []
+    for index, (_, block) in enumerate(data.groupby("chrom_key", sort=True)):
+        hit = block.index[significant[block.index]]
+        if not len(hit):
+            continue
+        boxes.append(background[hit])
+        box_x.append(float(np.median(x[hit])))
+        box_colors.append("0.30" if index % 2 == 0 else "0.60")
+    if not boxes:
+        return None
+
+    stats = boxplot_stats(boxes)
+    spread = np.concatenate(boxes)
+    ymax = float(max(np.nanmax(spread), np.nanmax(background)))
+    lines = _significance_lines(data, fdr)
+    fig, upper, lower, axes, y_break = _setup_manhattan_axes(
+        spread, lines, y_break, allow_y_break, figsize=(12, 5)
+    )
+
+    # Wide enough to read as a box, narrow enough that neighbouring
+    # chromosomes do not collide. The floor is a handful of genes' worth of
+    # the genome so a chromosome with a single hit is still visible.
+    box_width = max(layout.span / 40.0, layout.span / max(len(boxes) * 3.0, 1.0))
+
+    for ax in axes:
+        ax.scatter(
+            x[~significant], background[~significant],
+            s=4, alpha=0.25, color="0.75", zorder=1,
+        )
+        for i, color in enumerate(box_colors):
+            ax.bxp(
+                [stats[i]],
+                positions=[box_x[i]],
+                widths=box_width,
+                manage_ticks=False,
+                patch_artist=True,
+                showfliers=True,
+                flierprops=dict(
+                    marker="o", markersize=3.5, markerfacecolor=color,
+                    markeredgecolor="0.20", alpha=0.85,
+                ),
+                boxprops=dict(facecolor=color, edgecolor="0.20", linewidth=0.8),
+                medianprops=dict(color="firebrick", linewidth=1.2),
+                whiskerprops=dict(color="0.20", linewidth=0.7),
+                capprops=dict(color="0.20", linewidth=0.7),
+                zorder=3,
+            )
+        for value, color, style, label in lines:
+            ax.axhline(value, color=color, linestyle=style, linewidth=1,
+                       label=label, zorder=2)
+
+    return _finish_manhattan(
+        fig, upper, lower, layout, y_break, ymax,
+        f"{cell_type} — {len(spread):,} {criterion.upper()} gene(s) "
+        f"{GENE_SET_TITLES[gene_set.lower()]} as per-chromosome -log10 p boxplots",
+    )
+
+
+def manhattan_draw_boxplots(
+    long: pd.DataFrame,
+    frame: pd.DataFrame,
+    positions: dict[str, tuple[str, int]],
+    cell_type: str,
+    fdr: float = 0.05,
+    criterion: str = "fdr",
+    gene_set: str = "expectation",
+    label_top: int = 10,
+    y_break: Optional[tuple[float, float]] = None,
+    allow_y_break: bool = True,
+) -> Optional[plt.Figure]:
+    """
+    One boxplot per selected gene of its per-draw -log10 p, in genomic order.
+
+    `gene_set` is the same choice as `manhattan_boxplots`: the E[z] call, the
+    genes every fit agreed on, or the genes any fit called. The box is always
+    the full set of draws, so a unanimous gene is a box sitting entirely above
+    the threshold and an "any" gene that only one fit saw is a box that
+    straddles it.
+
+    Genes are spaced evenly rather than at their bp so neighbouring hits in
+    the same LD block stay readable as separate boxes. Chromosome labels and
+    the alternating colours are the same as `manhattan`, so the figures still
+    read as a pair.
+    """
+    if long.empty or "pvalue" not in long.columns:
+        return None
+
+    layout = _genome_layout(frame, positions)
+    if layout is None:
+        return None
+    data = layout.data
+
+    selected = _gene_set_mask(data, criterion, gene_set)
+    if selected is None:
+        return None
+    chosen = data.index[selected]
+    if not len(chosen):
+        logging.info(
+            "No gene of '%s' is %s at %s, so the per-draw boxplot Manhattan "
+            "was skipped.", cell_type, GENE_SET_TITLES[gene_set.lower()], criterion,
+        )
+        return None
+
+    per_gene = {
+        gene: _neg_log10(values.to_numpy(dtype=float))
+        for gene, values in long.dropna(subset=["pvalue"]).groupby("gene")["pvalue"]
+    }
+    boxes, box_rows, chrom_keys = [], [], []
+    for row in chosen:
+        values = per_gene.get(data.at[row, "gene"])
+        if values is None or values.size == 0:
+            continue
+        boxes.append(values)
+        box_rows.append(row)
+        chrom_keys.append(int(data.at[row, "chrom_key"]))
+    if not boxes:
+        return None
+
+    # Even spacing: one slot per gene, in the genomic order `_genome_layout`
+    # already sorted `data` into. Chromosome ticks sit at the midpoint of
+    # each chromosome's run of boxes.
+    box_x = np.arange(1, len(boxes) + 1, dtype=float)
+    ticks, tick_labels = [], []
+    chrom_keys_arr = np.asarray(chrom_keys)
+    for key in pd.unique(chrom_keys_arr):
+        slots = box_x[chrom_keys_arr == key]
+        ticks.append(float(slots.mean()))
+        label = str(data.at[box_rows[int(np.flatnonzero(chrom_keys_arr == key)[0])], "chrom"])
+        tick_labels.append(label.removeprefix("chr"))
+
+    stats = boxplot_stats(boxes)
+    spread = np.concatenate(boxes)
+    ymax = float(np.nanmax(spread))
+    lines = _significance_lines(data, fdr)
+    width_inches = float(np.clip(0.09 * len(boxes) + 8.0, 12.0, 28.0))
+    fig, upper, lower, axes, y_break = _setup_manhattan_axes(
+        spread, lines, y_break, allow_y_break, figsize=(width_inches, 5.4)
+    )
+    box_width = 0.65
+
+    for ax in axes:
+        for parity, facecolor in ((0, "0.45"), (1, "0.75")):
+            indices = [i for i, key in enumerate(chrom_keys) if key % 2 == parity]
+            if not indices:
+                continue
+            ax.bxp(
+                [stats[i] for i in indices],
+                positions=[box_x[i] for i in indices],
+                widths=box_width,
+                manage_ticks=False,
+                patch_artist=True,
+                showfliers=False,
+                boxprops=dict(facecolor=facecolor, edgecolor="0.20", linewidth=0.6),
+                medianprops=dict(color="firebrick", linewidth=1.1),
+                whiskerprops=dict(color="0.20", linewidth=0.6),
+                capprops=dict(color="0.20", linewidth=0.6),
+                zorder=3,
+            )
+        for value, color, style, label in lines:
+            ax.axhline(value, color=color, linestyle=style, linewidth=1,
+                       label=label, zorder=2)
+
+    if y_break is None:
+        lower.set_ylim(bottom=0)
+    else:
+        low, high = y_break
+        lower.set_ylim(0, low * 1.06)
+        upper.set_ylim(high - 0.06 * (ymax - high + 1.0), ymax * 1.04)
+        upper.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
+        _draw_axis_break(upper, lower)
+
+    if label_top:
+        strongest = sorted(
+            range(len(boxes)), key=lambda i: -float(np.median(boxes[i]))
+        )[:label_top]
+        for i in strongest:
+            row = box_rows[i]
+            top_of_box = float(stats[i]["whishi"])
+            name = data.at[row, "gene_name"] if "gene_name" in data.columns else None
+            target = (
+                upper if y_break is not None and top_of_box >= y_break[1] else lower
+            )
+            target.annotate(
+                name if pd.notna(name) and name else data.at[row, "gene"],
+                (box_x[i], top_of_box),
+                fontsize=7,
+                xytext=(0, 4),
+                textcoords="offset points",
+                ha="center",
+            )
+
     lower.set_xticks(ticks)
     lower.set_xticklabels(tick_labels, fontsize=8)
     lower.set_xlabel("Chromosome")
-    lower.set_xlim(-cumulative * 0.01, cumulative * 1.01)
-
-    title = f"{cell_type} — S-PrediXcan gene-level association"
+    lower.set_xlim(0.2, len(boxes) + 0.8)
+    n_draws = int(long["draw"].nunique()) if "draw" in long.columns else 0
+    title = (
+        f"{cell_type} — per-draw p-value spread of the {len(boxes):,} "
+        f"{criterion.upper()} gene(s) {GENE_SET_TITLES[gene_set.lower()]} "
+        f"over {n_draws} MI fit(s)"
+    )
     if lower.get_legend_handles_labels()[0]:
         lower.legend(loc="upper right", fontsize=8)
     if y_break is None:
@@ -755,6 +1114,8 @@ __all__ = [
     "agreement_vs_strength",
     "ld_block_gene_counts",
     "manhattan",
+    "manhattan_boxplots",
+    "manhattan_draw_boxplots",
     "mi_draw_spread",
     "mi_draw_summary",
     "mi_stability",

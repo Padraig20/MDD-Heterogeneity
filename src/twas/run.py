@@ -31,12 +31,11 @@ from src.twas.compare import (
     discover_ctpred_models,
     gene_overlap_report,
     log_overlap_report,
-    log_snp_set_merge,
     match_model,
     matched_pvalues,
-    merge_snp_sets,
+    warn_on_reference_mismatch,
 )
-from src.twas.covariance import build_covariance, load_ld_reference, snp_set_hash
+from src.twas.covariance import has_covariance, load_ld_reference, snp_set_hash
 from src.twas.ld_blocks import (
     LdBlocks,
     agreement_block_curve,
@@ -45,7 +44,6 @@ from src.twas.ld_blocks import (
     require_matching_build,
 )
 from src.twas.model_db import load_gene_name_map, write_model_db
-from src.twas.reference import BED_TEMPLATES, build_reference
 from src.twas.sprediXcan import GwasOptions, read_results, run_sprediXcan
 from src.twas.wandb_logger import TwasWandBLogger
 from src.twas.weights import (
@@ -53,8 +51,8 @@ from src.twas.weights import (
     KIND_MI,
     MODEL_KINDS,
     ModelSpec,
+    discover_models,
     load_model_json,
-    read_snp_universe,
 )
 
 """
@@ -67,16 +65,21 @@ For each cell type the pipeline runs the same three steps:
   1. Read the weights JSON written by `src/distillation/train.py` and expand it
      into the draws to run (one for a point-estimate or pooled-mean model, one
      per member-bootstrap fit under --model-kind mi).
-  2. Build the reference LD covariance from the UKB genotypes, or reuse a
-     previously built one from --ld-dir. One covariance serves every draw.
+  2. Load the reference LD covariance sitting beside that JSON. One covariance
+     serves every draw.
   3. Run S-PrediXcan per draw, then aggregate, plot and log the results.
+
+Step 2 is a read, not a computation. The covariance depends only on the model
+and the cohort it was distilled on, so it is built once by
+`src/twas/get_covariance_matrices.py` and stored in the model directory; this
+script never opens a .bed and takes no genotype arguments.
 
 Comparing against ctPred
 ------------------------
-`--ctpred-models-dir` points at a second directory of weights JSONs, distilled
-by the same `src/distillation/train.py` from a ctPred teacher
-(`src/training/models/ctpred.py`). That arm then runs through steps 1 and 3
-unchanged and against the *same* covariance from step 2, so the only difference
+`--ctpred-models-dir` points at a second model directory, distilled by the same
+`src/distillation/train.py` from a ctPred teacher
+(`src/training/models/ctpred.py`) and prepared with the same covariance script.
+That arm then runs through all three steps unchanged, so the only difference
 between the two sets of results is the teacher the elastic net was distilled
 from. Outputs are namespaced `this-study/`, `ctPred/` and `comparison/`.
 
@@ -87,8 +90,7 @@ Example
         --gwas-file gwas/mdd.txt.gz \\
         --snp-column SNP --effect-allele-column A1 --non-effect-allele-column A2 \\
         --beta-column BETA --se-column SE \\
-        --genotypes /data/ukb --genotype-template UKB \\
-        --ld-dir ld/ukb --output-dir results/mdd --wandb-project mdd-twas \\
+        --output-dir results/mdd --wandb-project mdd-twas \\
         --ctpred-models-dir models/ctpred
 """
 
@@ -118,7 +120,8 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help=(
             "Directory of weights JSONs written by src/distillation/train.py, one "
-            "per cell type (e.g. 'memory_B_cell.json')."
+            "per cell type (e.g. 'memory_B_cell.json'), each with the covariance "
+            "files src/twas/get_covariance_matrices.py writes beside it."
         ),
     )
     models.add_argument(
@@ -153,6 +156,12 @@ def parse_args() -> argparse.Namespace:
             "Subsample this many of the member-bootstrap fits under --model-kind "
             "mi. Defaults to using every fit."
         ),
+    )
+    models.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        help="Seed for the --mi-draws subsample.",
     )
     models.add_argument(
         "--gene-name-map",
@@ -200,73 +209,6 @@ def parse_args() -> argparse.Namespace:
     )
     gwas.add_argument("--keep-non-rsid", action="store_true")
     gwas.add_argument("--handle-empty-columns", action="store_true")
-
-    reference = parser.add_argument_group("LD reference")
-    reference.add_argument(
-        "-g", "--genotypes",
-        type=Path,
-        default=None,
-        help=(
-            "Directory of PLINK genotypes (chr1..chr22 .bed/.bim/.fam), the same "
-            "cohort used by src/distillation/train.py. Omit to reuse a previously "
-            "built --ld-dir."
-        ),
-    )
-    reference.add_argument(
-        "-gt", "--genotype-template",
-        type=str,
-        default="UKB",
-        choices=sorted(BED_TEMPLATES),
-        help="Naming template for the genotype files.",
-    )
-    reference.add_argument(
-        "--ld-dir",
-        type=Path,
-        required=True,
-        help=(
-            "Where the per-cell-type covariances live. Written here when "
-            "--genotypes is given, read from here otherwise."
-        ),
-    )
-    reference.add_argument(
-        "--rebuild-ld",
-        action="store_true",
-        help="Recompute the covariances even if a matching cached one exists.",
-    )
-    reference.add_argument(
-        "-ni", "--num-individuals",
-        type=str,
-        default="all",
-        help=(
-            "Reference individuals to use: 'all', an integer count (randomly "
-            "sampled with --sample-seed), or a 'K/N' contiguous split of the .fam "
-            "order. Same syntax as get_feats_from_seqs.py."
-        ),
-    )
-    reference.add_argument("--sample-seed", type=int, default=42)
-    reference.add_argument(
-        "--individual-split",
-        type=str,
-        default=None,
-        help="Optional 'K/N' contiguous split applied after --num-individuals.",
-    )
-    reference.add_argument(
-        "--max-snps-in-gene",
-        type=int,
-        default=None,
-        help="Skip genes whose model has more SNPs than this. Defaults to no limit.",
-    )
-    reference.add_argument(
-        "--ld-compression-level",
-        type=int,
-        choices=range(1, 10),
-        default=1,
-        metavar="1..9",
-        help=(
-            "Gzip compression level for newly built LD files. Level 1 is much "
-            "faster and only modestly larger than Python's level-9 default."
-        ),
-    )
 
     ld_blocks = parser.add_argument_group("LD blocks")
     ld_blocks.add_argument(
@@ -448,41 +390,6 @@ def gwas_options(args: argparse.Namespace) -> GwasOptions:
     return options
 
 
-def discover_models(
-    models_dir: Path, requested: Optional[list[str]]
-) -> list[Path]:
-    """
-    The weights JSONs to process.
-
-    `train.py` writes `<cell type with spaces replaced by underscores>.json`, so
-    a requested cell type is accepted in either spelling.
-    """
-    available = sorted(Path(models_dir).glob("*.json"))
-    if not available:
-        raise FileNotFoundError(f"No *.json weights files found in {models_dir}.")
-    if requested is None:
-        return available
-
-    by_name: dict[str, Path] = {}
-    for path in available:
-        by_name[path.stem] = path
-        by_name[path.stem.replace("_", " ")] = path
-
-    selected, missing = [], []
-    for cell_type in requested:
-        path = by_name.get(cell_type) or by_name.get(cell_type.replace(" ", "_"))
-        if path is None:
-            missing.append(cell_type)
-        elif path not in selected:
-            selected.append(path)
-    if missing:
-        raise ValueError(
-            f"Requested cell type(s) not found in {models_dir}: {missing}. "
-            f"Available: {sorted({p.stem for p in available})}"
-        )
-    return selected
-
-
 def run_draws(
     spec: ModelSpec,
     ld,
@@ -655,6 +562,9 @@ def analyse_arm(
 
     figures: dict[str, Optional[plt.Figure]] = {
         "manhattan": plots.manhattan(frame, positions, cell_type, fdr=fdr),
+        "manhattan_boxplots": plots.manhattan_boxplots(
+            frame, positions, cell_type, fdr=fdr
+        ),
         "qq": plots.qq(frame, cell_type),
         "volcano": plots.volcano(frame, cell_type, fdr=fdr),
         "zscore_histogram": plots.zscore_histogram(frame, cell_type),
@@ -711,12 +621,35 @@ def mi_figures(
     final: pd.DataFrame,
     long: pd.DataFrame,
     cell_type: str,
+    positions: dict[str, tuple[str, int]],
+    fdr: float,
     curve: Optional[pd.DataFrame] = None,
     agreement_column: str = "agreement_bonferroni",
+    criterion: str = "bonferroni",
 ) -> dict[str, Optional[plt.Figure]]:
     """The multiple-imputation diagnostics, which only this study's arm has."""
     figures = {
         "mi_stability": plots.mi_stability(final, cell_type),
+        "manhattan_draw_boxplots": plots.manhattan_draw_boxplots(
+            long, final, positions, cell_type, fdr=fdr, criterion=criterion,
+            gene_set="expectation",
+        ),
+        "manhattan_draw_boxplots_all": plots.manhattan_draw_boxplots(
+            long, final, positions, cell_type, fdr=fdr, criterion=criterion,
+            gene_set="all",
+        ),
+        "manhattan_draw_boxplots_any": plots.manhattan_draw_boxplots(
+            long, final, positions, cell_type, fdr=fdr, criterion=criterion,
+            gene_set="any",
+        ),
+        "manhattan_boxplots_all": plots.manhattan_boxplots(
+            final, positions, cell_type, fdr=fdr, criterion=criterion,
+            gene_set="all",
+        ),
+        "manhattan_boxplots_any": plots.manhattan_boxplots(
+            final, positions, cell_type, fdr=fdr, criterion=criterion,
+            gene_set="any",
+        ),
         "mi_draw_spread": plots.mi_draw_spread(long, cell_type),
         "mi_draw_summary": plots.mi_draw_summary(draw_spread(long), cell_type),
         "mi_agreement": plots.agreement_histogram(
@@ -739,7 +672,6 @@ def process_cell_type(
     gwas: GwasOptions,
     gene_names: dict[str, str],
     logger: TwasWandBLogger,
-    reference=None,
     blocks: Optional[LdBlocks] = None,
     ctpred_path: Optional[Path] = None,
 ) -> dict:
@@ -753,7 +685,17 @@ def process_cell_type(
         cell_type, spec.source, spec.kind, len(spec.snp_sets), len(spec.draws),
     )
 
-    ctpred_spec = None
+    # Step 2: the covariance built for exactly these weights, sitting beside
+    # them. The hash check is what catches a model that has been retrained
+    # since its covariance was built.
+    ld = load_ld_reference(
+        args.models_dir, cell_type, expected_hash=snp_set_hash(spec.snp_sets)
+    )
+    logging.info("Using the covariance at %s.", ld.cov_path)
+    snp_table = ld.load_snp_table()
+    positions = ld.gene_positions()
+
+    ctpred_spec = ctpred_ld = None
     if ctpred_path is not None:
         ctpred_spec = load_model_json(
             ctpred_path,
@@ -761,38 +703,21 @@ def process_cell_type(
             mi_draws=args.mi_draws,
             seed=args.sample_seed,
         )
+        ctpred_ld = load_ld_reference(
+            args.ctpred_models_dir,
+            cell_type,
+            expected_hash=snp_set_hash(ctpred_spec.snp_sets),
+        )
+        # The two arms have their own covariance, each over its own selected
+        # SNPs, but a comparison only means anything if both were estimated on
+        # the same cohort -- which they are when both directories were prepared
+        # from the same genotypes.
+        warn_on_reference_mismatch(ld.meta, ctpred_ld.meta, cell_type)
         logging.info(
             "Cell type '%s' [ctPred]: %s model, kind=%s, %d gene(s), %d draw(s).",
             cell_type, ctpred_spec.source, ctpred_spec.kind,
             len(ctpred_spec.snp_sets), len(ctpred_spec.draws),
         )
-
-    # Step 2: one LD reference, shared by every draw of both arms. Distilling
-    # ctPred on the same genotypes is what buys that, and it is the point of
-    # training it here rather than importing a foreign one: with the covariance
-    # held fixed the two arms differ only in their teacher.
-    snp_sets = spec.snp_sets
-    if ctpred_spec is not None:
-        snp_sets = merge_snp_sets(spec.snp_sets, ctpred_spec.snp_sets)
-        log_snp_set_merge(spec.snp_sets, ctpred_spec.snp_sets, snp_sets)
-
-    if reference is not None:
-        ld = build_covariance(
-            cell_type=cell_type,
-            snp_sets=snp_sets,
-            reference=reference,
-            ld_dir=args.ld_dir,
-            max_snps_in_gene=args.max_snps_in_gene,
-            compression_level=args.ld_compression_level,
-            overwrite=args.rebuild_ld,
-        )
-    else:
-        ld = load_ld_reference(
-            args.ld_dir, cell_type, expected_hash=snp_set_hash(snp_sets)
-        )
-        logging.info("Using the pre-built LD reference at %s.", ld.cov_path)
-    snp_table = ld.load_snp_table()
-    positions = ld.gene_positions()
 
     # Step 1 + 3: one model DB and one S-PrediXcan run per draw.
     cell_dir = Path(args.output_dir) / cell_type
@@ -833,8 +758,9 @@ def process_cell_type(
         )
         figures.update(_prefix(
             mi_figures(
-                final, long, cell_type, curve=curve,
+                final, long, cell_type, positions, args.fdr, curve=curve,
                 agreement_column=f"agreement_{args.agreement_criterion}",
+                criterion=args.agreement_criterion,
             ),
             ARM_OURS,
         ))
@@ -849,16 +775,13 @@ def process_cell_type(
     if ctpred_spec is not None:
         try:
             theirs, their_long, their_stats = run_arm(
-                ctpred_spec, ld, snp_table, gene_names, gwas, args,
-                cell_dir, arm=ARM_CTPRED,
+                ctpred_spec, ctpred_ld, ctpred_ld.load_snp_table(), gene_names,
+                gwas, args, cell_dir, arm=ARM_CTPRED,
             )
             if their_long is not None:
                 per_draw_zscores[ARM_CTPRED] = their_long
-            # Gene positions come from the shared covariance, so both arms are
-            # placed on the same coordinates and their LD-block counts are
-            # counted against the same blocks.
             theirs, their_summary, their_figures, their_tables = analyse_arm(
-                theirs, positions, blocks, cell_type,
+                theirs, ctpred_ld.gene_positions(), blocks, cell_type,
                 arm=ARM_CTPRED, fdr=args.fdr, top_n=args.top_n, annotate=False,
             )
             summary.update(their_summary)
@@ -946,9 +869,7 @@ def _wandb_config(args: argparse.Namespace, spec: ModelSpec) -> dict:
         "n_draws": len(spec.draws),
         "n_model_genes": len(spec.snp_sets),
         "gwas_file": args.gwas_file or args.gwas_folder,
-        "genotype_template": args.genotype_template,
-        "num_individuals": args.num_individuals,
-        "individual_split": args.individual_split,
+        "models_dir": str(args.models_dir),
         "fdr": args.fdr,
         "ld_blocks": str(args.ld_blocks) if args.ld_blocks else None,
         "ld_blocks_build": args.ld_blocks_build,
@@ -971,13 +892,6 @@ def main() -> None:
         logging.error("%s", error)
         sys.exit(1)
 
-    if args.genotypes is None and not Path(args.ld_dir).exists():
-        logging.error(
-            "Neither --genotypes nor an existing --ld-dir (%s) was provided; there "
-            "is nothing to compute the LD covariance from.", args.ld_dir,
-        )
-        sys.exit(1)
-
     try:
         model_paths = discover_models(args.models_dir, args.cell_types)
     except (FileNotFoundError, ValueError) as error:
@@ -990,6 +904,22 @@ def main() -> None:
             ctpred_models = discover_ctpred_models(args.ctpred_models_dir)
         except (FileNotFoundError, NotADirectoryError) as error:
             logging.error("%s", error)
+            sys.exit(1)
+
+    # Fail here rather than part-way through a sweep: a missing covariance is a
+    # setup mistake, and the fix is one command for the whole directory.
+    for directory, paths in (
+        (args.models_dir, model_paths),
+        (args.ctpred_models_dir, list(ctpred_models.values())),
+    ):
+        missing = [p.stem for p in paths if not has_covariance(directory, p.stem)]
+        if missing:
+            logging.error(
+                "%d model(s) in %s have no covariance beside them: %s. Build them "
+                "with `python -m src.twas.get_covariance_matrices --models-dir %s "
+                "--genotypes <plink dir>`.",
+                len(missing), directory, missing[:5], directory,
+            )
             sys.exit(1)
 
     blocks = None
@@ -1008,8 +938,6 @@ def main() -> None:
     gene_names = load_gene_name_map(args.gene_name_map)
     logger = TwasWandBLogger(project=args.wandb_project, entity=args.wandb_entity)
 
-    # Pair the two arms up front: the ctPred models feed the shared covariance,
-    # so their SNPs have to be in the reference index before it is built.
     paired: dict[Path, Optional[Path]] = {
         model_path: (
             match_model(ctpred_models, model_path.stem) if ctpred_models else None
@@ -1020,28 +948,6 @@ def main() -> None:
         path.stem for path, other in paired.items() if ctpred_models and other is None
     ]
 
-    # Index the reference once for the whole sweep. Walking 22 UKB .bim files
-    # costs far more than re-parsing the weights JSONs, so the SNP universe is
-    # collected in a cheap first pass rather than per cell type.
-    reference = None
-    if args.genotypes is not None:
-        wanted_snps: set[str] = set()
-        json_paths = [p for pair in paired.items() for p in pair if p is not None]
-        for path in tqdm(json_paths, desc="Collecting model SNPs", leave=False):
-            wanted_snps |= read_snp_universe(path)
-        logging.info(
-            "%d distinct model SNP(s) across %d cell type(s) and %d weights file(s).",
-            len(wanted_snps), len(model_paths), len(json_paths),
-        )
-        reference = build_reference(
-            genotype_dir=args.genotypes,
-            genotype_template=args.genotype_template,
-            wanted_snps=wanted_snps,
-            num_individuals=args.num_individuals,
-            sample_seed=args.sample_seed,
-            individual_split=args.individual_split,
-        )
-
     logging.info("Running TWAS for %d cell type(s).", len(model_paths))
     summaries: list[dict] = []
     failures: list[str] = []
@@ -1050,7 +956,7 @@ def main() -> None:
             summaries.append(
                 process_cell_type(
                     model_path, args, gwas, gene_names, logger,
-                    reference=reference, blocks=blocks, ctpred_path=ctpred_path,
+                    blocks=blocks, ctpred_path=ctpred_path,
                 )
             )
         except Exception as error:  # noqa: BLE001 - one bad cell type must not kill the sweep
