@@ -97,6 +97,37 @@ def load_gene_name_map(path: Optional[Path]) -> dict[str, str]:
     return dict(zip(keys, table.iloc[:, 1].astype(str)))
 
 
+def attach_gene_names(frame: pd.DataFrame, names: dict[str, str]) -> pd.DataFrame:
+    """
+    Fill `gene_name` from `{versionless Ensembl id -> symbol}`.
+
+    Existing symbols are kept when they already look like a gene name.
+    Ensembl ids, blanks, and missing values are replaced so the plots can
+    label every gene with the GTF name that `get_shared_genes.py` wrote.
+    """
+    if frame is None or frame.empty or "gene" not in frame.columns or not names:
+        return frame
+    frame = frame.copy()
+    keys = frame["gene"].astype(str).str.split(".").str[0].str.strip().str.upper()
+    mapped = keys.map(names)
+    if "gene_name" not in frame.columns:
+        frame["gene_name"] = mapped
+        return frame
+
+    current = frame["gene_name"].astype(str)
+    blank = (
+        frame["gene_name"].isna()
+        | current.str.strip().isin({"", "nan", "none"})
+        | current.str.upper().eq(keys)
+        | current.str.upper().str.startswith("ENSG")
+    )
+    replace = blank & mapped.notna()
+    frame.loc[replace, "gene_name"] = mapped[replace]
+    still_missing = frame["gene_name"].isna() & mapped.notna()
+    frame.loc[still_missing, "gene_name"] = mapped[still_missing]
+    return frame
+
+
 def write_model_db(
     path: Path,
     draw: Draw,
@@ -194,4 +225,4 @@ def write_model_db(
     return stats
 
 
-__all__ = ["ModelDbStats", "load_gene_name_map", "write_model_db"]
+__all__ = ["ModelDbStats", "attach_gene_names", "load_gene_name_map", "write_model_db"]

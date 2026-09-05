@@ -134,13 +134,14 @@ REFERENCE_FIELDS = (
 )
 
 
-def read_gene_list(path: Path) -> set[str]:
+def read_gene_table(path: Path) -> tuple[set[str], dict[str, str]]:
     """
-    Versionless Ensembl ids from a gene list.
+    Versionless Ensembl ids, and any gene symbols, from a gene list.
 
     Accepts one id per line, or a TSV whose first column (or an `ENSID` /
     `gene` column) holds the ids -- the same layouts `train.py --select_genes`
-    and `get_shared_genes.py` write.
+    and `get_shared_genes.py` write. When a `Gene` / `gene_name` column is
+    present, its symbols are returned as `{versionless id -> name}`.
     """
     path = Path(path)
     if not path.is_file():
@@ -151,18 +152,39 @@ def read_gene_list(path: Path) -> set[str]:
         raise ValueError(f"{path} is empty.")
 
     header = rows[0].split("\t")
+    names: dict[str, str] = {}
     if len(header) > 1 or header[0] in {"ENSID", "gene", "ensid", "Gene"}:
         frame = pd.read_csv(path, sep="\t", comment="#")
         column = next(
-            (name for name in ("ENSID", "gene", "ensid", "Gene") if name in frame.columns),
+            (name for name in ("ENSID", "gene", "ensid") if name in frame.columns),
             frame.columns[0],
         )
         values = frame[column].astype(str)
+        name_column = next(
+            (
+                name
+                for name in ("Gene", "gene_name", "symbol", "name")
+                if name in frame.columns and name != column
+            ),
+            None,
+        )
+        if name_column is not None:
+            for raw, symbol in zip(values, frame[name_column].astype(str)):
+                key = str(raw).split(".")[0].strip().upper()
+                symbol = str(symbol).strip()
+                if key and symbol and symbol.lower() not in {"nan", "none", ""}:
+                    names[key] = symbol
     else:
         values = rows
     keys = gene_keys(values)
     if not keys:
         raise ValueError(f"{path} contains no gene identifiers.")
+    return keys, names
+
+
+def read_gene_list(path: Path) -> set[str]:
+    """Versionless Ensembl ids from a gene list."""
+    keys, _ = read_gene_table(path)
     return keys
 
 
@@ -423,6 +445,7 @@ __all__ = [
     "matched_pvalues",
     "normalize_cell_type",
     "read_gene_list",
+    "read_gene_table",
     "two_sample_quantiles",
     "warn_on_reference_mismatch",
 ]

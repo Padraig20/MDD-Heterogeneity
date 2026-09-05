@@ -34,7 +34,7 @@ from src.twas.compare import (
     log_overlap_report,
     match_model,
     matched_pvalues,
-    read_gene_list,
+    read_gene_table,
     warn_on_reference_mismatch,
 )
 from src.twas.covariance import has_covariance, load_ld_reference, snp_set_hash
@@ -45,7 +45,7 @@ from src.twas.ld_blocks import (
     load_ld_blocks,
     require_matching_build,
 )
-from src.twas.model_db import load_gene_name_map, write_model_db
+from src.twas.model_db import attach_gene_names, load_gene_name_map, write_model_db
 from src.twas.sprediXcan import GwasOptions, read_results, run_sprediXcan
 from src.twas.wandb_logger import TwasWandBLogger
 from src.twas.weights import (
@@ -95,6 +95,7 @@ Example
     python -m src.twas.get_shared_genes \\
         --ours student-preds/variantformer \\
         --ctpred student-preds/ctpred \\
+        --gtf gencode.v38.annotation.gtf.gz \\
         --output shared_genes.txt
 
     python -m src.twas.run \\
@@ -181,8 +182,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_GENE_NAME_MAP,
         help=(
-            "Two-column TSV mapping ensembl gene id to symbol, used to fill the "
-            "gene_name output column. Pass an absent path to skip."
+            "Two-column TSV mapping ensembl gene id to symbol. Overridden for "
+            "any gene that --shared-genes already paired with a GTF name. "
+            "Pass an absent path to skip."
         ),
     )
 
@@ -312,10 +314,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Gene list written by src/twas/get_shared_genes.py (one Ensembl id "
-            "per line). Both arms keep only these genes. Required with "
-            "--ctpred-models-dir; optional otherwise. A listed gene that a "
-            "model never fitted is left missing."
+            "Gene list written by src/twas/get_shared_genes.py (ENSID/Gene "
+            "TSV). Both arms keep only these genes, and the Gene column is "
+            "used as the plot label. Required with --ctpred-models-dir; "
+            "optional otherwise. A listed gene that a model never fitted is "
+            "left missing."
         ),
     )
 
@@ -526,6 +529,10 @@ def run_arm(
         final, long = aggregate_draws(per_draw, fdr=args.fdr)
     else:
         final = annotate_significance(next(iter(per_draw.values())), fdr=args.fdr)
+
+    final = attach_gene_names(final, gene_names)
+    if long is not None:
+        long = attach_gene_names(long, gene_names)
 
     model_stats.update({
         "model_path": str(spec.path),
@@ -1006,20 +1013,23 @@ def main() -> None:
             sys.exit(1)
 
     shared_keys = None
+    shared_names: dict[str, str] = {}
     if args.shared_genes is not None:
         try:
-            shared_keys = read_gene_list(args.shared_genes)
+            shared_keys, shared_names = read_gene_table(args.shared_genes)
         except (FileNotFoundError, ValueError) as error:
             logging.error("%s", error)
             sys.exit(1)
         logging.info(
-            "Restricting TWAS to %d gene(s) from %s.",
-            len(shared_keys), args.shared_genes,
+            "Restricting TWAS to %d gene(s) from %s (%d with a display name).",
+            len(shared_keys), args.shared_genes, len(shared_names),
         )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     gene_names = load_gene_name_map(args.gene_name_map)
+    if shared_names:
+        gene_names.update(shared_names)
     logger = TwasWandBLogger(project=args.wandb_project, entity=args.wandb_entity)
 
     logging.info("Running TWAS for %d cell type(s).", len(model_paths))

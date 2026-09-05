@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.cbook import boxplot_stats
 from matplotlib.ticker import MaxNLocator
+from matplotlib.transforms import blended_transform_factory
 
 from src.twas.aggregate import genomic_inflation
 
@@ -243,6 +244,63 @@ def _gene_set_mask(
     return fraction > 0.0
 
 
+def _gene_label(row) -> str:
+    """Prefer the GTF symbol; fall back to a versionless Ensembl id."""
+    name = row["gene_name"] if "gene_name" in row.index else None
+    if name is not None and pd.notna(name):
+        text = str(name).strip()
+        if text and text.lower() not in {"nan", "none"} and not text.upper().startswith("ENSG"):
+            return text
+    return str(row["gene"]).split(".")[0]
+
+
+def _ld_block_runs(block_ids: list[int]) -> list[tuple[int, int, int]]:
+    """Inclusive `(start, end, block_id)` runs of the same assigned LD block."""
+    runs: list[tuple[int, int, int]] = []
+    if not block_ids:
+        return runs
+    start = 0
+    for i in range(1, len(block_ids) + 1):
+        if i == len(block_ids) or block_ids[i] != block_ids[start]:
+            block_id = block_ids[start]
+            if block_id is not None and int(block_id) >= 0:
+                runs.append((start, i - 1, int(block_id)))
+            start = i
+    return runs
+
+
+def _draw_ld_block_braces(
+    ax: plt.Axes, box_x: np.ndarray, block_ids: list[int]
+) -> bool:
+    """
+    Square under-brackets grouping neighbouring genes that share an LD block.
+
+    Drawn in mixed data/axes coordinates just below the spine so the y-scale
+    of the p-values is left alone. Single-gene blocks get a short tick;
+    runs of two or more get a bracket spanning them.
+    """
+    runs = _ld_block_runs(block_ids)
+    if not runs:
+        return False
+    transform = blended_transform_factory(ax.transData, ax.transAxes)
+    y_top, y_bot = -0.10, -0.16
+    for start, end, _block_id in runs:
+        x0, x1 = float(box_x[start]), float(box_x[end])
+        if start == end:
+            ax.plot(
+                [x0, x0], [y_top, y_bot],
+                transform=transform, color="0.40", lw=0.8,
+                clip_on=False, solid_capstyle="butt",
+            )
+        else:
+            ax.plot(
+                [x0, x0, x1, x1], [y_top, y_bot, y_bot, y_top],
+                transform=transform, color="0.40", lw=0.9,
+                clip_on=False, solid_capstyle="butt",
+            )
+    return True
+
+
 def _significance_lines(data: pd.DataFrame, fdr: float) -> list[tuple]:
     """The Bonferroni and BH threshold lines, as `(y, colour, style, label)`."""
     lines = []
@@ -311,7 +369,7 @@ def manhattan(
                 upper if y_break is not None and y[row_index] >= y_break[1] else lower
             )
             target.annotate(
-                row.get("gene_name") or row["gene"],
+                _gene_label(row),
                 (x[row_index], y[row_index]),
                 fontsize=7,
                 xytext=(0, 4),
@@ -436,7 +494,7 @@ def manhattan_draw_boxplots(
     fdr: float = 0.05,
     criterion: str = "fdr",
     gene_set: str = "expectation",
-    label_top: int = 10,
+    label_top: Optional[int] = None,
     y_break: Optional[tuple[float, float]] = None,
     allow_y_break: bool = True,
 ) -> Optional[plt.Figure]:
@@ -450,9 +508,10 @@ def manhattan_draw_boxplots(
     straddles it.
 
     Genes are spaced evenly rather than at their bp so neighbouring hits in
-    the same LD block stay readable as separate boxes. Chromosome labels and
-    the alternating colours are the same as `manhattan`, so the figures still
-    read as a pair.
+    the same LD block stay readable as separate boxes. Every selected gene is
+    labelled with its GTF symbol. When the result table carries `block_index`
+    (i.e. `--ld-blocks` was given), neighbouring genes that share a block
+    are grouped with a square bracket under the chromosome ticks.
     """
     if long.empty or "pvalue" not in long.columns:
         return None
@@ -504,9 +563,12 @@ def manhattan_draw_boxplots(
     spread = np.concatenate(boxes)
     ymax = float(np.nanmax(spread))
     lines = _significance_lines(data, fdr)
-    width_inches = float(np.clip(0.09 * len(boxes) + 8.0, 12.0, 28.0))
+    n_labels = len(boxes) if label_top is None else max(0, label_top)
+    width_inches = float(np.clip(0.16 * len(boxes) + 8.0, 12.0, 48.0))
+    height_inches = 6.6 if n_labels else 5.4
     fig, upper, lower, axes, y_break = _setup_manhattan_axes(
-        spread, lines, y_break, allow_y_break, figsize=(width_inches, 5.4)
+        spread, lines, y_break, allow_y_break,
+        figsize=(width_inches, height_inches),
     )
     box_width = 0.65
 
@@ -532,6 +594,22 @@ def manhattan_draw_boxplots(
             ax.axhline(value, color=color, linestyle=style, linewidth=1,
                        label=label, zorder=2)
 
+    block_ids = [
+        int(data.at[row, "block_index"])
+        if "block_index" in data.columns and pd.notna(data.at[row, "block_index"])
+        else -1
+        for row in box_rows
+    ]
+    for start, end, block_id in _ld_block_runs(block_ids):
+        if end <= start:
+            continue
+        color = "#4c72b0" if block_id % 2 == 0 else "#dd8452"
+        for ax in axes:
+            ax.axvspan(
+                box_x[start] - 0.45, box_x[end] + 0.45,
+                color=color, alpha=0.07, zorder=0, lw=0,
+            )
+
     if y_break is None:
         lower.set_ylim(bottom=0)
     else:
@@ -541,29 +619,41 @@ def manhattan_draw_boxplots(
         upper.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
         _draw_axis_break(upper, lower)
 
-    if label_top:
-        strongest = sorted(
-            range(len(boxes)), key=lambda i: -float(np.median(boxes[i]))
-        )[:label_top]
-        for i in strongest:
+    if n_labels:
+        # Every selected gene, or the strongest `label_top`, labelled with
+        # the GTF symbol. Rotated so neighbouring names stay readable.
+        order = list(range(len(boxes)))
+        if label_top is not None:
+            order = sorted(
+                order, key=lambda i: -float(np.median(boxes[i]))
+            )[:n_labels]
+        fontsize = 5.5 if len(order) > 40 else 7
+        for i in order:
             row = box_rows[i]
             top_of_box = float(stats[i]["whishi"])
-            name = data.at[row, "gene_name"] if "gene_name" in data.columns else None
             target = (
                 upper if y_break is not None and top_of_box >= y_break[1] else lower
             )
             target.annotate(
-                name if pd.notna(name) and name else data.at[row, "gene"],
+                _gene_label(data.loc[row]),
                 (box_x[i], top_of_box),
-                fontsize=7,
-                xytext=(0, 4),
+                fontsize=fontsize,
+                rotation=90,
+                xytext=(0, 5),
                 textcoords="offset points",
                 ha="center",
+                va="bottom",
+                clip_on=False,
             )
 
     lower.set_xticks(ticks)
     lower.set_xticklabels(tick_labels, fontsize=8)
-    lower.set_xlabel("Chromosome")
+    braced = _draw_ld_block_braces(lower, box_x, block_ids)
+    if braced:
+        lower.tick_params(axis="x", pad=18)
+        lower.set_xlabel("Chromosome  (brackets mark LD blocks)")
+    else:
+        lower.set_xlabel("Chromosome")
     lower.set_xlim(0.2, len(boxes) + 0.8)
     n_draws = int(long["draw"].nunique()) if "draw" in long.columns else 0
     title = (
@@ -576,7 +666,7 @@ def manhattan_draw_boxplots(
     if y_break is None:
         lower.set_ylabel(r"$-\log_{10}$ p")
         lower.set_title(title)
-        fig.tight_layout()
+        fig.tight_layout(rect=(0, 0.10 if braced else 0.0, 1, 1))
     else:
         fig.supylabel(r"$-\log_{10}$ p")
         upper.set_title(title)
@@ -646,7 +736,7 @@ def volcano(
         top = data.nsmallest(label_top, "pvalue")
         for row_index, row in top.iterrows():
             ax.annotate(
-                row.get("gene_name") or row["gene"],
+                _gene_label(row),
                 (effect[row_index], y[row_index]),
                 fontsize=7,
                 xytext=(0, 4),
