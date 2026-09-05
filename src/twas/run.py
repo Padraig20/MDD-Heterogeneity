@@ -87,8 +87,10 @@ from. `--shared-genes` is the gene universe both arms are allowed to test --
 the intersection of the two student-prediction directories, written by
 `src/twas/get_shared_genes.py`. A gene on that list that a distilled model
 never produced is left missing: that is a failure of the fit, not a reason
-to shrink the list. Outputs are namespaced `this-study/`, `ctPred/` and
-`comparison/`.
+to shrink the list. The two arms are independent until the comparison, so
+`--exec-type parallel` (the default) runs them at the same time; `serial`
+keeps the old this-study-then-ctPred order. Outputs are namespaced
+`this-study/`, `ctPred/` and `comparison/`.
 
 Example
 -------
@@ -117,6 +119,10 @@ DEFAULT_GENE_NAME_MAP = Path("data/mdd_genes.tsv")
 ARM_OURS = "this-study"
 ARM_CTPRED = "ctPred"
 ARM_COMPARISON = "comparison"
+
+EXEC_PARALLEL = "parallel"
+EXEC_SERIAL = "serial"
+EXEC_TYPES = (EXEC_PARALLEL, EXEC_SERIAL)
 
 
 def parse_args() -> argparse.Namespace:
@@ -365,7 +371,21 @@ def parse_args() -> argparse.Namespace:
         "-j", "--jobs",
         type=int,
         default=min(8, os.cpu_count() or 1),
-        help="Number of S-PrediXcan runs to execute concurrently.",
+        help=(
+            "Number of S-PrediXcan runs to execute concurrently inside one arm. "
+            "With --exec-type parallel both arms use this budget at once."
+        ),
+    )
+    runtime.add_argument(
+        "--exec-type",
+        choices=EXEC_TYPES,
+        default=EXEC_PARALLEL,
+        help=(
+            "How to run the two arms of a comparison. 'parallel' (default) "
+            "runs this study and ctPred at the same time; 'serial' finishes "
+            "this study before starting ctPred. Ignored when there is no "
+            "ctPred arm."
+        ),
     )
     runtime.add_argument(
         "--continue-on-error",
@@ -426,6 +446,7 @@ def run_draws(
     metaxcan_dir: Path,
     work_dir: Path,
     jobs: int,
+    label: str = "S-PrediXcan",
 ) -> tuple[dict[str, pd.DataFrame], dict]:
     """Build a model DB per draw, run S-PrediXcan on each, and collect the tables."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -460,7 +481,8 @@ def run_draws(
         iterator = executor.map(one_draw, spec.draws)
         if len(spec.draws) > 1:
             iterator = tqdm(
-                iterator, total=len(spec.draws), desc="S-PrediXcan draws", leave=False
+                iterator, total=len(spec.draws),
+                desc=f"{label} S-PrediXcan draws", leave=False,
             )
         for draw_id, frame, stats in iterator:
             results[draw_id] = frame
@@ -519,6 +541,7 @@ def run_arm(
             metaxcan_dir=args.metaxcan_dir,
             work_dir=work_dir,
             jobs=args.jobs,
+            label=arm,
         )
     finally:
         if not args.keep_intermediate and work_dir.exists():
@@ -697,6 +720,68 @@ def mi_figures(
     return figures
 
 
+def execute_arm(
+    spec: ModelSpec,
+    ld,
+    snp_table,
+    positions: dict[str, tuple[str, int]],
+    gene_names: dict[str, str],
+    gwas: GwasOptions,
+    args: argparse.Namespace,
+    cell_dir: Path,
+    arm: str,
+    blocks: Optional[LdBlocks],
+    cell_type: str,
+    *,
+    with_mi: bool,
+) -> tuple[pd.DataFrame, Optional[pd.DataFrame], dict, dict, dict]:
+    """
+    One arm from S-PrediXcan through its figures.
+
+    Isolated so this study and ctPred can be submitted to the same executor
+    under --exec-type parallel; the comparison is joined after both return.
+    """
+    logging.info("Starting the %s arm for '%s'.", arm, cell_type)
+    final, long, model_stats = run_arm(
+        spec, ld, snp_table, gene_names, gwas, args, cell_dir, arm=arm
+    )
+    final, summary, figures, tables = analyse_arm(
+        final, positions, blocks, cell_type,
+        arm=arm, fdr=args.fdr, top_n=args.top_n, annotate=False,
+    )
+    summary.update(_prefix({
+        **model_stats,
+        "n_reference_individuals": ld.meta["reference"]["n_individuals"],
+        "n_genes_in_ld_reference": ld.meta["n_genes_written"],
+    }, arm))
+    if with_mi:
+        agreement_stats, curve, strata = analyse_agreement(
+            final, blocks, args, is_mi=spec.kind == KIND_MI
+        )
+        if spec.kind == KIND_MI:
+            agreement_stats.update(
+                agreement_summary(
+                    final, agreement_column=f"agreement_{args.agreement_criterion}"
+                )
+            )
+            figures.update(_prefix(
+                mi_figures(
+                    final, long, cell_type, positions, args.fdr, curve=curve,
+                    agreement_column=f"agreement_{args.agreement_criterion}",
+                    criterion=args.agreement_criterion,
+                ),
+                arm,
+            ))
+            tables[f"{arm}/draw_spread"] = draw_spread(long)
+        summary.update(_prefix(agreement_stats, arm))
+        if curve is not None:
+            tables[f"{arm}/agreement_ld_block_curve"] = curve
+        if strata is not None and not strata.empty:
+            tables[f"{arm}/agreement_strata"] = strata
+    logging.info("Finished the %s arm for '%s'.", arm, cell_type)
+    return final, long, summary, figures, tables
+
+
 def process_cell_type(
     model_path: Path,
     args: argparse.Namespace,
@@ -767,27 +852,73 @@ def process_cell_type(
             )
             gene_sync.update(theirs_stats)
 
-    # Step 1 + 3: one model DB and one S-PrediXcan run per draw.
+    # Step 1 + 3: one model DB and one S-PrediXcan run per draw. The two
+    # arms do not depend on each other until the comparison, so --exec-type
+    # parallel submits them together and joins here.
     cell_dir = Path(args.output_dir) / cell_type
     cell_dir.mkdir(parents=True, exist_ok=True)
-    final, long, model_stats = run_arm(
-        spec, ld, snp_table, gene_names, gwas, args, cell_dir, arm=ARM_OURS
-    )
-    # An MI model's per-draw z-scores, kept per arm so neither is thrown away.
+
+    def run_ours():
+        return execute_arm(
+            spec, ld, snp_table, positions, gene_names, gwas, args,
+            cell_dir, ARM_OURS, blocks, cell_type, with_mi=True,
+        )
+
+    def run_theirs():
+        return execute_arm(
+            ctpred_spec, ctpred_ld, ctpred_ld.load_snp_table(),
+            ctpred_ld.gene_positions(), gene_names, gwas, args,
+            cell_dir, ARM_CTPRED, blocks, cell_type, with_mi=False,
+        )
+
+    theirs = their_long = None
+    their_summary = their_figures = their_tables = None
+    if ctpred_spec is not None and args.exec_type == EXEC_PARALLEL:
+        logging.info(
+            "Running this-study and ctPred in parallel for '%s'.", cell_type
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ours_future = pool.submit(run_ours)
+            theirs_future = pool.submit(run_theirs)
+            ours_error = theirs_error = None
+            try:
+                final, long, summary, figures, tables = ours_future.result()
+            except Exception as error:  # noqa: BLE001 - collect both before raising
+                ours_error = error
+            try:
+                theirs, their_long, their_summary, their_figures, their_tables = (
+                    theirs_future.result()
+                )
+            except Exception as error:  # noqa: BLE001 - the comparison is an extra
+                theirs_error = error
+        if ours_error is not None:
+            raise ours_error
+        if theirs_error is not None:
+            if not args.continue_on_error:
+                raise theirs_error
+            logging.error(
+                "The ctPred comparison for '%s' failed: %s", cell_type, theirs_error
+            )
+    else:
+        final, long, summary, figures, tables = run_ours()
+        if ctpred_spec is not None:
+            try:
+                theirs, their_long, their_summary, their_figures, their_tables = (
+                    run_theirs()
+                )
+            except Exception as error:  # noqa: BLE001 - the comparison is an extra
+                if not args.continue_on_error:
+                    raise
+                logging.error(
+                    "The ctPred comparison for '%s' failed: %s", cell_type, error
+                )
+
     per_draw_zscores: dict[str, pd.DataFrame] = {}
     if long is not None:
         per_draw_zscores[ARM_OURS] = long
+    if their_long is not None:
+        per_draw_zscores[ARM_CTPRED] = their_long
 
-    # This study's arm: significance, LD blocks, summary statistics, figures.
-    final, summary, figures, tables = analyse_arm(
-        final, positions, blocks, cell_type,
-        arm=ARM_OURS, fdr=args.fdr, top_n=args.top_n, annotate=False,
-    )
-    summary.update(_prefix({
-        **model_stats,
-        "n_reference_individuals": ld.meta["reference"]["n_individuals"],
-        "n_genes_in_ld_reference": ld.meta["n_genes_written"],
-    }, ARM_OURS))
     summary.update({
         "cell_type": cell_type,
         "model_source": spec.source,
@@ -799,70 +930,28 @@ def process_cell_type(
     if blocks is not None:
         summary.update({"ld_blocks": blocks.name, "ld_blocks_build": blocks.build})
 
-    agreement_stats, curve, strata = analyse_agreement(
-        final, blocks, args, is_mi=spec.kind == KIND_MI
-    )
-    if spec.kind == KIND_MI:
-        agreement_stats.update(
-            agreement_summary(final, agreement_column=f"agreement_{args.agreement_criterion}")
+    if theirs is not None:
+        summary.update(their_summary)
+        figures.update(their_figures)
+        tables.update(their_tables)
+        overlap = gene_overlap_report(
+            spec.snp_sets, ctpred_spec.snp_sets, final, theirs
         )
-        figures.update(_prefix(
-            mi_figures(
-                final, long, cell_type, positions, args.fdr, curve=curve,
-                agreement_column=f"agreement_{args.agreement_criterion}",
-                criterion=args.agreement_criterion,
-            ),
-            ARM_OURS,
+        log_overlap_report(overlap)
+        matched = matched_pvalues(final, theirs)
+        summary.update(_prefix(
+            {
+                **(gene_sync or {}),
+                **overlap,
+                **comparison_metrics(final, theirs, matched),
+            },
+            ARM_COMPARISON,
         ))
-        tables[f"{ARM_OURS}/draw_spread"] = draw_spread(long)
-    summary.update(_prefix(agreement_stats, ARM_OURS))
-    if curve is not None:
-        tables[f"{ARM_OURS}/agreement_ld_block_curve"] = curve
-    if strata is not None and not strata.empty:
-        tables[f"{ARM_OURS}/agreement_strata"] = strata
-
-    # ctPred's arm, through exactly the same analysis, plus the head-to-head.
-    if ctpred_spec is not None:
-        try:
-            theirs, their_long, their_stats = run_arm(
-                ctpred_spec, ctpred_ld, ctpred_ld.load_snp_table(), gene_names,
-                gwas, args, cell_dir, arm=ARM_CTPRED,
-            )
-            if their_long is not None:
-                per_draw_zscores[ARM_CTPRED] = their_long
-            theirs, their_summary, their_figures, their_tables = analyse_arm(
-                theirs, ctpred_ld.gene_positions(), blocks, cell_type,
-                arm=ARM_CTPRED, fdr=args.fdr, top_n=args.top_n, annotate=False,
-            )
-            summary.update(their_summary)
-            summary.update(_prefix(their_stats, ARM_CTPRED))
-            figures.update(their_figures)
-            tables.update(their_tables)
-
-            overlap = gene_overlap_report(
-                spec.snp_sets, ctpred_spec.snp_sets, final, theirs
-            )
-            log_overlap_report(overlap)
-            matched = matched_pvalues(final, theirs)
-            summary.update(_prefix(
-                {
-                    **(gene_sync or {}),
-                    **overlap,
-                    **comparison_metrics(final, theirs, matched),
-                },
-                ARM_COMPARISON,
-            ))
-            figures.update(_prefix({
-                "qq": plots.qq_comparison(final, theirs, cell_type),
-                "scatter": plots.pvalue_scatter(matched, cell_type),
-            }, ARM_COMPARISON))
-            tables[f"{ARM_COMPARISON}/matched_genes"] = matched
-        except Exception as error:  # noqa: BLE001 - the comparison is an extra
-            if not args.continue_on_error:
-                raise
-            logging.error(
-                "The ctPred comparison for '%s' failed: %s", cell_type, error
-            )
+        figures.update(_prefix({
+            "qq": plots.qq_comparison(final, theirs, cell_type),
+            "scatter": plots.pvalue_scatter(matched, cell_type),
+        }, ARM_COMPARISON))
+        tables[f"{ARM_COMPARISON}/matched_genes"] = matched
 
     # Persist everything before touching WandB, so a logging failure cannot lose
     # a run that took hours of S-PrediXcan.
@@ -934,6 +1023,7 @@ def _wandb_config(args: argparse.Namespace, spec: ModelSpec) -> dict:
         ),
         "ctpred_model_kind": args.ctpred_model_kind,
         "shared_genes": str(args.shared_genes) if args.shared_genes else None,
+        "exec_type": args.exec_type,
     }
 
 
