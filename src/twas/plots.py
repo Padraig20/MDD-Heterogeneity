@@ -487,7 +487,7 @@ def manhattan_boxplots(
 
 
 def manhattan_draw_boxplots(
-    long: pd.DataFrame,
+    long: Optional[pd.DataFrame],
     frame: pd.DataFrame,
     positions: dict[str, tuple[str, int]],
     cell_type: str,
@@ -499,21 +499,20 @@ def manhattan_draw_boxplots(
     allow_y_break: bool = True,
 ) -> Optional[plt.Figure]:
     """
-    One boxplot per selected gene of its per-draw -log10 p, in genomic order.
+    Significant genes only, evenly spaced, with names and LD-block brackets.
+
+    An MI run (several p-values per gene in `long`) is drawn as a boxplot of
+    per-draw -log10 p. A single, mean, or ctPred model has one p-value and is
+    drawn as a dot. `long` may be omitted: the point estimate on `frame` is
+    used.
 
     `gene_set` is the same choice as `manhattan_boxplots`: the E[z] call, the
-    genes every fit agreed on, or the genes any fit called. The box is always
-    the full set of draws, so a unanimous gene is a box sitting entirely above
-    the threshold and an "any" gene that only one fit saw is a box that
-    straddles it.
-
-    Genes are spaced evenly rather than at their bp so neighbouring hits in
-    the same LD block stay readable as separate boxes. Every selected gene is
-    labelled with its GTF symbol. When the result table carries `block_index`
-    (i.e. `--ld-blocks` was given), neighbouring genes that share a block
-    are grouped with a square bracket under the chromosome ticks.
+    genes every fit agreed on, or the genes any fit called.
     """
-    if long.empty or "pvalue" not in long.columns:
+    if long is None or long.empty or "pvalue" not in long.columns:
+        long = frame.loc[:, ["gene", "pvalue"]].dropna(subset=["pvalue"]).copy()
+        long["draw"] = "point"
+    if long.empty:
         return None
 
     layout = _genome_layout(frame, positions)
@@ -564,32 +563,45 @@ def manhattan_draw_boxplots(
     ymax = float(np.nanmax(spread))
     lines = _significance_lines(data, fdr)
     n_labels = len(boxes) if label_top is None else max(0, label_top)
+    use_boxes = any(values.size > 1 for values in boxes)
     width_inches = float(np.clip(0.16 * len(boxes) + 8.0, 12.0, 48.0))
-    height_inches = 6.6 if n_labels else 5.4
+    height_inches = 7.2 if n_labels else 5.6
     fig, upper, lower, axes, y_break = _setup_manhattan_axes(
         spread, lines, y_break, allow_y_break,
         figsize=(width_inches, height_inches),
     )
     box_width = 0.65
+    point_y = np.array([float(np.median(values)) for values in boxes])
 
     for ax in axes:
         for parity, facecolor in ((0, "0.45"), (1, "0.75")):
             indices = [i for i, key in enumerate(chrom_keys) if key % 2 == parity]
             if not indices:
                 continue
-            ax.bxp(
-                [stats[i] for i in indices],
-                positions=[box_x[i] for i in indices],
-                widths=box_width,
-                manage_ticks=False,
-                patch_artist=True,
-                showfliers=False,
-                boxprops=dict(facecolor=facecolor, edgecolor="0.20", linewidth=0.6),
-                medianprops=dict(color="firebrick", linewidth=1.1),
-                whiskerprops=dict(color="0.20", linewidth=0.6),
-                capprops=dict(color="0.20", linewidth=0.6),
-                zorder=3,
-            )
+            if use_boxes:
+                ax.bxp(
+                    [stats[i] for i in indices],
+                    positions=[box_x[i] for i in indices],
+                    widths=box_width,
+                    manage_ticks=False,
+                    patch_artist=True,
+                    showfliers=False,
+                    boxprops=dict(facecolor=facecolor, edgecolor="0.20", linewidth=0.6),
+                    medianprops=dict(color="firebrick", linewidth=1.1),
+                    whiskerprops=dict(color="0.20", linewidth=0.6),
+                    capprops=dict(color="0.20", linewidth=0.6),
+                    zorder=3,
+                )
+            else:
+                ax.scatter(
+                    [box_x[i] for i in indices],
+                    point_y[indices],
+                    s=22,
+                    color=facecolor,
+                    edgecolor="0.20",
+                    linewidth=0.4,
+                    zorder=3,
+                )
         for value, color, style, label in lines:
             ax.axhline(value, color=color, linestyle=style, linewidth=1,
                        label=label, zorder=2)
@@ -630,13 +642,13 @@ def manhattan_draw_boxplots(
         fontsize = 5.5 if len(order) > 40 else 7
         for i in order:
             row = box_rows[i]
-            top_of_box = float(stats[i]["whishi"])
+            top = float(stats[i]["whishi"]) if use_boxes else float(point_y[i])
             target = (
-                upper if y_break is not None and top_of_box >= y_break[1] else lower
+                upper if y_break is not None and top >= y_break[1] else lower
             )
             target.annotate(
                 _gene_label(data.loc[row]),
-                (box_x[i], top_of_box),
+                (box_x[i], top),
                 fontsize=fontsize,
                 rotation=90,
                 xytext=(0, 5),
@@ -651,25 +663,30 @@ def manhattan_draw_boxplots(
     braced = _draw_ld_block_braces(lower, box_x, block_ids)
     if braced:
         lower.tick_params(axis="x", pad=18)
-        lower.set_xlabel("Chromosome  (brackets mark LD blocks)")
-    else:
-        lower.set_xlabel("Chromosome")
+    lower.set_xlabel("")
     lower.set_xlim(0.2, len(boxes) + 0.8)
     n_draws = int(long["draw"].nunique()) if "draw" in long.columns else 0
-    title = (
-        f"{cell_type} — per-draw p-value spread of the {len(boxes):,} "
-        f"{criterion.upper()} gene(s) {GENE_SET_TITLES[gene_set.lower()]} "
-        f"over {n_draws} MI fit(s)"
-    )
+    if use_boxes:
+        title = (
+            f"{cell_type} — per-draw p-value spread of the {len(boxes):,} "
+            f"{criterion.upper()} gene(s) {GENE_SET_TITLES[gene_set.lower()]} "
+            f"over {n_draws} MI fit(s)"
+        )
+    else:
+        title = (
+            f"{cell_type} — {len(boxes):,} {criterion.upper()} gene(s) "
+            f"{GENE_SET_TITLES[gene_set.lower()]}"
+        )
     if lower.get_legend_handles_labels()[0]:
         lower.legend(loc="upper right", fontsize=8)
+    title_pad = 18
     if y_break is None:
         lower.set_ylabel(r"$-\log_{10}$ p")
-        lower.set_title(title)
-        fig.tight_layout(rect=(0, 0.10 if braced else 0.0, 1, 1))
+        lower.set_title(title, pad=title_pad)
+        fig.tight_layout(rect=(0, 0.08 if braced else 0.02, 1, 0.94))
     else:
         fig.supylabel(r"$-\log_{10}$ p")
-        upper.set_title(title)
+        upper.set_title(title, pad=title_pad)
     return fig
 
 

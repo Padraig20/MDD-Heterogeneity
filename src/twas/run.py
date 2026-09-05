@@ -585,6 +585,7 @@ def analyse_arm(
     fdr: float,
     top_n: int,
     annotate: bool = True,
+    long: Optional[pd.DataFrame] = None,
 ) -> tuple[pd.DataFrame, dict, dict, dict]:
     """
     The full single-model analysis, run identically for either arm.
@@ -618,6 +619,14 @@ def analyse_arm(
         "manhattan": plots.manhattan(frame, positions, cell_type, fdr=fdr),
         "manhattan_boxplots": plots.manhattan_boxplots(
             frame, positions, cell_type, fdr=fdr
+        ),
+        "manhattan_hits": plots.manhattan_draw_boxplots(
+            long, frame, positions, cell_type, fdr=fdr,
+            criterion="bonferroni", gene_set="expectation",
+        ),
+        "manhattan_hits_fdr": plots.manhattan_draw_boxplots(
+            long, frame, positions, cell_type, fdr=fdr,
+            criterion="fdr", gene_set="expectation",
         ),
         "qq": plots.qq(frame, cell_type),
         "volcano": plots.volcano(frame, cell_type, fdr=fdr),
@@ -748,6 +757,7 @@ def execute_arm(
     final, summary, figures, tables = analyse_arm(
         final, positions, blocks, cell_type,
         arm=arm, fdr=args.fdr, top_n=args.top_n, annotate=False,
+        long=long,
     )
     summary.update(_prefix({
         **model_stats,
