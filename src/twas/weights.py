@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -90,6 +90,43 @@ class ModelSpec:
 
     def n_model_snps(self) -> int:
         return sum(len(entry.snp_ids) for entry in self.snp_sets.values())
+
+    def restrict_to_gene_keys(self, keys: set[str]) -> "ModelSpec":
+        """
+        A copy of this spec that keeps only genes whose versionless Ensembl id
+        is in `keys`.
+
+        Used to put two arms on the same gene universe before TWAS, so a
+        comparison is not decided by which teacher happened to produce a
+        model for a gene the other never saw. Draws that lose every gene
+        are dropped; an empty result is refused rather than run as a
+        zero-gene TWAS.
+        """
+        keep = {str(key).split(".")[0].strip().upper() for key in keys}
+        snp_sets = {
+            gene: entry
+            for gene, entry in self.snp_sets.items()
+            if str(gene).split(".")[0].strip().upper() in keep
+        }
+        if not snp_sets:
+            raise ValueError(
+                f"{self.path.name}: restricting to the shared gene set left "
+                "no genes."
+            )
+        draws = []
+        for draw in self.draws:
+            coefs = {
+                gene: values for gene, values in draw.coefs.items()
+                if gene in snp_sets
+            }
+            if coefs:
+                draws.append(replace(draw, coefs=coefs))
+        if not draws:
+            raise ValueError(
+                f"{self.path.name}: every draw lost all of its genes when "
+                "restricted to the shared set."
+            )
+        return replace(self, snp_sets=snp_sets, draws=draws)
 
 
 def detect_source(payload: dict) -> str:

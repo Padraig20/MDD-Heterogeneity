@@ -8,6 +8,8 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from src.twas.weights import ModelSpec
+
 """
 compare.py
 
@@ -26,6 +28,17 @@ only thing that differs between them is the teacher -- which is the comparison
 the numbers are supposed to be making. Reading a foreign DB instead means the
 two arms also differ in their reference panel, their variant identifiers and
 their genome build, and any one of those can dominate the result.
+
+The gene universe is the intersection
+-------------------------------------
+VariantFormer simply never sees some genes, so our models are a subset of
+ctPred's. Leaving those extras in would let ctPred report more tests, a
+different Bonferroni threshold and a longer hit list for a reason that has
+nothing to do with the teacher. `restrict_to_shared_genes` therefore drops
+every gene that is not in both models *before* either arm is run, so the two
+TWAS are the same list of hypotheses. The covariances stay as built -- they
+are a property of the model directory -- and unused genes in them are simply
+never looked up.
 
 One reference panel, one covariance each
 ----------------------------------------
@@ -119,6 +132,57 @@ REFERENCE_FIELDS = (
     "n_individuals",
     "individuals_hash",
 )
+
+
+def restrict_to_shared_genes(
+    ours: ModelSpec, theirs: ModelSpec
+) -> tuple[ModelSpec, ModelSpec, dict]:
+    """
+    Restrict both model specs to the genes they both define.
+
+    Matching is on the versionless Ensembl id, the same key `gene_overlap_report`
+    uses. Genes only ctPred has -- the ones VariantFormer never produced a
+    model for -- are dropped from that arm; genes only we have are dropped
+    from ours, so both TWAS test the same hypotheses and share one
+    multiple-testing burden.
+
+    The covariance files are not touched: they were built for the full models
+    and a later hash check would fail if we rewrote them. Extra genes in a
+    covariance are ignored by S-PrediXcan.
+    """
+    our_keys = gene_keys(ours.snp_sets)
+    their_keys = gene_keys(theirs.snp_sets)
+    shared = our_keys & their_keys
+    dropped_ours = our_keys - shared
+    dropped_theirs = their_keys - shared
+    if not shared:
+        raise ValueError(
+            f"The two models for '{ours.cell_type}' share no gene, so there is "
+            "nothing to compare. Check that both were distilled against the "
+            "same --select-genes and the same targets."
+        )
+
+    ours_kept = ours.restrict_to_gene_keys(shared)
+    theirs_kept = theirs.restrict_to_gene_keys(shared)
+    stats = {
+        "n_genes_ours_before_intersection": len(our_keys),
+        "n_genes_ctpred_before_intersection": len(their_keys),
+        "n_genes_shared": len(shared),
+        "n_genes_dropped_from_ours": len(dropped_ours),
+        "n_genes_dropped_from_ctpred": len(dropped_theirs),
+    }
+    logging.info(
+        "Comparing on the %d gene(s) both models define (ours had %d, ctPred "
+        "had %d; dropped %d of ours and %d of ctPred).",
+        len(shared), len(our_keys), len(their_keys),
+        len(dropped_ours), len(dropped_theirs),
+    )
+    if dropped_theirs:
+        logging.info(
+            "ctPred-only genes are the ones VariantFormer never modelled; "
+            "they are not tested on either arm."
+        )
+    return ours_kept, theirs_kept, stats
 
 
 def warn_on_reference_mismatch(ours: dict, theirs: dict, cell_type: str) -> None:
@@ -291,10 +355,9 @@ def comparison_metrics(
     How the two arms' hit lists relate on the genes they both test.
 
     Each arm's own significance counts and LD-block coverage are produced by the
-    per-arm analysis; what is left here is strictly the overlap. Note that each
-    side is corrected against its own gene count, which is right -- the two
-    models can end up testing slightly different gene sets -- but does mean the
-    two Bonferroni thresholds differ.
+    per-arm analysis; what is left here is strictly the overlap. Both arms are
+    restricted to the same genes before TWAS, so they share one multiple-testing
+    burden and the two Bonferroni thresholds agree.
 
     `effect_size` is deliberately absent: it carries the units of the
     distillation target, and ctPred's percentile target is not our log target.
@@ -344,6 +407,7 @@ __all__ = [
     "match_model",
     "matched_pvalues",
     "normalize_cell_type",
+    "restrict_to_shared_genes",
     "two_sample_quantiles",
     "warn_on_reference_mismatch",
 ]

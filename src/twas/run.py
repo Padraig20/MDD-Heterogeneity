@@ -33,6 +33,7 @@ from src.twas.compare import (
     log_overlap_report,
     match_model,
     matched_pvalues,
+    restrict_to_shared_genes,
     warn_on_reference_mismatch,
 )
 from src.twas.covariance import has_covariance, load_ld_reference, snp_set_hash
@@ -81,7 +82,10 @@ Comparing against ctPred
 (`src/training/models/ctpred.py`) and prepared with the same covariance script.
 That arm then runs through all three steps unchanged, so the only difference
 between the two sets of results is the teacher the elastic net was distilled
-from. Outputs are namespaced `this-study/`, `ctPred/` and `comparison/`.
+from. Genes that only one model defines -- almost always ctPred extras that
+VariantFormer never saw -- are dropped from both arms before TWAS, so the
+two test the same hypotheses. Outputs are namespaced `this-study/`,
+`ctPred/` and `comparison/`.
 
 Example
 -------
@@ -718,6 +722,13 @@ def process_cell_type(
             cell_type, ctpred_spec.source, ctpred_spec.kind,
             len(ctpred_spec.snp_sets), len(ctpred_spec.draws),
         )
+        # Drop genes only one teacher produced -- almost always ctPred extras
+        # that VariantFormer never saw -- so both TWAS test the same list.
+        # Done after the covariance hash check, which is against the full
+        # model sitting on disk.
+        spec, ctpred_spec, gene_sync = restrict_to_shared_genes(spec, ctpred_spec)
+    else:
+        gene_sync = None
 
     # Step 1 + 3: one model DB and one S-PrediXcan run per draw.
     cell_dir = Path(args.output_dir) / cell_type
@@ -795,7 +806,11 @@ def process_cell_type(
             log_overlap_report(overlap)
             matched = matched_pvalues(final, theirs)
             summary.update(_prefix(
-                {**overlap, **comparison_metrics(final, theirs, matched)},
+                {
+                    **(gene_sync or {}),
+                    **overlap,
+                    **comparison_metrics(final, theirs, matched),
+                },
                 ARM_COMPARISON,
             ))
             figures.update(_prefix({
