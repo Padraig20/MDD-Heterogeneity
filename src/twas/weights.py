@@ -96,10 +96,8 @@ class ModelSpec:
         A copy of this spec that keeps only genes whose versionless Ensembl id
         is in `keys`.
 
-        Used to put two arms on the same gene universe before TWAS, so a
-        comparison is not decided by which teacher happened to produce a
-        model for a gene the other never saw. Draws that lose every gene
-        are dropped; an empty result is refused rather than run as a
+        Used to restrict a TWAS to `--shared-genes`. Draws that lose every
+        gene are dropped; an empty result is refused rather than run as a
         zero-gene TWAS.
         """
         keep = {str(key).split(".")[0].strip().upper() for key in keys}

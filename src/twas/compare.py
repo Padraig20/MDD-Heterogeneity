@@ -29,16 +29,16 @@ the numbers are supposed to be making. Reading a foreign DB instead means the
 two arms also differ in their reference panel, their variant identifiers and
 their genome build, and any one of those can dominate the result.
 
-The gene universe is the intersection
--------------------------------------
-VariantFormer simply never sees some genes, so our models are a subset of
-ctPred's. Leaving those extras in would let ctPred report more tests, a
-different Bonferroni threshold and a longer hit list for a reason that has
-nothing to do with the teacher. `restrict_to_shared_genes` therefore drops
-every gene that is not in both models *before* either arm is run, so the two
-TWAS are the same list of hypotheses. The covariances stay as built -- they
-are a property of the model directory -- and unused genes in them are simply
-never looked up.
+The gene universe is the intersection of the two teachers
+---------------------------------------------------------
+VariantFormer and Enformer (ctPred) see different gene sets -- 17,839 vs
+18,229 on the current run -- so a comparison that used every gene either
+distilled model happened to converge on would mix that annotation difference
+with the teacher difference. `src/twas/get_shared_genes.py` intersects the
+two student-prediction directories and writes `shared_genes.txt`; `run.py`
+takes that file and keeps only those genes. A gene on the list that a
+distilled model never produced is left missing: that is a failure of the
+fit, not a reason to shrink the universe.
 
 One reference panel, one covariance each
 ----------------------------------------
@@ -134,55 +134,68 @@ REFERENCE_FIELDS = (
 )
 
 
-def restrict_to_shared_genes(
-    ours: ModelSpec, theirs: ModelSpec
-) -> tuple[ModelSpec, ModelSpec, dict]:
+def read_gene_list(path: Path) -> set[str]:
     """
-    Restrict both model specs to the genes they both define.
+    Versionless Ensembl ids from a gene list.
 
-    Matching is on the versionless Ensembl id, the same key `gene_overlap_report`
-    uses. Genes only ctPred has -- the ones VariantFormer never produced a
-    model for -- are dropped from that arm; genes only we have are dropped
-    from ours, so both TWAS test the same hypotheses and share one
-    multiple-testing burden.
-
-    The covariance files are not touched: they were built for the full models
-    and a later hash check would fail if we rewrote them. Extra genes in a
-    covariance are ignored by S-PrediXcan.
+    Accepts one id per line, or a TSV whose first column (or an `ENSID` /
+    `gene` column) holds the ids -- the same layouts `train.py --select_genes`
+    and `get_shared_genes.py` write.
     """
-    our_keys = gene_keys(ours.snp_sets)
-    their_keys = gene_keys(theirs.snp_sets)
-    shared = our_keys & their_keys
-    dropped_ours = our_keys - shared
-    dropped_theirs = their_keys - shared
-    if not shared:
-        raise ValueError(
-            f"The two models for '{ours.cell_type}' share no gene, so there is "
-            "nothing to compare. Check that both were distilled against the "
-            "same --select-genes and the same targets."
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Gene list not found: {path}")
+    text = path.read_text().splitlines()
+    rows = [line.strip() for line in text if line.strip() and not line.startswith("#")]
+    if not rows:
+        raise ValueError(f"{path} is empty.")
+
+    header = rows[0].split("\t")
+    if len(header) > 1 or header[0] in {"ENSID", "gene", "ensid", "Gene"}:
+        frame = pd.read_csv(path, sep="\t", comment="#")
+        column = next(
+            (name for name in ("ENSID", "gene", "ensid", "Gene") if name in frame.columns),
+            frame.columns[0],
         )
+        values = frame[column].astype(str)
+    else:
+        values = rows
+    keys = gene_keys(values)
+    if not keys:
+        raise ValueError(f"{path} contains no gene identifiers.")
+    return keys
 
-    ours_kept = ours.restrict_to_gene_keys(shared)
-    theirs_kept = theirs.restrict_to_gene_keys(shared)
+
+def apply_gene_list(spec: ModelSpec, keys: set[str], arm: str) -> tuple[ModelSpec, dict]:
+    """
+    Keep the genes of `spec` that are on the shared list.
+
+    Genes on the list that this model never produced are left missing and
+    counted; that is a failure of the fit, not a reason to shrink the list.
+    """
+    before = gene_keys(spec.snp_sets)
+    kept = spec.restrict_to_gene_keys(keys)
+    after = gene_keys(kept.snp_sets)
+    missing = keys - before
+    extra = before - keys
     stats = {
-        "n_genes_ours_before_intersection": len(our_keys),
-        "n_genes_ctpred_before_intersection": len(their_keys),
-        "n_genes_shared": len(shared),
-        "n_genes_dropped_from_ours": len(dropped_ours),
-        "n_genes_dropped_from_ctpred": len(dropped_theirs),
+        f"n_genes_{arm}_in_model": len(before),
+        f"n_genes_{arm}_on_shared_list": len(after),
+        f"n_genes_{arm}_missing_from_model": len(missing),
+        f"n_genes_{arm}_dropped_as_off_list": len(extra),
     }
     logging.info(
-        "Comparing on the %d gene(s) both models define (ours had %d, ctPred "
-        "had %d; dropped %d of ours and %d of ctPred).",
-        len(shared), len(our_keys), len(their_keys),
-        len(dropped_ours), len(dropped_theirs),
+        "Cell type '%s' [%s]: %d of %d model gene(s) are on the shared list; "
+        "%d shared gene(s) have no weights in this model.",
+        spec.cell_type, arm, len(after), len(before), len(missing),
     )
-    if dropped_theirs:
-        logging.info(
-            "ctPred-only genes are the ones VariantFormer never modelled; "
-            "they are not tested on either arm."
+    if missing:
+        logging.warning(
+            "Cell type '%s' [%s]: %d gene(s) on the shared list have no "
+            "distilled weights. That is a fit failure, not a gene-list cut.",
+            spec.cell_type, arm, len(missing),
         )
-    return ours_kept, theirs_kept, stats
+    return kept, stats
 
 
 def warn_on_reference_mismatch(ours: dict, theirs: dict, cell_type: str) -> None:
@@ -356,8 +369,9 @@ def comparison_metrics(
 
     Each arm's own significance counts and LD-block coverage are produced by the
     per-arm analysis; what is left here is strictly the overlap. Both arms are
-    restricted to the same genes before TWAS, so they share one multiple-testing
-    burden and the two Bonferroni thresholds agree.
+    filtered to `--shared-genes` before TWAS; a gene on that list that one
+    model never fitted is missing from that arm's table, which is a fit
+    failure rather than a different universe.
 
     `effect_size` is deliberately absent: it carries the units of the
     distillation target, and ctPred's percentile target is not our log target.
@@ -404,10 +418,11 @@ __all__ = [
     "gene_keys",
     "gene_overlap_report",
     "log_overlap_report",
+    "apply_gene_list",
     "match_model",
     "matched_pvalues",
     "normalize_cell_type",
-    "restrict_to_shared_genes",
+    "read_gene_list",
     "two_sample_quantiles",
     "warn_on_reference_mismatch",
 ]

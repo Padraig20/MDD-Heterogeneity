@@ -27,13 +27,14 @@ from src.twas.aggregate import (
     summarize,
 )
 from src.twas.compare import (
+    apply_gene_list,
     comparison_metrics,
     discover_ctpred_models,
     gene_overlap_report,
     log_overlap_report,
     match_model,
     matched_pvalues,
-    restrict_to_shared_genes,
+    read_gene_list,
     warn_on_reference_mismatch,
 )
 from src.twas.covariance import has_covariance, load_ld_reference, snp_set_hash
@@ -82,20 +83,28 @@ Comparing against ctPred
 (`src/training/models/ctpred.py`) and prepared with the same covariance script.
 That arm then runs through all three steps unchanged, so the only difference
 between the two sets of results is the teacher the elastic net was distilled
-from. Genes that only one model defines -- almost always ctPred extras that
-VariantFormer never saw -- are dropped from both arms before TWAS, so the
-two test the same hypotheses. Outputs are namespaced `this-study/`,
-`ctPred/` and `comparison/`.
+from. `--shared-genes` is the gene universe both arms are allowed to test --
+the intersection of the two student-prediction directories, written by
+`src/twas/get_shared_genes.py`. A gene on that list that a distilled model
+never produced is left missing: that is a failure of the fit, not a reason
+to shrink the list. Outputs are namespaced `this-study/`, `ctPred/` and
+`comparison/`.
 
 Example
 -------
+    python -m src.twas.get_shared_genes \\
+        --ours student-preds/variantformer \\
+        --ctpred student-preds/ctpred \\
+        --output shared_genes.txt
+
     python -m src.twas.run \\
         --models-dir models/elasticnet \\
         --gwas-file gwas/mdd.txt.gz \\
         --snp-column SNP --effect-allele-column A1 --non-effect-allele-column A2 \\
         --beta-column BETA --se-column SE \\
         --output-dir results/mdd --wandb-project mdd-twas \\
-        --ctpred-models-dir models/ctpred
+        --ctpred-models-dir models/ctpred \\
+        --shared-genes shared_genes.txt
 """
 
 DEFAULT_METAXCAN_DIR = Path("metaxcan/software")
@@ -296,6 +305,17 @@ def parse_args() -> argparse.Namespace:
             "Draw expansion for the ctPred arm. Distillation forbids "
             "--norm-targets percentiles in ensemble mode, so a ctPred JSON is "
             "normally a single point estimate and 'auto' is right."
+        ),
+    )
+    comparison.add_argument(
+        "--shared-genes",
+        type=Path,
+        default=None,
+        help=(
+            "Gene list written by src/twas/get_shared_genes.py (one Ensembl id "
+            "per line). Both arms keep only these genes. Required with "
+            "--ctpred-models-dir; optional otherwise. A listed gene that a "
+            "model never fitted is left missing."
         ),
     )
 
@@ -678,6 +698,7 @@ def process_cell_type(
     logger: TwasWandBLogger,
     blocks: Optional[LdBlocks] = None,
     ctpred_path: Optional[Path] = None,
+    shared_keys: Optional[set[str]] = None,
 ) -> dict:
     """Run the full three-step pipeline for one cell type."""
     spec = load_model_json(
@@ -722,13 +743,22 @@ def process_cell_type(
             cell_type, ctpred_spec.source, ctpred_spec.kind,
             len(ctpred_spec.snp_sets), len(ctpred_spec.draws),
         )
-        # Drop genes only one teacher produced -- almost always ctPred extras
-        # that VariantFormer never saw -- so both TWAS test the same list.
-        # Done after the covariance hash check, which is against the full
-        # model sitting on disk.
-        spec, ctpred_spec, gene_sync = restrict_to_shared_genes(spec, ctpred_spec)
-    else:
-        gene_sync = None
+
+    # Restrict to --shared-genes after the covariance hash check, which is
+    # against the full model sitting on disk. Each arm is filtered
+    # independently: a listed gene one model never fitted stays missing.
+    gene_sync = None
+    if shared_keys is not None:
+        spec, ours_stats = apply_gene_list(spec, shared_keys, "ours")
+        gene_sync = {
+            "n_genes_on_shared_list": len(shared_keys),
+            **ours_stats,
+        }
+        if ctpred_spec is not None:
+            ctpred_spec, theirs_stats = apply_gene_list(
+                ctpred_spec, shared_keys, "ctpred"
+            )
+            gene_sync.update(theirs_stats)
 
     # Step 1 + 3: one model DB and one S-PrediXcan run per draw.
     cell_dir = Path(args.output_dir) / cell_type
@@ -757,6 +787,8 @@ def process_cell_type(
         "model_kind": spec.kind,
         "standardized_weights_rescaled": spec.standardized,
     })
+    if gene_sync is not None and ctpred_spec is None:
+        summary.update(_prefix(gene_sync, ARM_OURS))
     if blocks is not None:
         summary.update({"ld_blocks": blocks.name, "ld_blocks_build": blocks.build})
 
@@ -894,12 +926,21 @@ def _wandb_config(args: argparse.Namespace, spec: ModelSpec) -> dict:
             str(args.ctpred_models_dir) if args.ctpred_models_dir else None
         ),
         "ctpred_model_kind": args.ctpred_model_kind,
+        "shared_genes": str(args.shared_genes) if args.shared_genes else None,
     }
 
 
 def main() -> None:
     args = parse_args()
     setup_logging(args.verbose)
+
+    if args.ctpred_models_dir is not None and args.shared_genes is None:
+        logging.error(
+            "--shared-genes is required with --ctpred-models-dir. Build it "
+            "with `python -m src.twas.get_shared_genes --ours <student-preds> "
+            "--ctpred <ctpred student-preds>`."
+        )
+        sys.exit(1)
 
     try:
         gwas = gwas_options(args)
@@ -948,6 +989,18 @@ def main() -> None:
             logging.error("%s", error)
             sys.exit(1)
 
+    shared_keys = None
+    if args.shared_genes is not None:
+        try:
+            shared_keys = read_gene_list(args.shared_genes)
+        except (FileNotFoundError, ValueError) as error:
+            logging.error("%s", error)
+            sys.exit(1)
+        logging.info(
+            "Restricting TWAS to %d gene(s) from %s.",
+            len(shared_keys), args.shared_genes,
+        )
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     gene_names = load_gene_name_map(args.gene_name_map)
@@ -972,6 +1025,7 @@ def main() -> None:
                 process_cell_type(
                     model_path, args, gwas, gene_names, logger,
                     blocks=blocks, ctpred_path=ctpred_path,
+                    shared_keys=shared_keys,
                 )
             )
         except Exception as error:  # noqa: BLE001 - one bad cell type must not kill the sweep
