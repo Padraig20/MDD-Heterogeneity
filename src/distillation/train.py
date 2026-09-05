@@ -182,9 +182,12 @@ def parse_args() -> argparse.Namespace:
         default="log",
         choices=["none", "log", "percentiles"],
         help=(
-            "Normalization for target means. Ensemble sigmas are never "
-            "transformed; use 'log' for member files exported from a "
-            "log-target teacher and 'none' for an untransformed teacher."
+            "Normalization for target means. 'log' applies log1p, matching "
+            "member sigmas exported from a log-target teacher. 'percentiles' "
+            "ranks individuals within each gene and maps member sigmas "
+            "through that rank via the interpolated empirical CDF in "
+            "log1p-space (the space those sigmas already inhabit). 'none' "
+            "leaves both unchanged (untransformed teacher)."
         ),
     )
     parser.add_argument(
@@ -715,12 +718,6 @@ def main() -> None:
             "--ensemble-members-test-dir requires --ensemble-members-dir."
         )
         sys.exit(1)
-    if ensemble_mode and args.norm_targets == "percentiles":
-        logging.error(
-            "Percentile-normalized means have no compatible transformation for "
-            "the member sigmas; use --norm-targets log or none."
-        )
-        sys.exit(1)
     if ensemble_mode and args.model_name != "elasticnet":
         logging.error(
             "Ensemble-member bootstrap distillation requires "
@@ -912,6 +909,11 @@ def main() -> None:
             "fixed" if args.ensemble_alpha is not None else args.ensemble_alpha_mode,
             args.sigma_floor,
         )
+        if args.norm_targets == "percentiles":
+            logging.info(
+                "Percentile targets enabled: each gene ranks individuals, and "
+                "member sigmas are mapped through that rank in log1p-space."
+            )
     elif probabilistic:
         logging.info(
             "Probabilistic distillation enabled: fitting three independent elastic-net/"

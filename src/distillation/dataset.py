@@ -206,7 +206,8 @@ class GenotypeDataset(Dataset):
 
             self.genes        = self.y["gene"].to_numpy()
             self._individuals = np.asarray(individual_cols, dtype=str)
-            self._expression  = self._normalized_expression(self.y[individual_cols])
+            raw_expression = self.y[individual_cols].to_numpy(dtype=np.float64)
+            self._expression  = self._normalized_expression(raw_expression)
             self._aleatoric   = (
                 None if y_aleatoric is None
                 else self._aligned_matrix(y_aleatoric, "aleatoric", individual_cols)
@@ -219,6 +220,13 @@ class GenotypeDataset(Dataset):
                 None if y_sigma is None
                 else self._aligned_matrix(y_sigma, "sigma", individual_cols)
             )
+            if self._sigma is not None and self.normalize == "percentiles":
+                # Member sigmas from get_student_data stay in teacher output
+                # space. For the usual log-target teacher that is log1p-space
+                # (means are undone to TPM; sigmas are not), and rank(y) =
+                # rank(log1p(y)) for y >= 0, so the percentile Jacobian is
+                # applied on the log1p support.
+                self._sigma = self.to_percentile_sigmas(raw_expression, self._sigma)
         else:
             keep_genes = self._genes_passing_expression_filter(self.y, individual_cols=None)
             if keep_genes is not None:
@@ -252,17 +260,14 @@ class GenotypeDataset(Dataset):
             return set(np.random.choice(genes, size=227, replace=False))
         return set(pd.read_csv(self.select_genes, sep="\t")["ENSID"])
 
-    def _normalized_expression(self, expr_df: pd.DataFrame) -> np.ndarray:
+    def _normalized_expression(self, expr: np.ndarray) -> np.ndarray:
         """
         Normalize a wide (genes x individuals) expression block, vectorized over the
         whole block rather than per gene-individual row.
         """
-        expr = expr_df.to_numpy(dtype=np.float64)
+        expr = np.asarray(expr, dtype=np.float64)
         if self.normalize == "percentiles":
-            if expr.shape[1] == 0:
-                return expr
-            # ranked across individuals, separately per gene (i.e. along the row)
-            return rankdata(expr, method="average", axis=1) / expr.shape[1]
+            return self.to_percentiles_matrix(expr)
         elif self.normalize == "log":
             return np.log1p(expr)
         elif self.normalize == "none":
@@ -283,8 +288,8 @@ class GenotypeDataset(Dataset):
 
         Missing genes/individuals become NaN, as with the left join this replaces;
         the models drop those rows per gene. Values are kept in the teacher's output
-        space (no log/percentile transform), consistent with the log-transformed mean
-        targets used for distillation.
+        space here; percentile-normalized means push member sigmas through the same
+        rank map afterwards (see ``to_percentile_sigmas``).
         """
         if isinstance(extra, (Path, str)):
             extra_df = pd.read_csv(extra)
@@ -451,15 +456,103 @@ class GenotypeDataset(Dataset):
         return set(genes[keep])
 
     @staticmethod
+    def to_percentiles_matrix(expr: np.ndarray) -> np.ndarray:
+        """Within-gene percentiles: rank individuals separately per gene.
+
+        Ties receive their average rank. Missing values are omitted from the
+        ranking and stay NaN; the denominator is the number of finite
+        individuals for that gene, so percentiles stay in ``(0, 1]``.
+        """
+        expr = np.asarray(expr, dtype=np.float64)
+        if expr.size == 0 or expr.shape[1] == 0:
+            return expr
+        ranks = rankdata(expr, method="average", axis=1, nan_policy="omit")
+        n_finite = np.isfinite(expr).sum(axis=1, keepdims=True)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return np.divide(ranks, n_finite, where=n_finite > 0)
+
+    @staticmethod
     def to_percentiles(y_df: pd.DataFrame) -> pd.DataFrame:
         """Convert expression values to percentiles separately for each gene, ranking across individuals."""
         y_df = y_df.copy()
         y_df["expression"] = (
             y_df.groupby("gene")["expression"]
-            .transform(lambda col: rankdata(col.to_numpy(), method="average") / len(col))
+            .transform(
+                lambda col: GenotypeDataset.to_percentiles_matrix(
+                    col.to_numpy().reshape(1, -1)
+                ).ravel()
+            )
             .astype(float)
         )
         return y_df
+
+    @staticmethod
+    def to_percentile_sigmas(values: np.ndarray, sigmas: np.ndarray) -> np.ndarray:
+        """Map member SDs through the within-gene percentile transform.
+
+        The percentile of an individual is the empirical CDF of that gene's
+        values. Member files exported from a log-target teacher keep ``sigmas``
+        in log1p-space while storing means on the undone (TPM) scale, and
+        ``rank(y) = rank(log1p(y))`` for ``y >= 0``, so the Jacobian is taken
+        on the log1p support whenever a gene's finite means are non-negative.
+
+        The SD in percentile space is the central finite difference of the
+        linearly interpolated ECDF, ``0.5 * (F(z+σ) - F(z-σ))``. That is the
+        delta method with the local ECDF slope, and it saturates at the
+        ``[0, 1]`` bounds of a percentile.
+        """
+        values = np.asarray(values, dtype=np.float64)
+        sigmas = np.asarray(sigmas, dtype=np.float64)
+        if values.shape != sigmas.shape:
+            raise ValueError(
+                "values and sigmas must share shape "
+                f"(n_genes, n_individuals); got {values.shape} vs {sigmas.shape}."
+            )
+        if values.ndim != 2:
+            raise ValueError("values and sigmas must be 2-d gene-by-individual arrays.")
+
+        out = np.full(sigmas.shape, np.nan, dtype=np.float64)
+        for row in range(values.shape[0]):
+            out[row] = GenotypeDataset._row_percentile_sigmas(values[row], sigmas[row])
+        return out
+
+    @staticmethod
+    def _row_percentile_sigmas(values: np.ndarray, sigmas: np.ndarray) -> np.ndarray:
+        """Finite-difference percentile SDs for one gene."""
+        out = np.full(values.shape, np.nan, dtype=np.float64)
+        finite = np.isfinite(values)
+        n = int(finite.sum())
+        if n == 0:
+            return out
+        if n == 1:
+            usable = finite & np.isfinite(sigmas) & (sigmas >= 0.0)
+            out[usable] = 0.0
+            return out
+
+        support = values.astype(np.float64, copy=True)
+        if np.all(values[finite] >= 0.0):
+            support = np.log1p(support)
+
+        y = support[finite]
+        p = rankdata(y, method="average") / n
+        order = np.argsort(y, kind="mergesort")
+        y_ord = y[order]
+        p_ord = p[order]
+        y_uniq, first = np.unique(y_ord, return_index=True)
+        p_uniq = p_ord[first]
+
+        sigma = sigmas[finite].astype(np.float64, copy=False)
+        valid_sigma = np.isfinite(sigma) & (sigma >= 0.0)
+        lo = np.full(n, np.nan, dtype=np.float64)
+        hi = np.full(n, np.nan, dtype=np.float64)
+        lo[valid_sigma] = y[valid_sigma] - sigma[valid_sigma]
+        hi[valid_sigma] = y[valid_sigma] + sigma[valid_sigma]
+        p_lo = np.interp(lo, y_uniq, p_uniq, left=0.0, right=1.0)
+        p_hi = np.interp(hi, y_uniq, p_uniq, left=0.0, right=1.0)
+        result = 0.5 * (p_hi - p_lo)
+        result[~valid_sigma] = np.nan
+        out[finite] = result
+        return out
 
     @staticmethod
     def _maf_from_genotypes(X: np.ndarray) -> np.ndarray:
