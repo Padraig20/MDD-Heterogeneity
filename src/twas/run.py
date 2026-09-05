@@ -310,9 +310,8 @@ def parse_args() -> argparse.Namespace:
         default=KIND_AUTO,
         choices=list(MODEL_KINDS),
         help=(
-            "Draw expansion for the ctPred arm. Distillation forbids "
-            "--norm-targets percentiles in ensemble mode, so a ctPred JSON is "
-            "normally a single point estimate and 'auto' is right."
+            "Draw expansion for the ctPred arm. A point-estimate ctPred JSON "
+            "uses 'auto'; set this explicitly for an ensemble-distilled JSON."
         ),
     )
     comparison.add_argument(
