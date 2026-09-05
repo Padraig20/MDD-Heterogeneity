@@ -962,12 +962,28 @@ def main() -> None:
             logging.error("%s", error)
             sys.exit(1)
 
-    # Fail here rather than part-way through a sweep: a missing covariance is a
-    # setup mistake, and the fix is one command for the whole directory.
+    paired: dict[Path, Optional[Path]] = {
+        model_path: (
+            match_model(ctpred_models, model_path.stem) if ctpred_models else None
+        )
+        for model_path in model_paths
+    }
+    unmatched = [
+        path.stem for path, other in paired.items() if ctpred_models and other is None
+    ]
+
+    # Fail here rather than part-way through a sweep, but only for the cell
+    # types this run will actually touch. A missing covariance on some other
+    # model in the directory is not this job's problem.
     for directory, paths in (
         (args.models_dir, model_paths),
-        (args.ctpred_models_dir, list(ctpred_models.values())),
+        (
+            args.ctpred_models_dir,
+            [path for path in paired.values() if path is not None],
+        ),
     ):
+        if not paths:
+            continue
         missing = [p.stem for p in paths if not has_covariance(directory, p.stem)]
         if missing:
             logging.error(
@@ -1005,16 +1021,6 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     gene_names = load_gene_name_map(args.gene_name_map)
     logger = TwasWandBLogger(project=args.wandb_project, entity=args.wandb_entity)
-
-    paired: dict[Path, Optional[Path]] = {
-        model_path: (
-            match_model(ctpred_models, model_path.stem) if ctpred_models else None
-        )
-        for model_path in model_paths
-    }
-    unmatched = [
-        path.stem for path, other in paired.items() if ctpred_models and other is None
-    ]
 
     logging.info("Running TWAS for %d cell type(s).", len(model_paths))
     summaries: list[dict] = []
