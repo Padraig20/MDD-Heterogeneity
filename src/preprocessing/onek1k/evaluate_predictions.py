@@ -38,6 +38,15 @@ cell-type CSVs directly. Probabilistic seed directories have this layout:
     <model>/<seed>/aleatoric/*.csv
     <model>/<seed>/epistemic/*.csv
 
+For a single probabilistic model, the model directory itself may be passed
+as --predictions. In that case its immediate children are interpreted as
+seeds or ensemble members:
+
+    <seed>/preds/*.csv
+    <seed>/totvar/*.csv
+    <seed>/aleatoric/*.csv
+    <seed>/epistemic/*.csv
+
 Only the individuals in INDIVIDUAL_IDS are evaluated. Individual headers are
 canonicalized by their trailing numeric ID, so e.g. "OneK1K_1001" and "1001"
 match. Duplicate-suffixed labels such as "OneK1K_847_2" are excluded rather
@@ -584,6 +593,40 @@ def discover_models(prediction_root: Path) -> tuple[ModelLayout, ...]:
     )
     if not model_dirs:
         raise ValueError(f"No model directories found in {prediction_root}.")
+
+    # Also accept a single model's output directory directly. Deep-ensemble
+    # exports commonly use <member>/{preds,totvar,aleatoric,epistemic} rather
+    # than adding another model-name directory above the members. Without
+    # this check, the members are mistaken for models and the four data-kind
+    # directories are then mistaken for deterministic seeds.
+    if all((seed_dir / "preds").is_dir() for seed_dir in model_dirs):
+        seeds = tuple(discover_seed(seed_dir) for seed_dir in model_dirs)
+        reference_cell_types = set(seeds[0].predictions)
+        for seed in seeds[1:]:
+            seed_cell_types = set(seed.predictions)
+            if seed_cell_types != reference_cell_types:
+                missing = sorted(
+                    reference_cell_types - seed_cell_types,
+                    key=natural_sort_key,
+                )
+                extra = sorted(
+                    seed_cell_types - reference_cell_types,
+                    key=natural_sort_key,
+                )
+                raise ValueError(
+                    f"Model {prediction_root.name!r} does not contain the same "
+                    f"cell-type CSVs in every seed. Relative to seed "
+                    f"{seeds[0].name!r}, seed {seed.name!r} has "
+                    f"missing={missing}, extra={extra}."
+                )
+        return (
+            ModelLayout(
+                name=prediction_root.name,
+                path=prediction_root,
+                probabilistic=True,
+                seeds=seeds,
+            ),
+        )
 
     models: list[ModelLayout] = []
     for model_dir in model_dirs:
