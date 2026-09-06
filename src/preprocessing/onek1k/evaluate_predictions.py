@@ -47,6 +47,13 @@ seeds or ensemble members:
     <seed>/aleatoric/*.csv
     <seed>/epistemic/*.csv
 
+The equivalent deterministic single-model layout is also accepted:
+
+    <seed>/*.csv
+
+A deterministic seed directory containing CSVs directly may itself be passed
+as --predictions for a one-seed evaluation.
+
 Only the individuals in INDIVIDUAL_IDS are evaluated. Individual headers are
 canonicalized by their trailing numeric ID, so e.g. "OneK1K_1001" and "1001"
 match. Duplicate-suffixed labels such as "OneK1K_847_2" are excluded rather
@@ -584,6 +591,29 @@ def discover_models(prediction_root: Path) -> tuple[ModelLayout, ...]:
             f"Predictions path is not a directory: {prediction_root}"
         )
 
+    # A seed directory can be evaluated on its own. Use its parent directory
+    # as the model name and its own basename as the seed.
+    if (prediction_root / "preds").is_dir():
+        seed = discover_seed(prediction_root)
+        return (
+            ModelLayout(
+                name=prediction_root.parent.name,
+                path=prediction_root.parent,
+                probabilistic=True,
+                seeds=(seed,),
+            ),
+        )
+    if csv_files(prediction_root):
+        seed = discover_seed(prediction_root)
+        return (
+            ModelLayout(
+                name=prediction_root.parent.name,
+                path=prediction_root.parent,
+                probabilistic=False,
+                seeds=(seed,),
+            ),
+        )
+
     model_dirs = sorted(
         (
             path for path in prediction_root.iterdir()
@@ -594,12 +624,18 @@ def discover_models(prediction_root: Path) -> tuple[ModelLayout, ...]:
     if not model_dirs:
         raise ValueError(f"No model directories found in {prediction_root}.")
 
-    # Also accept a single model's output directory directly. Deep-ensemble
-    # exports commonly use <member>/{preds,totvar,aleatoric,epistemic} rather
-    # than adding another model-name directory above the members. Without
-    # this check, the members are mistaken for models and the four data-kind
-    # directories are then mistaken for deterministic seeds.
-    if all((seed_dir / "preds").is_dir() for seed_dir in model_dirs):
+    # Also accept a single model's output directory directly. Ensemble and
+    # multi-seed exports commonly use either <seed>/*.csv or
+    # <seed>/{preds,totvar,aleatoric,epistemic} without adding another model
+    # directory above the seeds. Without this check, seeds are mistaken for
+    # models (and, for probabilistic output, data-kind directories for seeds).
+    flat_probabilistic = all(
+        (seed_dir / "preds").is_dir() for seed_dir in model_dirs
+    )
+    flat_deterministic = all(
+        bool(csv_files(seed_dir)) for seed_dir in model_dirs
+    )
+    if flat_probabilistic or flat_deterministic:
         seeds = tuple(discover_seed(seed_dir) for seed_dir in model_dirs)
         reference_cell_types = set(seeds[0].predictions)
         for seed in seeds[1:]:
@@ -623,7 +659,7 @@ def discover_models(prediction_root: Path) -> tuple[ModelLayout, ...]:
             ModelLayout(
                 name=prediction_root.name,
                 path=prediction_root,
-                probabilistic=True,
+                probabilistic=flat_probabilistic,
                 seeds=seeds,
             ),
         )
