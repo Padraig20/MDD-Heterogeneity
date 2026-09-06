@@ -55,6 +55,10 @@ Outputs:
     comparisons/survival_curve_by_cell_type.png
     comparisons/survival_curve_auc.png
     comparisons/survival_curve_auc_by_cell_type.png
+    comparisons/spearman_survival_curve.png
+    comparisons/spearman_survival_curve_by_cell_type.png
+    comparisons/spearman_survival_curve_auc.png
+    comparisons/spearman_survival_curve_auc_by_cell_type.png
     comparisons/survival_curve_auc_uncertainty_ablation_by_cell_type.png
     comparisons/uncertainty_ablation/<cell_type>.png
     comparisons/sign_accuracy.png
@@ -68,6 +72,10 @@ Outputs:
     tables/survival_curve_by_cell_type.csv
     tables/survival_curve_auc_pooled.csv
     tables/survival_curve_auc_by_cell_type.csv
+    tables/spearman_survival_curve_pooled.csv
+    tables/spearman_survival_curve_by_cell_type.csv
+    tables/spearman_survival_curve_auc_pooled.csv
+    tables/spearman_survival_curve_auc_by_cell_type.csv
     tables/survival_curve_auc_uncertainty_ablation.csv
     tables/sign_accuracy_pooled.csv
     tables/sign_accuracy_by_cell_type.csv
@@ -85,8 +93,9 @@ undefined (fewer than --min-individuals paired donors, or no spread in
 error or uncertainty) are omitted. --uncertainty-only narrows a run to the
 uncertainty analysis alone: it implies --analyze-uncertainty, skips every
 other plot and table, and ignores deterministic models entirely.
-The scPrediXcan table and m1 baseline are generated only when
---scpredixcan-performance is supplied.
+The m1 columns and plot are generated only with --compute-m1. A reported
+scPrediXcan reference can additionally be included with
+--scpredixcan-performance.
 
 m1 = (1 - pi0) * (genes tested) estimates the number of true-positive genes
 via the q-value framework, mirroring scPrediXcan's use of m1 = pi1 * #genes.
@@ -98,22 +107,23 @@ alternative). See --pi0-method and --smooth-df for details.
 
 As an alternative, threshold-free view of the same tested genes, the
 survival curve plots, for a grid of thresholds t in [0, 1], the fraction of
-tested genes with |Pearson r| >= t (the absolute value is used for the same
-sign-invariant reason as m1: up- vs down-regulation is not distinguished
-here). This is computed both pooled across all cell types (one curve per
-model) and faceted per cell type (one subplot per cell type, models
-overlaid). In both cases the curve is first computed per model/seed, then
-summarized as the mean +/- sample SD across seeds. See
---survival-thresholds for the threshold grid resolution.
+tested genes with |Pearson r| >= t and, in parallel outputs, |Spearman rho|
+>= t. The absolute value is used for the same sign-invariant reason as m1:
+up- vs down-regulation is not distinguished here. This is computed both
+pooled across all cell types (one curve per model) and faceted per cell type
+(one subplot per cell type, models overlaid). In both cases the curve is
+first computed per model/seed, then summarized as the mean +/- sample SD
+across seeds. See --survival-thresholds for the threshold grid resolution.
 
 To directly compare models with a single number (per cell type or pooled),
 the survival_curve_auc plots show the trapezoidal area under each
 model/seed's fraction-based survival curve, again summarized as the seed
 mean +/- SD. The per-cell-type panel uses the same grouped horizontal-bar
 layout as the m1 comparison. Since S(t) = P(|r| >= t) for t in [0, 1],
-this AUC is approximately mean(|Pearson r|) across tested genes -- a
-single, gene-count-independent number that rewards stronger typical
-correlations, directly comparable across models and cell types.
+each AUC is approximately the corresponding mean absolute Pearson r or
+Spearman rho across tested genes -- a single, gene-count-independent number
+that rewards stronger typical correlations, directly comparable across
+models and cell types.
 
 Optionally, --uncertainty-ablation-percents re-evaluates that AUC after
 dropping the top X% most-uncertain individuals, ranked within each gene
@@ -206,8 +216,8 @@ class ModelLayout:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate per-gene Pearson correlations for OneK1K predictions "
-            "from multiple models and seeds."
+            "Evaluate per-gene Pearson and Spearman correlations for OneK1K "
+            "predictions from multiple models and seeds."
         ),
     )
     parser.add_argument(
@@ -235,6 +245,14 @@ def parse_args() -> argparse.Namespace:
         help="Directory in which plots and summary tables are written.",
     )
     parser.add_argument(
+        "--compute-m1",
+        action="store_true",
+        help=(
+            "Estimate q-value-framework m1 values and write the m1 comparison "
+            "plot. Disabled by default because pi0 estimation is optional."
+        ),
+    )
+    parser.add_argument(
         "--scpredixcan-performance",
         "--scpredixcan-performance-file",
         dest="scpredixcan_performance",
@@ -245,7 +263,7 @@ def parse_args() -> argparse.Namespace:
             "Optional scPrediXcan Excel workbook. When supplied, reported "
             "OneK1K m1 values are added as a 'scPrediXcan' reference in the "
             "m1 comparison and the parsed metrics are saved below tables/. "
-            "Omit this argument to disable the reference."
+            "Requires --compute-m1. Omit this argument to disable the reference."
         ),
     )
     parser.add_argument(
@@ -306,8 +324,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SURVIVAL_THRESHOLDS,
         metavar="N",
         help=(
-            "Number of equally spaced |Pearson r| thresholds in [0, 1] used "
-            "for the survival-curve plots (fraction of tested genes with "
+            "Number of equally spaced absolute-correlation thresholds in "
+            "[0, 1] used for the Pearson and Spearman survival-curve plots "
+            "(fraction of tested genes with "
             f"|r| >= threshold). Default: {DEFAULT_SURVIVAL_THRESHOLDS}."
         ),
     )
@@ -383,7 +402,8 @@ def parse_args() -> argparse.Namespace:
         "--save-per-gene",
         action="store_true",
         help=(
-            "Also save gzip-compressed per-gene Pearson r/p-value tables below "
+            "Also save gzip-compressed per-gene Pearson r/p-value and "
+            "Spearman rho tables below "
             "tables/per_gene/. Disabled by default because these files can be "
             "large."
         ),
@@ -405,7 +425,13 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not 0.0 <= args.pvalue_threshold <= 1.0:
         parser.error("--pvalue-threshold must lie in [0, 1].")
-    if not 2.0 < args.smooth_df < len(PI0_LAMBDAS):
+    if (
+        args.scpredixcan_performance is not None
+        and not args.compute_m1
+        and not args.uncertainty_only
+    ):
+        parser.error("--scpredixcan-performance requires --compute-m1.")
+    if args.compute_m1 and not 2.0 < args.smooth_df < len(PI0_LAMBDAS):
         parser.error(
             f"--smooth-df must lie strictly between 2 and {len(PI0_LAMBDAS)} "
             "(the number of lambda grid points), matching the valid range "
@@ -853,6 +879,43 @@ def rowwise_pearson(
     return r, pvalue, n
 
 
+def rowwise_spearman(
+    predictions: np.ndarray,
+    observations: np.ndarray,
+    min_individuals: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pairwise-complete Spearman rho by row, with average ranks for ties."""
+    predictions = np.asarray(predictions, dtype=np.float64)
+    observations = np.asarray(observations, dtype=np.float64)
+    if predictions.shape != observations.shape or predictions.ndim != 2:
+        raise ValueError(
+            "Predictions and observations must be equally shaped 2D arrays."
+        )
+
+    ranked_predictions = np.full_like(predictions, np.nan)
+    ranked_observations = np.full_like(observations, np.nan)
+    n = np.zeros(predictions.shape[0], dtype=np.int64)
+    for index, (predicted, observed) in enumerate(zip(predictions, observations)):
+        valid = np.isfinite(predicted) & np.isfinite(observed)
+        n[index] = int(valid.sum())
+        if n[index] < min_individuals:
+            continue
+        ranked_predictions[index, valid] = stats.rankdata(
+            predicted[valid],
+            method="average",
+        )
+        ranked_observations[index, valid] = stats.rankdata(
+            observed[valid],
+            method="average",
+        )
+    rho, _, _ = rowwise_pearson(
+        ranked_predictions,
+        ranked_observations,
+        min_individuals,
+    )
+    return rho, n
+
+
 def _pi0_lambda_curve(
     values: np.ndarray,
     lambdas: np.ndarray,
@@ -1034,17 +1097,17 @@ def equal_count_curve(
 
 
 def compute_survival_curve(
-    abs_pearson_r: np.ndarray,
+    absolute_correlations: np.ndarray,
     thresholds: np.ndarray,
 ) -> tuple[np.ndarray, int]:
-    """Fraction of tested genes with |Pearson r| >= each threshold.
+    """Fraction of tested genes with an absolute correlation >= each threshold.
 
     This is a threshold-free complement to the m1 significant-gene count:
     instead of picking one p-value cutoff, it summarizes the whole
     distribution of absolute correlations via its (empirical) survival
     function S(t) = P(|r| >= t).
     """
-    values = np.asarray(abs_pearson_r, dtype=np.float64)
+    values = np.asarray(absolute_correlations, dtype=np.float64)
     values = values[np.isfinite(values)]
     if values.size == 0:
         return np.full(thresholds.shape, np.nan, dtype=np.float64), 0
@@ -1648,14 +1711,14 @@ def load_scpredixcan_performance(
 
 
 def make_model_summary(per_seed: pd.DataFrame) -> pd.DataFrame:
-    metrics = (
+    metrics = [
         "n_genes_tested",
         "n_significant",
         "significant_fraction",
-        "pi0",
-        "m1",
         "n_common_individuals",
-    )
+    ]
+    if "m1" in per_seed.columns:
+        metrics.extend(["pi0", "m1"])
     rows: list[dict[str, object]] = []
     for (model, cell_type), group in per_seed.groupby(
         ["model", "cell_type"],
@@ -1777,6 +1840,7 @@ def plot_survival_curve_pooled(
     thresholds: np.ndarray,
     output_path: Path,
     dpi: int,
+    correlation_name: str = "Pearson r",
 ) -> None:
     """One line per model: mean +/- SD survival curve pooled over cell types."""
     models = sorted(pooled_curves, key=natural_sort_key)
@@ -1812,10 +1876,10 @@ def plot_survival_curve_pooled(
 
     axis.set_xlim(0.0, 1.0)
     axis.set_ylim(0.0, 1.0)
-    axis.set_xlabel("Absolute Pearson r threshold")
+    axis.set_xlabel(f"Absolute {correlation_name} threshold")
     axis.set_ylabel("Fraction of tested genes with |r| \u2265 threshold")
     axis.set_title(
-        "Survival curve of absolute Pearson correlation (all cell types pooled, "
+        f"Survival curve of absolute {correlation_name} (all cell types pooled, "
         "seed mean \u00b1 SD)",
     )
     axis.grid(alpha=0.2, linewidth=0.7)
@@ -1833,6 +1897,7 @@ def plot_survival_curve_by_cell_type(
     thresholds: np.ndarray,
     output_path: Path,
     dpi: int,
+    correlation_name: str = "Pearson r",
 ) -> None:
     """Grid of subplots, one per cell type, with one line per model."""
     cell_types = sorted(curves, key=natural_sort_key)
@@ -1890,7 +1955,7 @@ def plot_survival_curve_by_cell_type(
         axis.set_title(cell_type, fontsize=10)
         axis.set_xlim(0.0, 1.0)
         axis.set_ylim(0.0, 1.0)
-        axis.set_xlabel("|Pearson r| threshold")
+        axis.set_xlabel(f"|{correlation_name}| threshold")
         axis.set_ylabel("Fraction \u2265 threshold")
         axis.grid(alpha=0.18, linewidth=0.7)
         axis.set_axisbelow(True)
@@ -1911,7 +1976,7 @@ def plot_survival_curve_by_cell_type(
         bbox_to_anchor=(0.5, 1.0),
     )
     fig.suptitle(
-        "Survival curves of absolute Pearson correlation by cell type "
+        f"Survival curves of absolute {correlation_name} by cell type "
         "(seed mean \u00b1 SD)",
         fontsize=14,
         y=1.03,
@@ -2411,6 +2476,7 @@ def save_per_gene_metrics(
     n: np.ndarray,
     pearson_r: np.ndarray,
     pearson_pvalue: np.ndarray,
+    spearman_rho: np.ndarray,
 ) -> None:
     output_path = (
         output_dir
@@ -2425,6 +2491,7 @@ def save_per_gene_metrics(
     frame["n_individuals"] = n
     frame["pearson_r"] = pearson_r
     frame["pearson_pvalue"] = pearson_pvalue
+    frame["spearman_rho"] = spearman_rho
     frame.to_csv(output_path, index=False, compression="gzip")
     logging.debug("Wrote %s", output_path)
 
@@ -2674,6 +2741,7 @@ def main() -> int:
         skipped = [
             flag for flag, requested in (
                 ("--scpredixcan-performance", args.scpredixcan_performance),
+                ("--compute-m1", args.compute_m1),
                 ("--save-per-gene", args.save_per_gene),
             ) if requested
         ]
@@ -2684,6 +2752,7 @@ def main() -> int:
                 " and ".join(skipped),
             )
         args.scpredixcan_performance = None
+        args.compute_m1 = False
         args.save_per_gene = False
 
     scpredixcan_performance: pd.DataFrame | None = None
@@ -2728,6 +2797,14 @@ def main() -> int:
     ] = defaultdict(lambda: defaultdict(dict))
     survival_rows: list[dict[str, object]] = []
     pooled_abs_pearson_r: dict[str, dict[str, list[np.ndarray]]] = defaultdict(
+        lambda: defaultdict(list),
+    )
+    spearman_survival_curves_by_cell_type: dict[
+        str,
+        dict[str, dict[str, np.ndarray]],
+    ] = defaultdict(lambda: defaultdict(dict))
+    spearman_survival_rows: list[dict[str, object]] = []
+    pooled_abs_spearman_rho: dict[str, dict[str, list[np.ndarray]]] = defaultdict(
         lambda: defaultdict(list),
     )
 
@@ -2867,6 +2944,11 @@ def main() -> int:
                     gt_values,
                     args.min_individuals,
                 )
+                spearman_rho, _ = rowwise_spearman(
+                    pred_values,
+                    gt_values,
+                    args.min_individuals,
+                )
                 valid_pvalues = pearson_pvalue[np.isfinite(pearson_pvalue)]
                 n_tested = int(len(valid_pvalues))
                 if n_tested == 0:
@@ -2879,7 +2961,7 @@ def main() -> int:
                     pi0 = float("nan")
                     m1 = float("nan")
                     pi0_boundary_case = False
-                else:
+                elif args.compute_m1:
                     pi0 = estimate_pi0(
                         valid_pvalues,
                         method=args.pi0_method,
@@ -2900,6 +2982,10 @@ def main() -> int:
                             seed.name,
                             cell_type,
                         )
+                else:
+                    pi0 = float("nan")
+                    m1 = float("nan")
+                    pi0_boundary_case = False
 
                 n_significant = int(
                     np.sum(valid_pvalues <= args.pvalue_threshold)
@@ -2932,6 +3018,30 @@ def main() -> int:
                     abs_pearson_r_tested,
                 )
 
+                abs_spearman_rho_tested = np.abs(
+                    spearman_rho[np.isfinite(spearman_rho)]
+                )
+                spearman_curve, n_spearman_genes = compute_survival_curve(
+                    abs_spearman_rho_tested,
+                    survival_thresholds,
+                )
+                spearman_survival_curves_by_cell_type[cell_type][model.name][
+                    seed.name
+                ] = spearman_curve
+                spearman_row: dict[str, object] = {
+                    "model": model.name,
+                    "seed": seed.name,
+                    "cell_type": cell_type,
+                    "n_genes": n_spearman_genes,
+                    "auc": survival_curve_auc(spearman_curve, survival_thresholds),
+                }
+                for threshold, value in zip(survival_thresholds, spearman_curve):
+                    spearman_row[f"threshold_{threshold:.3f}"] = float(value)
+                spearman_survival_rows.append(spearman_row)
+                pooled_abs_spearman_rho[model.name][seed.name].append(
+                    abs_spearman_rho_tested,
+                )
+
                 pearson_r_tested = pearson_r[np.isfinite(pearson_r)]
                 sign_accuracy_curve, _ = compute_sign_accuracy_curve(
                     pearson_r_tested,
@@ -2955,8 +3065,7 @@ def main() -> int:
                 pooled_pearson_r[model.name][seed.name].append(pearson_r_tested)
 
                 finite_n = n[np.isfinite(pearson_pvalue)]
-                per_seed_rows.append(
-                    {
+                per_seed_row: dict[str, object] = {
                         "model": model.name,
                         "seed": seed.name,
                         "cell_type": cell_type,
@@ -2969,12 +3078,6 @@ def main() -> int:
                             if n_tested else float("nan")
                         ),
                         "pvalue_threshold": args.pvalue_threshold,
-                        "pi0": pi0,
-                        "m1": m1,
-                        "pi0_method": (
-                            f"storey_{args.pi0_method}_closed_form_modified_boundary"
-                        ),
-                        "pi0_boundary_case": pi0_boundary_case,
                         "n_common_individuals": len(pred.columns),
                         "min_finite_individuals_per_tested_gene": (
                             int(finite_n.min())
@@ -2984,20 +3087,39 @@ def main() -> int:
                             float(np.median(finite_n))
                             if len(finite_n) else float("nan")
                         ),
-                    },
-                )
+                    }
+                if args.compute_m1:
+                    per_seed_row.update(
+                        {
+                            "pi0": pi0,
+                            "m1": m1,
+                            "pi0_method": (
+                                "storey_"
+                                f"{args.pi0_method}_closed_form_modified_boundary"
+                            ),
+                            "pi0_boundary_case": pi0_boundary_case,
+                        }
+                    )
+                per_seed_rows.append(per_seed_row)
                 logging.info(
-                    "  %s/%s: tested=%d, p<=%g=%d, m1=%.1f, "
-                    "genes aligned=%d, individuals=%d",
+                    "  %s/%s: tested=%d, p<=%g=%d, genes aligned=%d, "
+                    "individuals=%d",
                     model.name,
                     seed.name,
                     n_tested,
                     args.pvalue_threshold,
                     n_significant,
-                    m1,
                     len(pred),
                     len(pred.columns),
                 )
+                if args.compute_m1:
+                    logging.info(
+                        "  %s/%s: m1=%.1f (pi0=%.4f)",
+                        model.name,
+                        seed.name,
+                        m1,
+                        pi0,
+                    )
 
                 if args.save_per_gene:
                     save_per_gene_metrics(
@@ -3009,6 +3131,7 @@ def main() -> int:
                         n,
                         pearson_r,
                         pearson_pvalue,
+                        spearman_rho,
                     )
 
     if args.uncertainty_only and not between_rows:
@@ -3032,6 +3155,11 @@ def main() -> int:
             survival_rows=survival_rows,
             survival_curves_by_cell_type=survival_curves_by_cell_type,
             pooled_abs_pearson_r=pooled_abs_pearson_r,
+            spearman_survival_rows=spearman_survival_rows,
+            spearman_survival_curves_by_cell_type=(
+                spearman_survival_curves_by_cell_type
+            ),
+            pooled_abs_spearman_rho=pooled_abs_spearman_rho,
             sign_accuracy_rows=sign_accuracy_rows,
             sign_accuracy_curves_by_cell_type=sign_accuracy_curves_by_cell_type,
             pooled_pearson_r=pooled_pearson_r,
@@ -3075,6 +3203,12 @@ def report_core_outputs(
     survival_rows: list[dict[str, object]],
     survival_curves_by_cell_type: dict[str, dict[str, dict[str, np.ndarray]]],
     pooled_abs_pearson_r: dict[str, dict[str, list[np.ndarray]]],
+    spearman_survival_rows: list[dict[str, object]],
+    spearman_survival_curves_by_cell_type: dict[
+        str,
+        dict[str, dict[str, np.ndarray]],
+    ],
+    pooled_abs_spearman_rho: dict[str, dict[str, list[np.ndarray]]],
     sign_accuracy_rows: list[dict[str, object]],
     sign_accuracy_curves_by_cell_type: dict[
         str,
@@ -3160,21 +3294,22 @@ def report_core_outputs(
         output_path=comparisons_dir / "significant_genes.png",
         dpi=args.dpi,
     )
-    m1_xlabel = (
-        r"Estimated non-null genes, m1 = (1 − $\hat{\pi}_0$)m "
-        "(evaluated models: seed mean ± SD)"
-    )
-    if scpredixcan_performance is not None:
-        m1_xlabel += "; scPrediXcan: reported value"
-    plot_model_comparison(
-        model_summary=model_summary,
-        mean_column="m1_mean",
-        std_column="m1_std",
-        xlabel=m1_xlabel,
-        title="q-value-framework m1 comparison by cell type",
-        output_path=comparisons_dir / "m1.png",
-        dpi=args.dpi,
-    )
+    if args.compute_m1:
+        m1_xlabel = (
+            r"Estimated non-null genes, m1 = (1 − $\hat{\pi}_0$)m "
+            "(evaluated models: seed mean ± SD)"
+        )
+        if scpredixcan_performance is not None:
+            m1_xlabel += "; scPrediXcan: reported value"
+        plot_model_comparison(
+            model_summary=model_summary,
+            mean_column="m1_mean",
+            std_column="m1_std",
+            xlabel=m1_xlabel,
+            title="q-value-framework m1 comparison by cell type",
+            output_path=comparisons_dir / "m1.png",
+            dpi=args.dpi,
+        )
 
     survival_by_cell_type_path = tables_dir / "survival_curve_by_cell_type.csv"
     pd.DataFrame(survival_rows).to_csv(survival_by_cell_type_path, index=False)
@@ -3258,6 +3393,108 @@ def report_core_outputs(
         xlabel=auc_xlabel,
         title="Survival-curve AUC comparison (all cell types pooled)",
         output_path=comparisons_dir / "survival_curve_auc.png",
+        dpi=args.dpi,
+    )
+
+    spearman_by_cell_type_path = (
+        tables_dir / "spearman_survival_curve_by_cell_type.csv"
+    )
+    pd.DataFrame(spearman_survival_rows).to_csv(
+        spearman_by_cell_type_path,
+        index=False,
+    )
+    logging.info("Wrote %s", spearman_by_cell_type_path)
+
+    pooled_spearman_curves: dict[str, dict[str, np.ndarray]] = defaultdict(dict)
+    pooled_spearman_rows: list[dict[str, object]] = []
+    for model_name, by_seed in pooled_abs_spearman_rho.items():
+        for seed_name, chunks in by_seed.items():
+            combined = (
+                np.concatenate(chunks) if chunks else np.array([], dtype=np.float64)
+            )
+            pooled_curve, n_pooled_genes = compute_survival_curve(
+                combined,
+                survival_thresholds,
+            )
+            pooled_spearman_curves[model_name][seed_name] = pooled_curve
+            pooled_row: dict[str, object] = {
+                "model": model_name,
+                "seed": seed_name,
+                "n_genes": n_pooled_genes,
+                "auc": survival_curve_auc(pooled_curve, survival_thresholds),
+            }
+            for threshold, value in zip(survival_thresholds, pooled_curve):
+                pooled_row[f"threshold_{threshold:.3f}"] = float(value)
+            pooled_spearman_rows.append(pooled_row)
+
+    spearman_pooled_path = tables_dir / "spearman_survival_curve_pooled.csv"
+    pd.DataFrame(pooled_spearman_rows).to_csv(spearman_pooled_path, index=False)
+    logging.info("Wrote %s", spearman_pooled_path)
+
+    plot_survival_curve_pooled(
+        pooled_curves=pooled_spearman_curves,
+        thresholds=survival_thresholds,
+        output_path=comparisons_dir / "spearman_survival_curve.png",
+        dpi=args.dpi,
+        correlation_name="Spearman rho",
+    )
+    plot_survival_curve_by_cell_type(
+        curves=spearman_survival_curves_by_cell_type,
+        thresholds=survival_thresholds,
+        output_path=(
+            comparisons_dir / "spearman_survival_curve_by_cell_type.png"
+        ),
+        dpi=args.dpi,
+        correlation_name="Spearman rho",
+    )
+
+    spearman_auc_by_cell_type = summarize_metric_over_seeds(
+        pd.DataFrame(spearman_survival_rows),
+        ["model", "cell_type"],
+        "auc",
+    )
+    spearman_auc_pooled = summarize_metric_over_seeds(
+        pd.DataFrame(pooled_spearman_rows),
+        ["model"],
+        "auc",
+    )
+    spearman_auc_by_cell_type_path = (
+        tables_dir / "spearman_survival_curve_auc_by_cell_type.csv"
+    )
+    spearman_auc_pooled_path = (
+        tables_dir / "spearman_survival_curve_auc_pooled.csv"
+    )
+    spearman_auc_by_cell_type.to_csv(
+        spearman_auc_by_cell_type_path,
+        index=False,
+    )
+    spearman_auc_pooled.to_csv(spearman_auc_pooled_path, index=False)
+    logging.info("Wrote %s", spearman_auc_by_cell_type_path)
+    logging.info("Wrote %s", spearman_auc_pooled_path)
+
+    spearman_auc_xlabel = (
+        "AUC of absolute Spearman correlation survival curve (seed mean ± SD)"
+    )
+    plot_model_comparison(
+        model_summary=spearman_auc_by_cell_type,
+        mean_column="auc_mean",
+        std_column="auc_std",
+        xlabel=spearman_auc_xlabel,
+        title="Spearman survival-curve AUC comparison by cell type",
+        output_path=(
+            comparisons_dir / "spearman_survival_curve_auc_by_cell_type.png"
+        ),
+        dpi=args.dpi,
+    )
+    plot_model_scalar_comparison(
+        summary=spearman_auc_pooled,
+        mean_column="auc_mean",
+        std_column="auc_std",
+        xlabel=spearman_auc_xlabel,
+        title=(
+            "Spearman survival-curve AUC comparison (all cell types pooled)"
+        ),
+        output_path=comparisons_dir / "spearman_survival_curve_auc.png",
         dpi=args.dpi,
     )
 
