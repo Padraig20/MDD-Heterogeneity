@@ -141,7 +141,7 @@ def train_single_model(
 
             if scheduler is not None:
                 scheduler.step()
-            wb_logger.log({"train/lr": optimizer.param_groups[0]['lr']})
+            wb_logger.log_batch({"train/lr": optimizer.param_groups[0]['lr']})
 
             metric_cells.update(outputs, targets)
             metric_genes.update(outputs, targets)
@@ -149,6 +149,7 @@ def train_single_model(
 
         log_dict["train/epoch"] = epoch
         log_dict["train/loss"] /= len(train_loader)
+        log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
         log_dict["train/pearson_cells"] = metric_cells.compute().nanmean().item()
         log_dict["train/pearson_genes"] = metric_genes.compute().nanmean().item()
         log_dict["train/pearson"] = (log_dict["train/pearson_cells"] + log_dict["train/pearson_genes"]) / 2.0
@@ -336,9 +337,10 @@ def train_separate_model(
 
             # Schedules are initialized identically, so logging the first
             # optimizer retains the existing scalar learning-rate interface.
-            wb_logger.log({"train/lr": optimizers[0].param_groups[0]["lr"]})
+            wb_logger.log_batch({"train/lr": optimizers[0].param_groups[0]["lr"]})
 
         log_dict["train/loss"] /= len(train_loader)
+        log_dict["train/lr"] = optimizers[0].param_groups[0]["lr"]
         log_dict["train/pearson_cells"] = metric_cells.compute().nanmean().item()
         log_dict["train/pearson_genes"] = metric_genes.compute().nanmean().item()
         log_dict["train/pearson"] = (
@@ -581,13 +583,14 @@ def train_ensemble_model(
 
             if scheduler is not None:
                 scheduler.step()
-            wb_logger.log({"train/lr": optimizer.param_groups[0]['lr']})
+            wb_logger.log_batch({"train/lr": optimizer.param_groups[0]['lr']})
             metric_cells.update(output, targets)
             metric_genes.update(output, targets)
             log_dict["train/loss"] += composite_loss.item()
 
         log_dict["train/epoch"] = epoch
         log_dict["train/loss"] /= len(train_loader)
+        log_dict["train/lr"] = optimizer.param_groups[0]["lr"]
         log_dict["train/pearson_cells"] = metric_cells.compute().nanmean().item()
         log_dict["train/pearson_genes"] = metric_genes.compute().nanmean().item()
         log_dict["train/pearson"] = (log_dict["train/pearson_cells"] + log_dict["train/pearson_genes"]) / 2.0
@@ -632,6 +635,188 @@ def train_ensemble_model(
                 logging.info("Early stopping triggered! Restoring best model weights...")
                 early_stopping.restore_best_weights(model)
                 break
+
+
+class _SlicedTargetLoader:
+    """Yield ``(inputs, targets[..., column:column+1])`` from an existing loader."""
+
+    def __init__(
+        self,
+        loader: torch.utils.data.DataLoader,
+        column_index: int,
+    ) -> None:
+        self.loader = loader
+        self.column_index = column_index
+
+    def __iter__(self):
+        for inputs, targets in self.loader:
+            yield inputs, targets[..., self.column_index : self.column_index + 1]
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+
+def train_separate_ensemble_model(
+    model: torch.nn.Module,
+    train_loader: torch.utils.data.DataLoader,
+    eval_loader: torch.utils.data.DataLoader,
+    loss_dict: dict,
+    loss_lambda_dict: dict,
+    optimizers: Sequence[torch.optim.Optimizer],
+    schedulers: Sequence[torch.optim.lr_scheduler.LRScheduler | None],
+    wb_logger: WandBLogger,
+    early_stopping: EarlyStopping | None,
+    epochs: int = 10,
+    device: torch.device = torch.device("cpu"),
+    eval_calibration_loader: torch.utils.data.DataLoader | None = None,
+) -> None:
+    """Train one deep ensemble independently for each cell type.
+
+    Every cell-type ensemble receives only its matching target column, owns
+    its optimizer and scheduler, and completes backward/step before the next
+    ensemble is considered. After each epoch a post-hoc variance scale is
+    fitted separately for every cell type.
+    """
+
+    n_cell_types = model.output_dim
+    if len(model.cell_type_models) != n_cell_types:
+        raise ValueError(
+            "Expected one ensemble per output cell type, got "
+            f"{len(model.cell_type_models)} ensembles for {n_cell_types} "
+            "outputs."
+        )
+    if len(optimizers) != n_cell_types or len(schedulers) != n_cell_types:
+        raise ValueError(
+            "Cell-type-separate ensemble training requires one optimizer "
+            f"and scheduler per cell type; got {len(optimizers)} optimizers "
+            f"and {len(schedulers)} schedulers for {n_cell_types} cell types."
+        )
+
+    for epoch in range(epochs):
+        log_dict = {
+            "train/epoch": epoch,
+            "train/loss": 0.0,
+            "train/pearson_cells": 0.0,
+            "train/pearson_genes": 0.0,
+            "train/pearson": 0.0,
+        }
+        for key in loss_dict:
+            log_dict[f"train/{key}_loss"] = 0.0
+
+        model.train()
+        metric_cells = MeanCellPearson(n_cells=n_cell_types).to(device)
+        metric_genes = MeanGenePearson(
+            n_cells=n_cell_types,
+            n_genes=len(train_loader.dataset),
+        ).to(device)
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
+            inputs, targets = batch
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            cell_outputs = []
+            batch_loss = 0.0
+            batch_losses = {key: 0.0 for key in loss_dict}
+
+            for cell_type_index, (optimizer, scheduler) in enumerate(
+                zip(optimizers, schedulers)
+            ):
+                optimizer.zero_grad()
+                means, variances = model.forward_cell_type(
+                    inputs,
+                    cell_type_index,
+                )
+                target = targets[..., cell_type_index : cell_type_index + 1]
+
+                cell_loss = torch.tensor(0.0, device=device)
+                for mean, variance in zip(means, variances):
+                    output = torch.stack([mean, variance], dim=2)
+                    for key, loss_fn in loss_dict.items():
+                        weighted_loss = (
+                            loss_fn(output, target) * loss_lambda_dict[key]
+                        )
+                        cell_loss = cell_loss + weighted_loss
+                        batch_losses[key] += (
+                            weighted_loss.detach().item() / n_cell_types
+                        )
+
+                cell_loss.backward()
+                optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+
+                cell_outputs.append(torch.mean(torch.stack(means), dim=0).detach())
+                batch_loss += cell_loss.detach().item() / n_cell_types
+
+            outputs = torch.cat(cell_outputs, dim=-1)
+            metric_cells.update(outputs, targets)
+            metric_genes.update(outputs, targets)
+
+            log_dict["train/loss"] += batch_loss
+            for key in loss_dict:
+                log_dict[f"train/{key}_loss"] += batch_losses[key]
+
+            wb_logger.log_batch({"train/lr": optimizers[0].param_groups[0]["lr"]})
+
+        log_dict["train/loss"] /= len(train_loader)
+        log_dict["train/lr"] = optimizers[0].param_groups[0]["lr"]
+        log_dict["train/pearson_cells"] = metric_cells.compute().nanmean().item()
+        log_dict["train/pearson_genes"] = metric_genes.compute().nanmean().item()
+        log_dict["train/pearson"] = (
+            log_dict["train/pearson_cells"]
+            + log_dict["train/pearson_genes"]
+        ) / 2.0
+        for key in loss_dict:
+            log_dict[f"train/{key}_loss"] /= len(train_loader)
+
+        tqdm.write(
+            f"Epoch {epoch + 1}/{epochs}, Loss: {log_dict['train/loss']:.4f}, "
+            f"PC Cells: {log_dict['train/pearson_cells']:.4f}, "
+            f"PC Genes: {log_dict['train/pearson_genes']:.4f}, "
+            f"PC: {log_dict['train/pearson']:.4f}"
+        )
+        wb_logger.log(log_dict)
+
+        variance_calibration_loader = (
+            eval_calibration_loader
+            if eval_calibration_loader is not None
+            else eval_loader
+        )
+        for cell_type_index, ensemble in enumerate(model.cell_type_models):
+            variance_scale = fit_posthoc_variance_scale(
+                model=ensemble,
+                calibration_loader=_SlicedTargetLoader(
+                    variance_calibration_loader,
+                    cell_type_index,
+                ),
+                device=device,
+            )
+            logging.info(
+                "Epoch %d cell type %d post-hoc variance scale: %.6g.",
+                epoch + 1,
+                cell_type_index,
+                variance_scale,
+            )
+
+        eval_loss = evaluate_ensemble_model(
+            model=model,
+            eval_loader=eval_loader,
+            loss_dict=loss_dict,
+            loss_lambda_dict=loss_lambda_dict,
+            wb_logger=wb_logger,
+            device=device,
+            epoch=epoch,
+            mode="eval",
+            calibration_loader=eval_calibration_loader,
+        )
+
+        if early_stopping is not None and early_stopping.step(eval_loss, model):
+            logging.info(
+                "Early stopping triggered! Restoring best model weights..."
+            )
+            early_stopping.restore_best_weights(model)
+            break
+
 
 def evaluate_ensemble_model(
     model: torch.nn.Module,

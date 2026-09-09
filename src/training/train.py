@@ -16,10 +16,12 @@ from src.training.models.mlp import MLPPredictor
 from src.training.models.mlp_sep import MLPPredictor as SeparateMLPPredictor
 from src.training.models.mlp_sep import CtPredPredictor
 from src.training.models.mlp_deep_ensemble import MLPEnsemble
+from src.training.models.mlp_sep_deep_ensemble import SeparateMLPEnsemble
 
 from src.training.utils import train_single_model, evaluate_single_model
 from src.training.utils import train_separate_model, evaluate_separate_model
 from src.training.utils import train_ensemble_model, evaluate_ensemble_model
+from src.training.utils import train_separate_ensemble_model
 
 from src.training.loss.cossim_loss import CosineSimilarityLoss
 from src.training.loss.mpc_loss import MPCLoss
@@ -75,7 +77,7 @@ def parse_args() -> argparse.Namespace:
         "-m", "--model-name",
         type=str,
         default="mlp",
-        choices=["mlp", "mlp-sep", "ctpred", "deep-ensemble"],
+        choices=["mlp", "mlp-sep", "ctpred", "deep-ensemble", "mlp-sep-deep-ensemble"],
         help=(
             "Name of the model to train. 'ctpred' reimplements the "
             "per-cell-type ctPred architecture from scPrediXcan "
@@ -150,6 +152,16 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Name of the WandB run. Leave empty to not use WandB logging."
+    )
+    parser.add_argument(
+        "--wandb-log-every",
+        type=int,
+        default=50,
+        help=(
+            "Upload per-batch WandB metrics every N training steps. "
+            "Epoch and evaluation summaries are always logged. "
+            "Set to 0 to disable per-batch uploads. Weight tracking is off."
+        ),
     )
     parser.add_argument(
         "--cossim-lambda",
@@ -406,11 +418,25 @@ def main() -> None:
                             n_layers=args.n_layers,
                             layer_norm=args.norm_layer,
                             dropout=args.dropout).to(device)
+    elif args.model_name == 'mlp-sep-deep-ensemble':
+        model = SeparateMLPEnsemble(n_models=5,
+                                    input_dim=input_dim,
+                                    output_dim=output_dim,
+                                    n_layers=args.n_layers,
+                                    layer_norm=args.norm_layer,
+                                    dropout=args.dropout).to(device)
     else:
         raise ValueError(f"Model {args.model_name} is not supported.")
     
+    if args.wandb_log_every < 0:
+        raise ValueError("--wandb-log-every must be non-negative.")
+
     if args.run_name is not None:
-        wb_logger = WandBLogger(enabled=True, model=model, run_name=args.run_name)
+        wb_logger = WandBLogger(
+            enabled=True,
+            run_name=args.run_name,
+            log_every=args.wandb_log_every,
+        )
     else:
         wb_logger = WandBLogger(enabled=False)
 
@@ -420,7 +446,7 @@ def main() -> None:
         + args.mse_lambda
         + args.pnll_lambda
         <= 0.0
-        and args.model_name != "deep-ensemble"
+        and args.model_name not in ("deep-ensemble", "mlp-sep-deep-ensemble")
     ):
         raise ValueError(
             "At least one loss lambda must be set to a positive value."
@@ -441,7 +467,7 @@ def main() -> None:
         loss_dict['pnll'] = PNLLLoss()
         loss_lambda_dict['pnll'] = args.pnll_lambda
     
-    if args.model_name == 'deep-ensemble':
+    if args.model_name in ('deep-ensemble', 'mlp-sep-deep-ensemble'):
         # for deep ensemble, we always add the Gaussian NLL loss for uncertainty estimation
         # we delete all other losses, since they don't work with the (mean, var) output format of the ensemble
         loss_dict['gnll'] = GaussianNLLLoss()
@@ -475,7 +501,8 @@ def main() -> None:
         )
 
     separate_model = args.model_name in ("mlp-sep", "ctpred")
-    if separate_model:
+    separate_ensemble_model = args.model_name == "mlp-sep-deep-ensemble"
+    if separate_model or separate_ensemble_model:
         optimizers = [
             torch.optim.Adam(
                 cell_model.parameters(),
@@ -503,6 +530,7 @@ def main() -> None:
 
     logging.info("Starting training...")
 
+    ensemble_model = args.model_name in ("deep-ensemble", "mlp-sep-deep-ensemble")
     if args.model_name == 'deep-ensemble':
         train_ensemble_model(
             model=model,
@@ -518,7 +546,23 @@ def main() -> None:
             device=device,
             eval_calibration_loader=eval_calibration_loader
         )
+    elif separate_ensemble_model:
+        train_separate_ensemble_model(
+            model=model,
+            train_loader=train_loader,
+            eval_loader=eval_loader,
+            loss_dict=loss_dict,
+            loss_lambda_dict=loss_lambda_dict,
+            optimizers=optimizers,
+            schedulers=schedulers,
+            wb_logger=wb_logger,
+            early_stopping=early_stopping,
+            epochs=args.epochs,
+            device=device,
+            eval_calibration_loader=eval_calibration_loader,
+        )
 
+    if ensemble_model:
         logging.info("Training done, starting evaluation...")
 
         evaluate_ensemble_model(
@@ -653,12 +697,17 @@ def main() -> None:
             "loss_lambdas": dict(loss_lambda_dict),
             "posthoc_variance_calibration": (
                 "validation_scalar_gaussian_nll"
-                if args.model_name == "deep-ensemble"
+                if args.model_name in ("deep-ensemble", "mlp-sep-deep-ensemble")
                 else None
             ),
             "variance_scale": (
                 float(model.variance_scale.item())
-                if args.model_name == "deep-ensemble"
+                if args.model_name in ("deep-ensemble", "mlp-sep-deep-ensemble")
+                else None
+            ),
+            "variance_scales": (
+                list(model.variance_scales)
+                if args.model_name == "mlp-sep-deep-ensemble"
                 else None
             ),
             "cell_types": list(cell_type_names),

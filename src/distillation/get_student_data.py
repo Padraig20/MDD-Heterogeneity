@@ -11,6 +11,7 @@ from src.training.models.mlp_sep import (
     CtPredPredictor,
 )
 from src.training.models.mlp_deep_ensemble import MLPEnsemble
+from src.training.models.mlp_sep_deep_ensemble import SeparateMLPEnsemble
 
 """
 get_student_data.py
@@ -184,7 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-b", "--batch-size",    type=int, default=1)
     parser.add_argument("-m", "--model-name",
                         type=str, default=None,
-                        choices=["mlp", "mlp-sep", "ctpred", "deep-ensemble"],
+                        choices=["mlp", "mlp-sep", "ctpred", "deep-ensemble", "mlp-sep-deep-ensemble"],
                         help=(
                             "Optional teacher-model type. Inferred from new "
                             "checkpoints and validated when supplied. Legacy "
@@ -207,20 +208,26 @@ def parse_args() -> argparse.Namespace:
             "existing preds/aleatoric/epistemic/totvar layout; 'members' "
             "writes each member's means and calibrated standard deviations "
             "under members/member_<index>/{preds,sigmas}; 'both' writes both "
-            "layouts. Only valid with --model-name deep-ensemble (or a "
-            "checkpoint that records that model type)."
+            "layouts. Only valid with a deep-ensemble or "
+            "mlp-sep-deep-ensemble teacher (or a checkpoint that records "
+            "that model type)."
         ),
     )
     return parser.parse_args()
 
 
-def infer_n_models(state_dict) -> int:
-    """Infer the number of ensemble members from the saved state dict keys
-    (e.g. 'models.0.mlp...', 'models.1.mlp...')."""
+def infer_n_models(state_dict, prefix: str = "models.") -> int:
+    """Infer the number of ensemble members from saved state dict keys.
+
+    Shared ensembles store members at ``models.N....``. Per-cell-type
+    ensembles store them at ``mlps.<ct>.models.N....``.
+    """
     indices = set()
     for key in state_dict:
-        if key.startswith("models."):
-            indices.add(int(key.split(".")[1]))
+        if key.startswith(prefix):
+            member_index = key[len(prefix):].split(".", 1)[0]
+            if member_index.isdigit():
+                indices.add(int(member_index))
     if not indices:
         raise ValueError("Could not infer number of ensemble members from checkpoint.")
     return max(indices) + 1
@@ -269,6 +276,18 @@ def load_model(
     elif model_name == "deep-ensemble":
         model = MLPEnsemble(
             n_models=infer_n_models(checkpoint["model_state_dict"]),
+            input_dim=checkpoint["input_dim"],
+            n_layers=checkpoint["n_layers"],
+            output_dim=checkpoint["output_dim"],
+            layer_norm=checkpoint["layer_norm"],
+            dropout=checkpoint.get("dropout", 0.0),
+        )
+    elif model_name == "mlp-sep-deep-ensemble":
+        model = SeparateMLPEnsemble(
+            n_models=infer_n_models(
+                checkpoint["model_state_dict"],
+                prefix="mlps.0.models.",
+            ),
             input_dim=checkpoint["input_dim"],
             n_layers=checkpoint["n_layers"],
             output_dim=checkpoint["output_dim"],
@@ -377,10 +396,11 @@ def main() -> None:
     master_chroms = np.array([k[1] for k in all_keys], dtype=object)
     master_tss    = np.array([k[2] for k in all_keys], dtype=np.int64)
 
-    is_ensemble = model_name == "deep-ensemble"
+    is_ensemble = model_name in ("deep-ensemble", "mlp-sep-deep-ensemble")
     if not is_ensemble and args.ensemble_output != "aggregate":
         raise ValueError(
-            "--ensemble-output members/both requires a deep-ensemble teacher."
+            "--ensemble-output members/both requires a deep-ensemble or "
+            "mlp-sep-deep-ensemble teacher."
         )
     write_aggregate = not is_ensemble or args.ensemble_output in {
         "aggregate",
@@ -407,7 +427,11 @@ def main() -> None:
         empty_ct_matrices() if is_ensemble and write_aggregate else None
     )
 
-    n_models = len(model.models) if is_ensemble else 0
+    n_models = (
+        getattr(model, "n_models", len(getattr(model, "models", ())))
+        if is_ensemble
+        else 0
+    )
     member_ct_to_pred = (
         [empty_ct_matrices() for _ in range(n_models)]
         if write_members

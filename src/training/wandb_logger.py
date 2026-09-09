@@ -1,4 +1,3 @@
-import torch
 import wandb
 import os
 
@@ -11,11 +10,16 @@ if "WANDB_KEY" not in os.environ:
 wandb.login(key=os.getenv("WANDB_KEY"))
 class WandBLogger:
 
-    def __init__(self, enabled=True, 
-                 model: torch.nn.modules=None, 
-                 run_name: str=None) -> None:
+    def __init__(
+        self,
+        enabled=True,
+        run_name: str = None,
+        log_every: int = 50,
+    ) -> None:
         
         self.enabled = enabled
+        self.log_every = log_every
+        self._batch_step = 0
 
         if self.enabled:
             wandb.init(entity=ENTITY,
@@ -24,13 +28,6 @@ class WandBLogger:
                 wandb.run.name = wandb.run.id    
             else:
                 wandb.run.name = run_name  
-
-            if model is not None:
-                self.watch(model)         
-            
-    def watch(self, model, log_freq: int=1):
-        if self.enabled:
-            wandb.watch(model, log="all", log_freq=log_freq)
             
     def log(self, log_dict: dict, commit=True, step=None):
         if self.enabled:
@@ -38,6 +35,16 @@ class WandBLogger:
                 wandb.log(log_dict, commit=commit, step=step)
             else:
                 wandb.log(log_dict, commit=commit)
+
+    def log_batch(self, log_dict: dict) -> None:
+        """Log a per-batch metric only every ``log_every`` training steps."""
+        if not self.enabled:
+            return
+        self._batch_step += 1
+        if self.log_every <= 0:
+            return
+        if self._batch_step % self.log_every == 0:
+            wandb.log(log_dict)
  
     def finish(self):
         if self.enabled:
