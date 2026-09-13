@@ -7,7 +7,8 @@ from those tables and shows both their total count in each cell type and the
 size of every *exact* intersection retained in the plot.
 
 Figures and sharing statistics are logged to a new WandB run named
-``General`` in ``--wandb-project``, namespaced under ``General/<scope>/...``.
+``General`` in ``--wandb-project``, namespaced under
+``General/<arm>/<scope>/...`` so this-study and ctPred stay distinct.
 Optional ``--output`` still writes a local copy of each figure.
 
     For example::
@@ -22,8 +23,7 @@ Optional ``--output`` still writes a local copy of each figure.
         --input-dir results/mdd \
         --wandb-project mdd-twas \
         --criterion fdr \
-        --combination expectation \
-        --arm this-study
+        --combination expectation
 
     python -m src.twas.analysis.generate_upset_plot \
         --input-dir results/mdd \
@@ -208,7 +208,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         required=True,
         help=(
             "WandB project. Figures and sharing statistics are logged to a new "
-            "run named 'General' under General/<gene-scope>/..."
+            "run named 'General' under General/<arm>/<gene-scope>/..."
         ),
     )
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -224,9 +224,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--arm",
+        nargs="+",
         choices=ARMS,
-        default="this-study",
-        help="Which run.py model arm to plot.",
+        default=list(ARMS),
+        metavar="ARM",
+        help="Which run.py model arm(s) to plot. Defaults to both.",
     )
     parser.add_argument(
         "--criterion",
@@ -310,7 +312,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="CELL_TYPE",
         help=(
             "Plot only these cell types. Names may use spaces or underscores; "
-            "the default is every cell type with a result for the selected arm. "
+            "the default is every cell type with a result for that arm. "
             "With --group-onek1k, specify the broad group names."
         ),
     )
@@ -362,6 +364,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--max-intersections cannot be negative.")
     if args.dpi < 1:
         parser.error("--dpi must be at least 1.")
+    args.arm = list(dict.fromkeys(args.arm))
     args.gene_scope = [
         GENE_SCOPE_ALIASES.get(scope, scope) for scope in args.gene_scope
     ]
@@ -891,12 +894,24 @@ def filter_gene_sets_by_scope(
     }
 
 
-def output_for_scope(output: Path, scope: str, multiple: bool) -> Path:
-    """Add a scope suffix when one invocation writes several plots."""
+def output_for_variant(
+    output: Path,
+    *,
+    arm: str,
+    scope: str,
+    multiple_arms: bool,
+    multiple_scopes: bool,
+) -> Path:
+    """Add arm/scope suffixes when one invocation writes several plots."""
     output = Path(output)
-    if not multiple:
+    parts: list[str] = []
+    if multiple_arms:
+        parts.append(arm)
+    if multiple_scopes:
+        parts.append(scope)
+    if not parts:
         return output
-    return output.with_name(f"{output.stem}_{scope}{output.suffix}")
+    return output.with_name(f"{output.stem}_{'_'.join(parts)}{output.suffix}")
 
 
 def order_gene_sets(
@@ -1027,9 +1042,9 @@ def format_sharing_summary(
     )
 
 
-def _scope_key(scope: str, name: str) -> str:
-    """Namespace one metric, figure, or table under ``General/<scope>/``."""
-    return f"{GENERAL_RUN_NAME}/{scope}/{name}"
+def _log_key(arm: str, scope: str, name: str) -> str:
+    """Namespace one metric, figure, or table under ``General/<arm>/<scope>/``."""
+    return f"{GENERAL_RUN_NAME}/{arm}/{scope}/{name}"
 
 
 def _scope_statistics(
@@ -1052,35 +1067,36 @@ def _scope_statistics(
     }
 
 
-def _set_size_table(gene_sets: Mapping[str, set[str]]) -> pd.DataFrame:
+def _set_size_table(gene_sets: Mapping[str, set[str]], arm: str) -> pd.DataFrame:
     """One row per displayed cell type with its candidate-gene count."""
     return pd.DataFrame(
         [
-            {"cell_type": name, "n_genes": len(genes)}
+            {"arm": arm, "cell_type": name, "n_genes": len(genes)}
             for name, genes in gene_sets.items()
         ]
     )
 
 
-def _intersection_table(intersections: pd.DataFrame) -> pd.DataFrame:
+def _intersection_table(intersections: pd.DataFrame, arm: str) -> pd.DataFrame:
     """Serialize exact intersections for a WandB table."""
     rows = []
     for _, row in intersections.iterrows():
         members = sorted(row["members"], key=str.casefold)
         rows.append(
             {
+                "arm": arm,
                 "members": " ∩ ".join(members),
                 "n_members": int(row["degree"]),
                 "n_genes": int(row["size"]),
             }
         )
-    return pd.DataFrame(rows, columns=["members", "n_members", "n_genes"])
+    return pd.DataFrame(rows, columns=["arm", "members", "n_members", "n_genes"])
 
 
 def _wandb_config(args: argparse.Namespace) -> dict:
     """Record the analysis settings on the General run."""
     return {
-        "arm": args.arm,
+        "arms": list(args.arm),
         "criterion": args.criterion,
         "combination": args.combination,
         "min_agreement": args.min_agreement,
@@ -1096,6 +1112,48 @@ def _wandb_config(args: argparse.Namespace) -> dict:
         "sort_sets": args.sort_sets,
         "input_dir": str(args.input_dir),
     }
+
+
+def _arm_min_agreement(args: argparse.Namespace, arm: str) -> float | None:
+    """Agreement cutoffs are an MI this-study feature; ctPred has no such columns."""
+    if arm != "this-study":
+        return None
+    return args.min_agreement
+
+
+def load_arm_gene_sets(
+    args: argparse.Namespace, arm: str
+) -> dict[str, set[str]]:
+    """Load (and optionally OneK1K-group) candidate sets for one model arm."""
+    min_agreement = _arm_min_agreement(args, arm)
+    if args.min_agreement is not None and min_agreement is None:
+        logging.info(
+            "Arm %s has no MI agreement columns; using pooled %s significance.",
+            arm,
+            args.combination,
+        )
+    if args.group_onek1k:
+        files = discover_result_files(args.input_dir, arm)
+        gene_sets = group_onek1k_gene_sets(
+            files,
+            criterion=args.criterion,
+            min_agreement=min_agreement,
+            alpha=args.alpha,
+            combination=args.combination,
+        )
+        return select_gene_sets(gene_sets, args.cell_types)
+    files = discover_result_files(args.input_dir, arm, args.cell_types)
+    return load_gene_sets(
+        files,
+        criterion=args.criterion,
+        min_agreement=min_agreement,
+        combination=args.combination,
+    )
+
+
+def _figure_title(title: str | None, arm: str) -> str:
+    """Keep the arm visible on the figure itself, not only in the WandB key."""
+    return f"{title} ({arm})" if title else arm
 
 
 def _display_name(name: str) -> str:
@@ -1271,30 +1329,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.criterion,
         )
     try:
-        if args.group_onek1k:
-            files = discover_result_files(args.input_dir, args.arm)
-            base_gene_sets = group_onek1k_gene_sets(
-                files,
-                criterion=args.criterion,
-                min_agreement=args.min_agreement,
-                alpha=args.alpha,
-                combination=args.combination,
-            )
-            base_gene_sets = select_gene_sets(
-                base_gene_sets, args.cell_types
-            )
-        else:
-            files = discover_result_files(
-                args.input_dir, args.arm, args.cell_types
-            )
-            base_gene_sets = load_gene_sets(
-                files,
-                criterion=args.criterion,
-                min_agreement=args.min_agreement,
-                combination=args.combination,
-            )
+        arms = list(args.arm)
         scopes = list(dict.fromkeys(args.gene_scope))
-        multiple_outputs = len(scopes) > 1
+        arm_gene_sets: dict[str, dict[str, set[str]]] = {}
+        for arm in arms:
+            try:
+                arm_gene_sets[arm] = load_arm_gene_sets(args, arm)
+            except FileNotFoundError as error:
+                logging.warning("Skipping arm %s: %s", arm, error)
+        if not arm_gene_sets:
+            raise FileNotFoundError(
+                f"No */{{{','.join(arms)}}}/results.csv files found under "
+                f"{args.input_dir}."
+            )
+
         mhc_gene_ids: set[str] | None = None
         if any(scope != "all" for scope in scopes):
             annotated_ids, mhc_gene_ids = load_mhc_gene_ids(
@@ -1302,7 +1350,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             candidate_ids = {
                 _gene_identifier_key(gene)
-                for genes in base_gene_sets.values()
+                for gene_sets in arm_gene_sets.values()
+                for genes in gene_sets.values()
                 for gene in genes
             }
             missing_annotation = candidate_ids - annotated_ids
@@ -1325,58 +1374,73 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.combination == "expectation"
             else "TWAS hits"
         )
+        multiple_arms = len(arm_gene_sets) > 1
+        multiple_scopes = len(scopes) > 1
 
-        for scope in scopes:
-            gene_sets = filter_gene_sets_by_scope(
-                base_gene_sets, scope, mhc_gene_ids
-            )
-            gene_sets = order_gene_sets(gene_sets, sort_by=args.sort_sets)
-            intersections = compute_intersections(
-                gene_sets,
-                min_size=args.min_intersection_size,
-                max_intersections=args.max_intersections,
-                sort_by=args.sort_intersections,
-            )
-            figure = plot_upset(
-                gene_sets,
-                intersections,
-                title=args.title,
-            )
-            sharing = sharing_summary(gene_sets)
-            stats = _scope_statistics(sharing, intersections)
-            figures[_scope_key(scope, "upset")] = figure
-            wandb_summary.update(
-                {_scope_key(scope, name): value for name, value in stats.items()}
-            )
-            tables[_scope_key(scope, "set_sizes")] = _set_size_table(gene_sets)
-            tables[_scope_key(scope, "intersections")] = _intersection_table(
-                intersections
-            )
-
-            if args.output is not None:
-                output = output_for_scope(
-                    args.output, scope, multiple_outputs
+        for arm, base_gene_sets in arm_gene_sets.items():
+            for scope in scopes:
+                gene_sets = filter_gene_sets_by_scope(
+                    base_gene_sets, scope, mhc_gene_ids
                 )
-                figure.savefig(output, dpi=args.dpi, bbox_inches="tight")
-                logging.info("Wrote %s [%s].", output, scope)
+                gene_sets = order_gene_sets(gene_sets, sort_by=args.sort_sets)
+                intersections = compute_intersections(
+                    gene_sets,
+                    min_size=args.min_intersection_size,
+                    max_intersections=args.max_intersections,
+                    sort_by=args.sort_intersections,
+                )
+                figure = plot_upset(
+                    gene_sets,
+                    intersections,
+                    title=_figure_title(args.title, arm),
+                )
+                sharing = sharing_summary(gene_sets)
+                stats = _scope_statistics(sharing, intersections)
+                figures[_log_key(arm, scope, "upset")] = figure
+                wandb_summary.update(
+                    {
+                        _log_key(arm, scope, name): value
+                        for name, value in stats.items()
+                    }
+                )
+                tables[_log_key(arm, scope, "set_sizes")] = _set_size_table(
+                    gene_sets, arm
+                )
+                tables[_log_key(arm, scope, "intersections")] = (
+                    _intersection_table(intersections, arm)
+                )
 
-            sentence = format_sharing_summary(sharing, hit_kind=hit_kind)
-            logging.info(
-                "%s [%s]: %d cell types, %d candidate genes, %d of %d "
-                "intersections shown.",
-                GENERAL_RUN_NAME,
-                scope,
-                stats["n_cell_types"],
-                stats["n_hits"],
-                stats["n_intersections_shown"],
-                stats["n_intersections_available"],
-            )
-            logging.info("%s", sentence)
+                if args.output is not None:
+                    output = output_for_variant(
+                        args.output,
+                        arm=arm,
+                        scope=scope,
+                        multiple_arms=multiple_arms,
+                        multiple_scopes=multiple_scopes,
+                    )
+                    figure.savefig(output, dpi=args.dpi, bbox_inches="tight")
+                    logging.info("Wrote %s [%s/%s].", output, arm, scope)
+
+                sentence = format_sharing_summary(sharing, hit_kind=hit_kind)
+                logging.info(
+                    "%s [%s/%s]: %d cell types, %d candidate genes, %d of %d "
+                    "intersections shown.",
+                    GENERAL_RUN_NAME,
+                    arm,
+                    scope,
+                    stats["n_cell_types"],
+                    stats["n_hits"],
+                    stats["n_intersections_shown"],
+                    stats["n_intersections_available"],
+                )
+                logging.info("%s", sentence)
 
         logger = TwasWandBLogger(
             project=args.wandb_project, entity=args.wandb_entity
         )
-        logger.start(GENERAL_RUN_NAME, config=_wandb_config(args))
+        config = _wandb_config(args)
+        config["arms"] = list(arm_gene_sets)
+        logger.start(GENERAL_RUN_NAME, config=config)
         try:
             logger.log_results(wandb_summary, figures, tables=tables)
             logging.info(
