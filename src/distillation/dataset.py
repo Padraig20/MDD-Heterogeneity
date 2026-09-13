@@ -11,7 +11,7 @@ from pathlib import Path
 
 from bed_reader import open_bed
 
-from scipy.stats import rankdata
+from scipy.stats import norm, rankdata
 
 """
 Quick reminder: Make sure to convert the VCF files to BED/BIM/FAM via plink2.
@@ -100,7 +100,7 @@ class GenotypeDataset(Dataset):
             bim_dir (Path):               Directory containing the BIM files.
             window_size (int):            Size of the genomic window to consider around each TSS.
             select_genes (Path | None):   Path to a file containing a list of genes to select. If None, use all genes.
-            normalize (str):              Normalization method for expression values. Options are "none", "log", or "percentiles".
+            normalize (str):              Normalization method for expression values. Options are "none", "log", "percentiles", or "normal".
             max_individuals (int | None):  Maximum number of individuals to use. If None, use all individuals.
             bed_template (str):           Template for the PLINK fileset basename, with a `{chrom}` placeholder.
             maf_threshold (float | None): Minimum minor allele frequency a SNP must have to be kept (e.g. 0.05
@@ -220,13 +220,16 @@ class GenotypeDataset(Dataset):
                 None if y_sigma is None
                 else self._aligned_matrix(y_sigma, "sigma", individual_cols)
             )
-            if self._sigma is not None and self.normalize == "percentiles":
+            if self._sigma is not None and self.normalize in {"percentiles", "normal"}:
                 # Member sigmas from get_student_data stay in teacher output
                 # space. For the usual log-target teacher that is log1p-space
                 # (means are undone to TPM; sigmas are not), and rank(y) =
-                # rank(log1p(y)) for y >= 0, so the percentile Jacobian is
-                # applied on the log1p support.
-                self._sigma = self.to_percentile_sigmas(raw_expression, self._sigma)
+                # rank(log1p(y)) for y >= 0, so the rank Jacobian is applied
+                # on the log1p support.
+                if self.normalize == "percentiles":
+                    self._sigma = self.to_percentile_sigmas(raw_expression, self._sigma)
+                else:
+                    self._sigma = self.to_normal_sigmas(raw_expression, self._sigma)
         else:
             keep_genes = self._genes_passing_expression_filter(self.y, individual_cols=None)
             if keep_genes is not None:
@@ -268,6 +271,8 @@ class GenotypeDataset(Dataset):
         expr = np.asarray(expr, dtype=np.float64)
         if self.normalize == "percentiles":
             return self.to_percentiles_matrix(expr)
+        elif self.normalize == "normal":
+            return self.to_normal_matrix(expr)
         elif self.normalize == "log":
             return np.log1p(expr)
         elif self.normalize == "none":
@@ -288,8 +293,9 @@ class GenotypeDataset(Dataset):
 
         Missing genes/individuals become NaN, as with the left join this replaces;
         the models drop those rows per gene. Values are kept in the teacher's output
-        space here; percentile-normalized means push member sigmas through the same
-        rank map afterwards (see ``to_percentile_sigmas``).
+        space here; percentile- and inverse-normal-normalized means push member
+        sigmas through the same rank map afterwards (see ``to_percentile_sigmas``
+        and ``to_normal_sigmas``).
         """
         if isinstance(extra, (Path, str)):
             extra_df = pd.read_csv(extra)
@@ -551,6 +557,117 @@ class GenotypeDataset(Dataset):
         p_hi = np.interp(hi, y_uniq, p_uniq, left=0.0, right=1.0)
         result = 0.5 * (p_hi - p_lo)
         result[~valid_sigma] = np.nan
+        out[finite] = result
+        return out
+
+    @staticmethod
+    def to_normal_matrix(expr: np.ndarray) -> np.ndarray:
+        """Within-gene inverse quantile normalization to N(0, 1).
+
+        Ranks individuals separately per gene (average ranks for ties), maps
+        to ``(rank - 0.5) / n_finite``, then through the standard-normal
+        quantile function. Missing values stay NaN. This is the PrediXcan /
+        GTEx rankit transform; the ``(rank - 0.5) / n`` offset keeps
+        quantiles in ``(0, 1)`` so ``Φ^{-1}`` stays finite.
+        """
+        expr = np.asarray(expr, dtype=np.float64)
+        if expr.size == 0 or expr.shape[1] == 0:
+            return expr
+        ranks = rankdata(expr, method="average", axis=1, nan_policy="omit")
+        n_finite = np.isfinite(expr).sum(axis=1, keepdims=True)
+        quantiles = np.full(expr.shape, np.nan, dtype=np.float64)
+        usable = (n_finite > 0) & np.isfinite(ranks)
+        np.divide(ranks - 0.5, n_finite, out=quantiles, where=usable)
+        out = np.full(expr.shape, np.nan, dtype=np.float64)
+        finite_q = np.isfinite(quantiles)
+        out[finite_q] = norm.ppf(quantiles[finite_q])
+        return out
+
+    @staticmethod
+    def to_normal(y_df: pd.DataFrame) -> pd.DataFrame:
+        """Inverse-quantile-normalize expression separately for each gene, ranking across individuals."""
+        y_df = y_df.copy()
+        y_df["expression"] = (
+            y_df.groupby("gene")["expression"]
+            .transform(
+                lambda col: GenotypeDataset.to_normal_matrix(
+                    col.to_numpy().reshape(1, -1)
+                ).ravel()
+            )
+            .astype(float)
+        )
+        return y_df
+
+    @staticmethod
+    def to_normal_sigmas(values: np.ndarray, sigmas: np.ndarray) -> np.ndarray:
+        """Map member SDs through the within-gene inverse-normal transform.
+
+        The inverse-normal value of an individual is ``Φ^{-1}`` of that
+        gene's rankit quantile. Member files exported from a log-target
+        teacher keep ``sigmas`` in log1p-space while storing means on the
+        undone (TPM) scale, and ``rank(y) = rank(log1p(y))`` for ``y >= 0``,
+        so the Jacobian is taken on the log1p support whenever a gene's
+        finite means are non-negative.
+
+        The SD in inverse-normal space is the central finite difference
+        ``0.5 * (Φ^{-1}(F(z+σ)) - Φ^{-1}(F(z-σ)))``, with ``F`` the rankit
+        ECDF clipped to ``(0.5/n, 1 - 0.5/n)`` so the quantile function
+        stays finite.
+        """
+        values = np.asarray(values, dtype=np.float64)
+        sigmas = np.asarray(sigmas, dtype=np.float64)
+        if values.shape != sigmas.shape:
+            raise ValueError(
+                "values and sigmas must share shape "
+                f"(n_genes, n_individuals); got {values.shape} vs {sigmas.shape}."
+            )
+        if values.ndim != 2:
+            raise ValueError("values and sigmas must be 2-d gene-by-individual arrays.")
+
+        out = np.full(sigmas.shape, np.nan, dtype=np.float64)
+        for row in range(values.shape[0]):
+            out[row] = GenotypeDataset._row_normal_sigmas(values[row], sigmas[row])
+        return out
+
+    @staticmethod
+    def _row_normal_sigmas(values: np.ndarray, sigmas: np.ndarray) -> np.ndarray:
+        """Finite-difference inverse-normal SDs for one gene."""
+        out = np.full(values.shape, np.nan, dtype=np.float64)
+        finite = np.isfinite(values)
+        n = int(finite.sum())
+        if n == 0:
+            return out
+        if n == 1:
+            usable = finite & np.isfinite(sigmas) & (sigmas >= 0.0)
+            out[usable] = 0.0
+            return out
+
+        support = values.astype(np.float64, copy=True)
+        if np.all(values[finite] >= 0.0):
+            support = np.log1p(support)
+
+        y = support[finite]
+        p = (rankdata(y, method="average") - 0.5) / n
+        order = np.argsort(y, kind="mergesort")
+        y_ord = y[order]
+        p_ord = p[order]
+        y_uniq, first = np.unique(y_ord, return_index=True)
+        p_uniq = p_ord[first]
+        p_min = 0.5 / n
+        p_max = 1.0 - 0.5 / n
+
+        sigma = sigmas[finite].astype(np.float64, copy=False)
+        valid_sigma = np.isfinite(sigma) & (sigma >= 0.0)
+        lo = np.full(n, np.nan, dtype=np.float64)
+        hi = np.full(n, np.nan, dtype=np.float64)
+        lo[valid_sigma] = y[valid_sigma] - sigma[valid_sigma]
+        hi[valid_sigma] = y[valid_sigma] + sigma[valid_sigma]
+        p_lo = np.interp(lo, y_uniq, p_uniq, left=p_min, right=p_max)
+        p_hi = np.interp(hi, y_uniq, p_uniq, left=p_min, right=p_max)
+        result = np.full(n, np.nan, dtype=np.float64)
+        result[valid_sigma] = 0.5 * (
+            norm.ppf(p_hi[valid_sigma]) - norm.ppf(p_lo[valid_sigma])
+        )
         out[finite] = result
         return out
 

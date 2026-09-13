@@ -180,14 +180,17 @@ def parse_args() -> argparse.Namespace:
         "-nt", "--norm-targets",
         type=str,
         default="log",
-        choices=["none", "log", "percentiles"],
+        choices=["none", "log", "percentiles", "normal"],
         help=(
             "Normalization for target means. 'log' applies log1p, matching "
             "member sigmas exported from a log-target teacher. 'percentiles' "
             "ranks individuals within each gene and maps member sigmas "
             "through that rank via the interpolated empirical CDF in "
-            "log1p-space (the space those sigmas already inhabit). 'none' "
-            "leaves both unchanged (untransformed teacher)."
+            "log1p-space (the space those sigmas already inhabit). 'normal' "
+            "inverse-quantile-normalizes each gene to N(0, 1) across "
+            "individuals (PrediXcan/GTEx rankit) and maps member sigmas "
+            "through that transform. 'none' leaves both unchanged "
+            "(untransformed teacher)."
         ),
     )
     parser.add_argument(
@@ -913,6 +916,12 @@ def main() -> None:
             logging.info(
                 "Percentile targets enabled: each gene ranks individuals, and "
                 "member sigmas are mapped through that rank in log1p-space."
+            )
+        elif args.norm_targets == "normal":
+            logging.info(
+                "Inverse-normal targets enabled: each gene is rankit-"
+                "transformed to N(0, 1) across individuals, and member "
+                "sigmas are mapped through that transform in log1p-space."
             )
     elif probabilistic:
         logging.info(
