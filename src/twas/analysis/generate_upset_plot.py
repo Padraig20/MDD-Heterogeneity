@@ -6,10 +6,11 @@ For every cell type, :mod:`src.twas.run` writes
 from those tables and shows both their total count in each cell type and the
 size of every *exact* intersection retained in the plot.
 
-Figures and sharing statistics are logged to a new WandB run named
-``General`` in ``--wandb-project``, namespaced under
-``General/<arm>/<scope>/...`` so this-study and ctPred stay distinct.
-Optional ``--output`` still writes a local copy of each figure.
+Figures and sharing statistics are logged to two WandB runs named after
+the model arms (``this-study`` and ``ctPred``). Every artifact is
+namespaced under ``general/<scope>/...`` so it sits in its own section
+inside each run. Optional ``--output`` still writes a local copy of each
+figure.
 
     For example::
 
@@ -73,7 +74,7 @@ GENE_SCOPE_ALIASES = {
 GENE_SCOPE_CHOICES = GENE_SCOPES + tuple(GENE_SCOPE_ALIASES)
 DEFAULT_MHC_REGION = "6:25000000-34000000"
 DEFAULT_GTF = Path("data/hg38/Homo_sapiens.GRCh38.115.gtf")
-GENERAL_RUN_NAME = "General"
+GENERAL_PREFIX = "general"
 
 _GTF_GENE_ID = re.compile(r'gene_id\s+"([^"]+)"')
 
@@ -207,8 +208,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=str,
         required=True,
         help=(
-            "WandB project. Figures and sharing statistics are logged to a new "
-            "run named 'General' under General/<arm>/<gene-scope>/..."
+            "WandB project. Each arm becomes its own run (this-study, ctPred) "
+            "with figures and statistics under general/<gene-scope>/..."
         ),
     )
     parser.add_argument("--wandb-entity", type=str, default=None)
@@ -1042,9 +1043,9 @@ def format_sharing_summary(
     )
 
 
-def _log_key(arm: str, scope: str, name: str) -> str:
-    """Namespace one metric, figure, or table under ``General/<arm>/<scope>/``."""
-    return f"{GENERAL_RUN_NAME}/{arm}/{scope}/{name}"
+def _log_key(scope: str, name: str) -> str:
+    """Namespace one metric, figure, or table under ``general/<scope>/``."""
+    return f"{GENERAL_PREFIX}/{scope}/{name}"
 
 
 def _scope_statistics(
@@ -1093,13 +1094,14 @@ def _intersection_table(intersections: pd.DataFrame, arm: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["arm", "members", "n_members", "n_genes"])
 
 
-def _wandb_config(args: argparse.Namespace) -> dict:
-    """Record the analysis settings on the General run."""
+def _wandb_config(args: argparse.Namespace, arm: str) -> dict:
+    """Record the analysis settings on one arm's run."""
     return {
-        "arms": list(args.arm),
+        "arm": arm,
+        "analysis": GENERAL_PREFIX,
         "criterion": args.criterion,
         "combination": args.combination,
-        "min_agreement": args.min_agreement,
+        "min_agreement": _arm_min_agreement(args, arm),
         "group_onek1k": args.group_onek1k,
         "alpha": args.alpha,
         "gene_scope": list(args.gene_scope),
@@ -1366,9 +1368,6 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.output is not None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
 
-        figures: dict[str, Figure] = {}
-        wandb_summary: dict[str, int | float] = {}
-        tables: dict[str, pd.DataFrame] = {}
         hit_kind = (
             "E[z] TWAS hits"
             if args.combination == "expectation"
@@ -1376,8 +1375,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         multiple_arms = len(arm_gene_sets) > 1
         multiple_scopes = len(scopes) > 1
+        logger = TwasWandBLogger(
+            project=args.wandb_project, entity=args.wandb_entity
+        )
 
         for arm, base_gene_sets in arm_gene_sets.items():
+            figures: dict[str, Figure] = {}
+            wandb_summary: dict[str, int | float] = {}
+            tables: dict[str, pd.DataFrame] = {}
             for scope in scopes:
                 gene_sets = filter_gene_sets_by_scope(
                     base_gene_sets, scope, mhc_gene_ids
@@ -1396,17 +1401,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 sharing = sharing_summary(gene_sets)
                 stats = _scope_statistics(sharing, intersections)
-                figures[_log_key(arm, scope, "upset")] = figure
+                figures[_log_key(scope, "upset")] = figure
                 wandb_summary.update(
                     {
-                        _log_key(arm, scope, name): value
+                        _log_key(scope, name): value
                         for name, value in stats.items()
                     }
                 )
-                tables[_log_key(arm, scope, "set_sizes")] = _set_size_table(
+                tables[_log_key(scope, "set_sizes")] = _set_size_table(
                     gene_sets, arm
                 )
-                tables[_log_key(arm, scope, "intersections")] = (
+                tables[_log_key(scope, "intersections")] = (
                     _intersection_table(intersections, arm)
                 )
 
@@ -1425,8 +1430,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 logging.info(
                     "%s [%s/%s]: %d cell types, %d candidate genes, %d of %d "
                     "intersections shown.",
-                    GENERAL_RUN_NAME,
                     arm,
+                    GENERAL_PREFIX,
                     scope,
                     stats["n_cell_types"],
                     stats["n_hits"],
@@ -1435,26 +1440,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
                 logging.info("%s", sentence)
 
-        logger = TwasWandBLogger(
-            project=args.wandb_project, entity=args.wandb_entity
-        )
-        config = _wandb_config(args)
-        config["arms"] = list(arm_gene_sets)
-        logger.start(GENERAL_RUN_NAME, config=config)
-        try:
-            logger.log_results(wandb_summary, figures, tables=tables)
-            logging.info(
-                "Logged %d figure(s) and %d statistic(s) to WandB run %r "
-                "in project %s.",
-                len(figures),
-                len(wandb_summary),
-                GENERAL_RUN_NAME,
-                args.wandb_project,
-            )
-        finally:
-            logger.finish()
-            for figure in figures.values():
-                plt.close(figure)
+            logger.start(arm, config=_wandb_config(args, arm))
+            try:
+                logger.log_results(wandb_summary, figures, tables=tables)
+                logging.info(
+                    "Logged %d figure(s) and %d statistic(s) to WandB run %r "
+                    "in project %s.",
+                    len(figures),
+                    len(wandb_summary),
+                    arm,
+                    args.wandb_project,
+                )
+            finally:
+                logger.finish()
+                for figure in figures.values():
+                    plt.close(figure)
     except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as error:
         logging.error("%s", error)
         raise SystemExit(1) from error
