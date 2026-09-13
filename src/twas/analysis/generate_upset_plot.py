@@ -4,27 +4,30 @@ The input is the directory passed to ``python -m src.twas.run --output-dir``.
 For every cell type, :mod:`src.twas.run` writes
 ``<cell type>/<arm>/results.csv``.  This script reads the significant genes
 from those tables and shows both their total count in each cell type and the
-size of every *exact* intersection retained in the plot. Beside each figure it
-also writes the sharing sentence (all cell types / at least two / singleton).
+size of every *exact* intersection retained in the plot.
 
-For example::
+Figures and sharing statistics are logged to a new WandB run named
+``General`` in ``--wandb-project``, namespaced under ``General/<scope>/...``.
+Optional ``--output`` still writes a local copy of each figure.
+
+    For example::
 
     python -m src.twas.analysis.generate_upset_plot \
         --input-dir results/mdd \
-        --output results/mdd/upset.png \
+        --wandb-project mdd-twas \
         --criterion fdr \
         --cell-types Memory_B_cell Naive_B_cell "CD4-positive alpha-beta T cell"
 
     python -m src.twas.analysis.generate_upset_plot \
         --input-dir results/mdd \
-        --output results/mdd/upset-expectation.png \
+        --wandb-project mdd-twas \
         --criterion fdr \
         --combination expectation \
         --arm this-study
 
     python -m src.twas.analysis.generate_upset_plot \
         --input-dir results/mdd \
-        --output results/mdd/upset-grouped.png \
+        --wandb-project mdd-twas \
         --group-onek1k \
         --cell-types "B cell" "T cell" "NK cell"
 
@@ -54,6 +57,7 @@ from matplotlib.ticker import MaxNLocator
 
 from src.twas.aggregate import acat_rows, benjamini_hochberg
 from src.twas.compare import normalize_cell_type
+from src.twas.wandb_logger import TwasWandBLogger
 
 
 ARMS = ("this-study", "ctPred")
@@ -69,6 +73,7 @@ GENE_SCOPE_ALIASES = {
 GENE_SCOPE_CHOICES = GENE_SCOPES + tuple(GENE_SCOPE_ALIASES)
 DEFAULT_MHC_REGION = "6:25000000-34000000"
 DEFAULT_GTF = Path("data/hg38/Homo_sapiens.GRCh38.115.gtf")
+GENERAL_RUN_NAME = "General"
 
 _GTF_GENE_ID = re.compile(r'gene_id\s+"([^"]+)"')
 
@@ -198,11 +203,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="The --output-dir of a completed src/twas/run.py invocation.",
     )
     parser.add_argument(
+        "--wandb-project",
+        type=str,
+        required=True,
+        help=(
+            "WandB project. Figures and sharing statistics are logged to a new "
+            "run named 'General' under General/<gene-scope>/..."
+        ),
+    )
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        required=True,
-        help="Output figure (.png, .pdf, .svg, or another Matplotlib format).",
+        default=None,
+        help=(
+            "Optional local figure (.png, .pdf, .svg, or another Matplotlib "
+            "format). Omit to log only to WandB."
+        ),
     )
     parser.add_argument(
         "--arm",
@@ -1009,6 +1027,77 @@ def format_sharing_summary(
     )
 
 
+def _scope_key(scope: str, name: str) -> str:
+    """Namespace one metric, figure, or table under ``General/<scope>/``."""
+    return f"{GENERAL_RUN_NAME}/{scope}/{name}"
+
+
+def _scope_statistics(
+    summary: Mapping[str, float],
+    intersections: pd.DataFrame,
+) -> dict[str, int | float]:
+    """Scalar sharing and intersection counts for one gene-scope plot."""
+    n_available = intersections.attrs.get("n_available", len(intersections))
+    return {
+        "n_hits": int(summary["n_hits"]),
+        "n_cell_types": int(summary["n_cell_types"]),
+        "n_shared_all": int(summary["n_shared_all"]),
+        "pct_shared_all": float(summary["pct_shared_all"]),
+        "n_shared_at_least_two": int(summary["n_shared_at_least_two"]),
+        "pct_shared_at_least_two": float(summary["pct_shared_at_least_two"]),
+        "n_single": int(summary["n_single"]),
+        "pct_single": float(summary["pct_single"]),
+        "n_intersections_shown": int(len(intersections)),
+        "n_intersections_available": int(n_available),
+    }
+
+
+def _set_size_table(gene_sets: Mapping[str, set[str]]) -> pd.DataFrame:
+    """One row per displayed cell type with its candidate-gene count."""
+    return pd.DataFrame(
+        [
+            {"cell_type": name, "n_genes": len(genes)}
+            for name, genes in gene_sets.items()
+        ]
+    )
+
+
+def _intersection_table(intersections: pd.DataFrame) -> pd.DataFrame:
+    """Serialize exact intersections for a WandB table."""
+    rows = []
+    for _, row in intersections.iterrows():
+        members = sorted(row["members"], key=str.casefold)
+        rows.append(
+            {
+                "members": " ∩ ".join(members),
+                "n_members": int(row["degree"]),
+                "n_genes": int(row["size"]),
+            }
+        )
+    return pd.DataFrame(rows, columns=["members", "n_members", "n_genes"])
+
+
+def _wandb_config(args: argparse.Namespace) -> dict:
+    """Record the analysis settings on the General run."""
+    return {
+        "arm": args.arm,
+        "criterion": args.criterion,
+        "combination": args.combination,
+        "min_agreement": args.min_agreement,
+        "group_onek1k": args.group_onek1k,
+        "alpha": args.alpha,
+        "gene_scope": list(args.gene_scope),
+        "gtf": str(args.gtf),
+        "mhc_region": args.mhc_region,
+        "cell_types": list(args.cell_types) if args.cell_types else None,
+        "min_intersection_size": args.min_intersection_size,
+        "max_intersections": args.max_intersections,
+        "sort_intersections": args.sort_intersections,
+        "sort_sets": args.sort_sets,
+        "input_dir": str(args.input_dir),
+    }
+
+
 def _display_name(name: str) -> str:
     return name.replace("_", " ")
 
@@ -1225,7 +1314,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.gtf,
                 )
 
-        args.output.parent.mkdir(parents=True, exist_ok=True)
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+
+        figures: dict[str, Figure] = {}
+        wandb_summary: dict[str, int | float] = {}
+        tables: dict[str, pd.DataFrame] = {}
+        hit_kind = (
+            "E[z] TWAS hits"
+            if args.combination == "expectation"
+            else "TWAS hits"
+        )
+
         for scope in scopes:
             gene_sets = filter_gene_sets_by_scope(
                 base_gene_sets, scope, mhc_gene_ids
@@ -1242,36 +1342,55 @@ def main(argv: Sequence[str] | None = None) -> None:
                 intersections,
                 title=args.title,
             )
-            output = output_for_scope(
-                args.output, scope, multiple_outputs
+            sharing = sharing_summary(gene_sets)
+            stats = _scope_statistics(sharing, intersections)
+            figures[_scope_key(scope, "upset")] = figure
+            wandb_summary.update(
+                {_scope_key(scope, name): value for name, value in stats.items()}
             )
-            figure.savefig(output, dpi=args.dpi, bbox_inches="tight")
-            plt.close(figure)
+            tables[_scope_key(scope, "set_sizes")] = _set_size_table(gene_sets)
+            tables[_scope_key(scope, "intersections")] = _intersection_table(
+                intersections
+            )
 
-            summary = sharing_summary(gene_sets)
-            hit_kind = (
-                "E[z] TWAS hits"
-                if args.combination == "expectation"
-                else "TWAS hits"
-            )
-            sentence = format_sharing_summary(summary, hit_kind=hit_kind)
-            stats_path = output.with_suffix(".txt")
-            stats_path.write_text(sentence + "\n", encoding="utf-8")
-            n_available = intersections.attrs.get(
-                "n_available", len(intersections)
-            )
+            if args.output is not None:
+                output = output_for_scope(
+                    args.output, scope, multiple_outputs
+                )
+                figure.savefig(output, dpi=args.dpi, bbox_inches="tight")
+                logging.info("Wrote %s [%s].", output, scope)
+
+            sentence = format_sharing_summary(sharing, hit_kind=hit_kind)
             logging.info(
-                "Wrote %s [%s] (%d cell types, %d candidate genes, %d of %d "
-                "intersections shown).",
-                output,
+                "%s [%s]: %d cell types, %d candidate genes, %d of %d "
+                "intersections shown.",
+                GENERAL_RUN_NAME,
                 scope,
-                summary["n_cell_types"],
-                summary["n_hits"],
-                len(intersections),
-                n_available,
+                stats["n_cell_types"],
+                stats["n_hits"],
+                stats["n_intersections_shown"],
+                stats["n_intersections_available"],
             )
             logging.info("%s", sentence)
-            logging.info("Wrote sharing summary to %s.", stats_path)
+
+        logger = TwasWandBLogger(
+            project=args.wandb_project, entity=args.wandb_entity
+        )
+        logger.start(GENERAL_RUN_NAME, config=_wandb_config(args))
+        try:
+            logger.log_results(wandb_summary, figures, tables=tables)
+            logging.info(
+                "Logged %d figure(s) and %d statistic(s) to WandB run %r "
+                "in project %s.",
+                len(figures),
+                len(wandb_summary),
+                GENERAL_RUN_NAME,
+                args.wandb_project,
+            )
+        finally:
+            logger.finish()
+            for figure in figures.values():
+                plt.close(figure)
     except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as error:
         logging.error("%s", error)
         raise SystemExit(1) from error
