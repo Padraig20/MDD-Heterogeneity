@@ -4,7 +4,8 @@ The input is the directory passed to ``python -m src.twas.run --output-dir``.
 For every cell type, :mod:`src.twas.run` writes
 ``<cell type>/<arm>/results.csv``.  This script reads the significant genes
 from those tables and shows both their total count in each cell type and the
-size of every *exact* intersection retained in the plot.
+size of every *exact* intersection retained in the plot. Beside each figure it
+also writes the sharing sentence (all cell types / at least two / singleton).
 
 For example::
 
@@ -12,8 +13,20 @@ For example::
         --input-dir results/mdd \
         --output results/mdd/upset.png \
         --criterion fdr \
-        --min-agreement 80 \
-        --group-onek1k
+        --cell-types Memory_B_cell Naive_B_cell "CD4-positive alpha-beta T cell"
+
+    python -m src.twas.analysis.generate_upset_plot \
+        --input-dir results/mdd \
+        --output results/mdd/upset-expectation.png \
+        --criterion fdr \
+        --combination expectation \
+        --arm this-study
+
+    python -m src.twas.analysis.generate_upset_plot \
+        --input-dir results/mdd \
+        --output results/mdd/upset-grouped.png \
+        --group-onek1k \
+        --cell-types "B cell" "T cell" "NK cell"
 
 No UpSet-specific package is required; the figure is drawn directly with
 Matplotlib so it works with the dependencies already used by the TWAS code.
@@ -39,12 +52,13 @@ import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
-from src.twas.aggregate import benjamini_hochberg
+from src.twas.aggregate import acat_rows, benjamini_hochberg
 from src.twas.compare import normalize_cell_type
 
 
 ARMS = ("this-study", "ctPred")
 CRITERIA = ("fdr", "bonferroni")
+COMBINATIONS = ("expectation", "acat")
 SORT_INTERSECTIONS = ("degree", "cardinality")
 SORT_SETS = ("size", "name", "input")
 GENE_SCOPES = ("all", "in-mhc", "outside-mhc")
@@ -203,6 +217,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Use the corresponding significant_<criterion> column.",
     )
     parser.add_argument(
+        "--combination",
+        choices=COMBINATIONS,
+        default="acat",
+        help=(
+            "Pooled significance track when --min-agreement is omitted. "
+            "'acat' (the default) uses the Cauchy-combined per-draw p-values "
+            "from an MI TWAS (significant_<criterion>); 'expectation' uses "
+            "the E[z] flags (significant_<criterion>_expectation)."
+        ),
+    )
+    parser.add_argument(
         "--min-agreement",
         type=float,
         default=None,
@@ -304,11 +329,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--title",
         default=None,
         help="Optional title above the intersection-size bars.",
-    )
-    parser.add_argument(
-        "--panel-label",
-        default=None,
-        help="Optional publication panel label, for example C.",
     )
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -414,17 +434,24 @@ def load_gene_sets(
     result_files: Iterable[tuple[str, Path]],
     criterion: str = "fdr",
     min_agreement: float | None = None,
+    combination: str = "acat",
 ) -> dict[str, set[str]]:
     """Load candidate Ensembl gene IDs for every cell type.
 
-    Without ``min_agreement``, candidates use the pooled significance flag.
-    With it, agreement itself defines the candidates: zero has the established
-    run.py meaning of significant in at least one draw, while positive cutoffs
-    are inclusive.
+    Without ``min_agreement``, candidates use the pooled significance flag
+    (ACAT or E[z], per ``combination``). With it, agreement itself defines
+    the candidates: zero has the established run.py meaning of significant in
+    at least one draw, while positive cutoffs are inclusive. Agreement is
+    always the per-draw call, independent of ``combination``.
     """
     if min_agreement is not None and not 0 <= min_agreement <= 100:
         raise ValueError("min_agreement must be between 0 and 100")
-    significant_column = f"significant_{criterion}"
+    if combination not in COMBINATIONS:
+        raise ValueError(
+            f"Unknown combination {combination!r}; expected one of {COMBINATIONS}."
+        )
+    suffix = _combination_suffix(combination) if min_agreement is None else ""
+    significant_column = f"significant_{criterion}{suffix}"
     agreement_column = f"agreement_{criterion}"
     gene_sets: dict[str, set[str]] = {}
     for cell_type, path in result_files:
@@ -440,9 +467,17 @@ def load_gene_sets(
                 if agreement_column in missing
                 else ""
             )
+            combination_hint = (
+                " Pass --combination acat (the default) for ACAT flags, or "
+                "re-run src/twas/run.py with --model-kind mi to write E[z] "
+                "columns as significant_<criterion>_expectation."
+                if combination == "expectation" and significant_column in missing
+                else ""
+            )
             raise ValueError(
                 f"{path} is missing required column(s) {sorted(missing)}. "
-                f"Pass --criterion matching the output of run.py.{agreement_hint}"
+                f"Pass --criterion matching the output of run.py."
+                f"{agreement_hint}{combination_hint}"
             )
         if min_agreement is None:
             mask = _boolean_mask(
@@ -456,6 +491,10 @@ def load_gene_sets(
         genes = frame.loc[mask, "gene"].dropna().astype(str).str.strip()
         gene_sets[cell_type] = set(genes.loc[genes.ne("")])
     return gene_sets
+
+
+def _combination_suffix(combination: str) -> str:
+    return "_expectation" if combination == "expectation" else ""
 
 
 def _agreement_values(values: pd.Series, path: Path, column: str) -> pd.Series:
@@ -483,9 +522,10 @@ def _agreement_mask(agreement: pd.Series, percent: float) -> pd.Series:
 
 def _pvalue_series(
     path: Path,
+    pvalue_column: str = "pvalue",
 ) -> pd.Series:
     """Read one gene-indexed pooled p-value series for grouped ACAT."""
-    wanted = {"gene", "pvalue"}
+    wanted = {"gene", pvalue_column}
     frame = pd.read_csv(path, usecols=lambda name: name in wanted)
     missing = wanted - set(frame.columns)
     if missing:
@@ -499,11 +539,11 @@ def _pvalue_series(
         duplicated = genes.loc[valid_gene & genes.duplicated(keep=False)].iloc[0]
         raise ValueError(f"{path}: duplicate gene identifier {duplicated!r}.")
 
-    pvalues = pd.to_numeric(frame["pvalue"], errors="coerce")
-    invalid = frame["pvalue"].notna() & pvalues.isna()
+    pvalues = pd.to_numeric(frame[pvalue_column], errors="coerce")
+    invalid = frame[pvalue_column].notna() & pvalues.isna()
     if bool(invalid.any()):
-        examples = frame.loc[invalid, "pvalue"].astype(str).unique().tolist()[:5]
-        raise ValueError(f"{path}: 'pvalue' is not numeric: {examples}")
+        examples = frame.loc[invalid, pvalue_column].astype(str).unique().tolist()[:5]
+        raise ValueError(f"{path}: {pvalue_column!r} is not numeric: {examples}")
     outside = pvalues.notna() & ~pvalues.between(0.0, 1.0)
     if bool(outside.any()):
         examples = pvalues.loc[outside].unique().tolist()[:5]
@@ -512,30 +552,6 @@ def _pvalue_series(
     pvalues = pvalues.loc[valid_gene].copy()
     pvalues.index = genes.loc[valid_gene].astype(str)
     return pvalues
-
-
-def acat(pvalues: Sequence[float]) -> float:
-    """Combine available p-values with the equal-weight ACAT statistic."""
-    values = np.asarray(pvalues, dtype=float)
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return float("nan")
-    if np.any((values < 0.0) | (values > 1.0)):
-        raise ValueError("ACAT p-values must be between 0 and 1")
-    if np.any(values == 0.0):
-        return 0.0
-    if np.all(values == 1.0):
-        return 1.0
-
-    with np.errstate(over="ignore", invalid="ignore"):
-        statistic = float(np.mean(np.tan((0.5 - values) * np.pi)))
-    # atan loses relative precision in the far positive tail. The Cauchy tail
-    # approximation is effectively exact there and preserves tiny p-values.
-    if statistic > 1e15:
-        return float(1.0 / (np.pi * statistic))
-    if statistic < -1e15:
-        return 1.0
-    return float(np.clip(0.5 - np.arctan(statistic) / np.pi, 0.0, 1.0))
 
 
 def _call_combined_genes(
@@ -606,32 +622,6 @@ def _per_draw_pvalue_series(results_path: Path) -> pd.Series:
     return pvalues
 
 
-def _acat_rows(pvalue_matrix: pd.DataFrame) -> pd.Series:
-    """Vectorized equal-weight ACAT over the finite values of each row."""
-    values = pvalue_matrix.to_numpy(dtype=float)
-    finite = np.isfinite(values)
-    counts = finite.sum(axis=1)
-    transformed = np.zeros_like(values)
-    with np.errstate(over="ignore", invalid="ignore"):
-        transformed[finite] = np.tan((0.5 - values[finite]) * np.pi)
-        statistics = np.divide(
-            transformed.sum(axis=1),
-            counts,
-            out=np.full(len(values), np.nan),
-            where=counts > 0,
-        )
-        combined = 0.5 - np.arctan(statistics) / np.pi
-    large = statistics > 1e15
-    combined[large] = 1.0 / (np.pi * statistics[large])
-    combined[np.any((values == 0.0) & finite, axis=1)] = 0.0
-    combined[counts == 0] = np.nan
-    return pd.Series(
-        np.clip(combined, 0.0, 1.0),
-        index=pvalue_matrix.index,
-        name="pvalue",
-    )
-
-
 def _grouped_mi_gene_set(
     members: Sequence[tuple[str, Path]],
     criterion: str,
@@ -643,7 +633,7 @@ def _grouped_mi_gene_set(
         cell_type: _per_draw_pvalue_series(path)
         for cell_type, path in members
     }
-    combined = _acat_rows(pd.concat(columns, axis=1)).dropna()
+    combined = acat_rows(pd.concat(columns, axis=1)).dropna()
     calls: list[pd.DataFrame] = []
     for _, draw_values in combined.groupby(level="draw", sort=False):
         significant = _significant_pvalue_mask(draw_values, criterion, alpha)
@@ -667,19 +657,25 @@ def group_onek1k_gene_sets(
     criterion: str = "fdr",
     min_agreement: float | None = None,
     alpha: float = 0.05,
+    combination: str = "acat",
 ) -> dict[str, set[str]]:
     """Collapse fine OneK1K results to scPrediXcan's 12 ontology groups.
 
-    Without an agreement cutoff, multi-subtype pooled p-values are combined by
-    ACAT and significance is recalculated at ``alpha``. With a cutoff, ACAT and
-    multiple-testing correction are performed separately within each MI draw;
-    candidates are then defined by the resulting group-level agreement. A
-    single-member group reads the equivalent calls already written by run.py.
+    Without an agreement cutoff, multi-subtype pooled p-values (ACAT or E[z],
+    per ``combination``) are combined by ACAT and significance is recalculated
+    at ``alpha``. With a cutoff, ACAT and multiple-testing correction are
+    performed separately within each MI draw; candidates are then defined by
+    the resulting group-level agreement. A single-member group reads the
+    equivalent calls already written by run.py.
     """
     if min_agreement is not None and not 0 <= min_agreement <= 100:
         raise ValueError("min_agreement must be between 0 and 100")
     if not 0 < alpha < 1:
         raise ValueError("alpha must be strictly between 0 and 1")
+    if combination not in COMBINATIONS:
+        raise ValueError(
+            f"Unknown combination {combination!r}; expected one of {COMBINATIONS}."
+        )
     by_key: dict[str, tuple[str, Path]] = {}
     for item in result_files:
         key = _onek1k_key(item[0])
@@ -728,6 +724,7 @@ def group_onek1k_gene_sets(
                 members,
                 criterion=criterion,
                 min_agreement=min_agreement,
+                combination=combination,
             )[members[0][0]]
             logging.info(
                 "%s: %d candidate genes from %s.",
@@ -738,11 +735,14 @@ def group_onek1k_gene_sets(
             continue
 
         if min_agreement is None:
+            pvalue_column = (
+                "pvalue_expectation" if combination == "expectation" else "pvalue"
+            )
             columns = {
-                cell_type: _pvalue_series(path)
+                cell_type: _pvalue_series(path, pvalue_column=pvalue_column)
                 for cell_type, path in members
             }
-            combined = _acat_rows(pd.concat(columns, axis=1))
+            combined = acat_rows(pd.concat(columns, axis=1))
             grouped[group_name] = _call_combined_genes(
                 combined, criterion, alpha
             )
@@ -959,6 +959,56 @@ def compute_intersections(
     return result
 
 
+def sharing_summary(gene_sets: Mapping[str, set[str]]) -> dict:
+    """Count unique hits by how many displayed cell types they appear in."""
+    n_cell_types = len(gene_sets)
+    all_genes: set[str] = set().union(*gene_sets.values()) if gene_sets else set()
+    n_hits = len(all_genes)
+    n_shared_all = n_shared_at_least_two = n_single = 0
+    for gene in all_genes:
+        degree = sum(gene in genes for genes in gene_sets.values())
+        if degree >= 2:
+            n_shared_at_least_two += 1
+        if n_cell_types and degree == n_cell_types:
+            n_shared_all += 1
+        if degree == 1:
+            n_single += 1
+
+    def percent(count: int) -> float:
+        return 100.0 * count / n_hits if n_hits else 0.0
+
+    return {
+        "n_hits": n_hits,
+        "n_cell_types": n_cell_types,
+        "n_shared_all": n_shared_all,
+        "pct_shared_all": percent(n_shared_all),
+        "n_shared_at_least_two": n_shared_at_least_two,
+        "pct_shared_at_least_two": percent(n_shared_at_least_two),
+        "n_single": n_single,
+        "pct_single": percent(n_single),
+    }
+
+
+def format_sharing_summary(
+    summary: Mapping[str, float],
+    *,
+    hit_kind: str = "TWAS hits",
+) -> str:
+    """The scPrediXcan-style sharing sentence for one UpSet gene universe."""
+    noun = "cell type" if summary["n_cell_types"] == 1 else "cell types"
+    return (
+        f"Among {int(summary['n_hits']):,} {hit_kind} from the "
+        f"{int(summary['n_cell_types']):,} {noun}, "
+        f"{int(summary['n_shared_all']):,} ({summary['pct_shared_all']:.1f}%) "
+        f"genes are shared in all cell types, "
+        f"{int(summary['n_shared_at_least_two']):,} "
+        f"({summary['pct_shared_at_least_two']:.1f}%) genes are shared in at "
+        f"least two cell types, and {int(summary['n_single']):,} "
+        f"({summary['pct_single']:.1f}%) genes yield significance in a single "
+        f"cell type."
+    )
+
+
 def _display_name(name: str) -> str:
     return name.replace("_", " ")
 
@@ -968,7 +1018,6 @@ def plot_upset(
     intersections: pd.DataFrame,
     *,
     title: str | None = None,
-    panel_label: str | None = None,
 ) -> Figure:
     """Draw the set-size bars, intersection bars, and membership matrix."""
     names = list(gene_sets)
@@ -1099,16 +1148,6 @@ def plot_upset(
     labels.set_ylim(n_sets - 0.5, -0.5)
     set_sizes.set_ylim(n_sets - 0.5, -0.5)
 
-    if panel_label:
-        figure.text(
-            0.018,
-            0.975,
-            panel_label,
-            ha="left",
-            va="top",
-            fontsize=25,
-            fontweight="bold",
-        )
     figure.subplots_adjust(left=0.04, right=0.99, top=0.96, bottom=0.05)
     return figure
 
@@ -1132,6 +1171,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.criterion,
                 args.min_agreement,
             )
+    elif args.combination == "expectation":
+        logging.info(
+            "Pooled candidate rule: significant_%s_expectation (E[z] p-values).",
+            args.criterion,
+        )
+    else:
+        logging.info(
+            "Pooled candidate rule: significant_%s (ACAT-combined MI p-values).",
+            args.criterion,
+        )
     try:
         if args.group_onek1k:
             files = discover_result_files(args.input_dir, args.arm)
@@ -1140,6 +1189,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 criterion=args.criterion,
                 min_agreement=args.min_agreement,
                 alpha=args.alpha,
+                combination=args.combination,
             )
             base_gene_sets = select_gene_sets(
                 base_gene_sets, args.cell_types
@@ -1152,6 +1202,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 files,
                 criterion=args.criterion,
                 min_agreement=args.min_agreement,
+                combination=args.combination,
             )
         scopes = list(dict.fromkeys(args.gene_scope))
         multiple_outputs = len(scopes) > 1
@@ -1190,7 +1241,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 gene_sets,
                 intersections,
                 title=args.title,
-                panel_label=args.panel_label,
             )
             output = output_for_scope(
                 args.output, scope, multiple_outputs
@@ -1198,7 +1248,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             figure.savefig(output, dpi=args.dpi, bbox_inches="tight")
             plt.close(figure)
 
-            total_genes = len(set().union(*gene_sets.values()))
+            summary = sharing_summary(gene_sets)
+            hit_kind = (
+                "E[z] TWAS hits"
+                if args.combination == "expectation"
+                else "TWAS hits"
+            )
+            sentence = format_sharing_summary(summary, hit_kind=hit_kind)
+            stats_path = output.with_suffix(".txt")
+            stats_path.write_text(sentence + "\n", encoding="utf-8")
             n_available = intersections.attrs.get(
                 "n_available", len(intersections)
             )
@@ -1207,11 +1265,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "intersections shown).",
                 output,
                 scope,
-                len(gene_sets),
-                total_genes,
+                summary["n_cell_types"],
+                summary["n_hits"],
                 len(intersections),
                 n_available,
             )
+            logging.info("%s", sentence)
+            logging.info("Wrote sharing summary to %s.", stats_path)
     except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as error:
         logging.error("%s", error)
         raise SystemExit(1) from error

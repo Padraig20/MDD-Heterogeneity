@@ -20,8 +20,13 @@ the natural point summary.
 A caveat worth keeping in mind when reading the numbers: the draws are
 bootstrap refits of one cohort and are therefore strongly correlated, so
 `zscore_var` measures how *stable* a gene's association is across fits, not the
-sampling variance of an estimator. The reported p-value comes from `E[z]` alone
-and does not absorb that spread, which makes it anti-conservative.
+sampling variance of an estimator. The two-sided tail of `E[z]` alone does not
+absorb that spread, which makes it anti-conservative.
+
+An MI run therefore combines the per-draw p-values with the Cauchy combination
+test (ACAT; Liu and Xie 2020) and reports that as the primary `pvalue`. ACAT is
+valid under arbitrary dependence. The `E[z]` p-value is kept beside it as
+`pvalue_expectation`, nested under `expectation/` in summaries and figures.
 """
 
 # The columns S-PrediXcan emits (see `MetaxcanUtilities._results_column_order`).
@@ -60,19 +65,87 @@ def benjamini_hochberg(pvalues: Sequence[float]) -> np.ndarray:
 
 
 def annotate_significance(
-    frame: pd.DataFrame, fdr: float = 0.05, pvalue_column: str = "pvalue"
+    frame: pd.DataFrame,
+    fdr: float = 0.05,
+    pvalue_column: str = "pvalue",
+    suffix: str = "",
+    *,
+    sort: Optional[bool] = None,
 ) -> pd.DataFrame:
-    """Add BH q-values plus Bonferroni threshold/flag over the tested genes."""
+    """Add BH q-values plus Bonferroni threshold/flag over the tested genes.
+
+    `suffix` writes a parallel track (`qvalue_expectation`,
+    `significant_fdr_expectation`, ...) without touching the primary columns.
+    Sorting follows `pvalue_column` unless `sort` is set; a suffix defaults to
+    leaving row order alone so the primary (ACAT, on an MI run) ranking is
+    preserved.
+    """
     frame = frame.copy()
     pvalues = frame[pvalue_column].to_numpy(dtype=float)
     n_tested = int(np.isfinite(pvalues).sum())
 
-    frame["qvalue"] = benjamini_hochberg(pvalues)
-    frame["significant_fdr"] = frame["qvalue"] < fdr
+    frame[f"qvalue{suffix}"] = benjamini_hochberg(pvalues)
+    frame[f"significant_fdr{suffix}"] = frame[f"qvalue{suffix}"] < fdr
     bonferroni = 0.05 / n_tested if n_tested else np.nan
-    frame["bonferroni_threshold"] = bonferroni
-    frame["significant_bonferroni"] = pvalues < bonferroni
+    frame[f"bonferroni_threshold{suffix}"] = bonferroni
+    frame[f"significant_bonferroni{suffix}"] = pvalues < bonferroni
+    if sort is None:
+        sort = not suffix
+    if not sort:
+        return frame
     return frame.sort_values(pvalue_column, na_position="last").reset_index(drop=True)
+
+
+# tan((0.5-p)π) loses all digits once p is near the ulp of 0.5 (~1e-16) and
+# saturates at tan(π/2). Liu and Xie 2020 replace it with 1/(pπ) below this.
+ACAT_SMALL_P = 1e-15
+
+
+def acat(pvalues: Sequence[float]) -> float:
+    """Combine available p-values with the equal-weight ACAT statistic."""
+    values = np.asarray(pvalues, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return float("nan")
+    return float(acat_rows(pd.DataFrame([values])).iloc[0])
+
+
+def acat_rows(pvalue_matrix: pd.DataFrame) -> pd.Series:
+    """Vectorized equal-weight ACAT over the finite values of each row."""
+    values = pvalue_matrix.to_numpy(dtype=float)
+    finite = np.isfinite(values)
+    if np.any(((values < 0.0) | (values > 1.0)) & finite):
+        raise ValueError("ACAT p-values must be between 0 and 1")
+    counts = finite.sum(axis=1)
+    transformed = np.zeros_like(values)
+    pvalues = values[finite]
+    small = pvalues < ACAT_SMALL_P
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        trans = np.empty_like(pvalues)
+        trans[~small] = np.tan((0.5 - pvalues[~small]) * np.pi)
+        trans[small] = 1.0 / (pvalues[small] * np.pi)
+        transformed[finite] = trans
+        statistics = np.divide(
+            transformed.sum(axis=1),
+            counts,
+            out=np.full(len(values), np.nan),
+            where=counts > 0,
+        )
+        combined = 0.5 - np.arctan(statistics) / np.pi
+    large = statistics > 1e15
+    combined[large] = 1.0 / (np.pi * statistics[large])
+    small_stat = statistics < -1e15
+    combined[small_stat] = 1.0
+    # atan of +inf is imprecise; a single exact 0 dominates the combination.
+    combined[np.any((values == 0.0) & finite, axis=1)] = 0.0
+    all_ones = (counts > 0) & np.all((~finite) | (values == 1.0), axis=1)
+    combined[all_ones] = 1.0
+    combined[counts == 0] = np.nan
+    return pd.Series(
+        np.clip(combined, 0.0, 1.0),
+        index=pvalue_matrix.index,
+        name="pvalue",
+    )
 
 
 def genomic_inflation(pvalues: Sequence[float]) -> float:
@@ -101,8 +174,12 @@ def aggregate_draws(
     frame the MI figures are drawn from.
 
     `zscore_var` is only reported for genes that come out significant under
-    `E[z]`; for everything else the spread of a null association is not a
-    number worth reading, so it is left as NA.
+    `E[z]` or ACAT FDR; for everything else the spread of a null association
+    is not a number worth reading, so it is left as NA.
+
+    `pvalue` combines the per-draw p-values with equal-weight ACAT. The
+    two-sided tail of `E[z]` is written as `pvalue_expectation` and corrected
+    separately. `zscore` remains `E[z]`.
     """
     if not per_draw:
         raise ValueError("No draws to aggregate.")
@@ -168,7 +245,7 @@ def aggregate_draws(
 
     zscores = aggregated["zscore_mean"].to_numpy(dtype=float)
     aggregated["zscore"] = zscores
-    aggregated["pvalue"] = 2.0 * norm.sf(np.abs(zscores))
+    ez_pvalue = 2.0 * norm.sf(np.abs(zscores))
     if "effect_size_mean" in aggregated.columns:
         aggregated["effect_size"] = aggregated["effect_size_mean"]
 
@@ -176,12 +253,29 @@ def aggregate_draws(
     aggregated["zscore_ci_low"] = zscores - Z_CI_MULTIPLIER * sds
     aggregated["zscore_ci_high"] = zscores + Z_CI_MULTIPLIER * sds
 
-    aggregated = annotate_significance(aggregated, fdr=fdr)
+    if "pvalue" in long.columns:
+        pvalue_matrix = long.pivot_table(
+            index="gene", columns="draw", values="pvalue", aggfunc="first"
+        )
+        aggregated["pvalue"] = aggregated["gene"].map(acat_rows(pvalue_matrix))
+        aggregated["pvalue_expectation"] = ez_pvalue
+        aggregated = annotate_significance(aggregated, fdr=fdr)
+        aggregated = annotate_significance(
+            aggregated,
+            fdr=fdr,
+            pvalue_column="pvalue_expectation",
+            suffix="_expectation",
+        )
+    else:
+        aggregated["pvalue"] = ez_pvalue
+        aggregated = annotate_significance(aggregated, fdr=fdr)
 
-    # Report the between-fit spread only where the expectation is significant.
-    insignificant = ~aggregated["significant_fdr"].fillna(False)
+    # Report the between-fit spread where either pooled call is FDR-significant.
+    fdr_hit = aggregated["significant_fdr"].fillna(False)
+    if "significant_fdr_expectation" in aggregated.columns:
+        fdr_hit = fdr_hit | aggregated["significant_fdr_expectation"].fillna(False)
     for column in ("zscore_var", "zscore_sd", "zscore_ci_low", "zscore_ci_high"):
-        aggregated.loc[insignificant, column] = np.nan
+        aggregated.loc[~fdr_hit, column] = np.nan
 
     ordered = [
         "gene",
@@ -189,6 +283,8 @@ def aggregate_draws(
         "zscore",
         "pvalue",
         "qvalue",
+        "pvalue_expectation",
+        "qvalue_expectation",
         "effect_size",
         "zscore_var",
         "zscore_sd",
@@ -207,6 +303,9 @@ def aggregate_draws(
         "significant_fdr",
         "significant_bonferroni",
         "bonferroni_threshold",
+        "significant_fdr_expectation",
+        "significant_bonferroni_expectation",
+        "bonferroni_threshold_expectation",
     ]
     aggregated = aggregated[[c for c in ordered if c in aggregated.columns]]
     return aggregated, long
@@ -406,7 +505,31 @@ def summarize(
             summary["max_zscore_sd_significant"] = float(np.nanmax(sds))
     if extra:
         summary.update(extra)
+    summary.update(_prefix(_expectation_summary(frame), "expectation"))
     return summary
+
+
+def _expectation_summary(frame: pd.DataFrame) -> dict:
+    """FDR/Bonferroni counts and inflation for the E[z] p-values."""
+    if "pvalue_expectation" not in frame.columns:
+        return {}
+    pvalues = frame["pvalue_expectation"].to_numpy(dtype=float)
+    tested = int(np.isfinite(pvalues).sum())
+    return {
+        "n_significant_fdr": int(
+            frame.get("significant_fdr_expectation", pd.Series(dtype=bool)).sum()
+        ),
+        "n_significant_bonferroni": int(
+            frame.get("significant_bonferroni_expectation", pd.Series(dtype=bool)).sum()
+        ),
+        "lambda_gc": genomic_inflation(pvalues),
+        "min_pvalue": float(np.nanmin(pvalues)) if tested else float("nan"),
+    }
+
+
+def _prefix(mapping: dict, section: str) -> dict:
+    """Nest keys under a section, which is what groups them in WandB."""
+    return {f"{section}/{key}": value for key, value in mapping.items()}
 
 
 def _present(frame: pd.DataFrame, columns: Sequence[str]) -> list[str]:
@@ -415,6 +538,8 @@ def _present(frame: pd.DataFrame, columns: Sequence[str]) -> list[str]:
 
 __all__ = [
     "AGREEMENT_THRESHOLDS",
+    "acat",
+    "acat_rows",
     "aggregate_draws",
     "agreement_strata",
     "agreement_summary",

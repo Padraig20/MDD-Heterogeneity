@@ -288,7 +288,9 @@ def matched_pvalues(
         columns = [
             c for c in
             ("gene", "gene_name", "zscore", "pvalue", "qvalue", "effect_size",
-             "n_snps_used", "significant_fdr", "significant_bonferroni")
+             "n_snps_used", "significant_fdr", "significant_bonferroni",
+             "pvalue_expectation", "qvalue_expectation",
+             "significant_fdr_expectation", "significant_bonferroni_expectation")
             if c in frame.columns
         ]
         subset = frame[columns].copy()
@@ -397,24 +399,19 @@ def comparison_metrics(
 
     `effect_size` is deliberately absent: it carries the units of the
     distillation target, and ctPred's percentile target is not our log target.
+
+    When both arms carry E[z] columns (an MI run on each side), the same
+    overlap statistics are also reported under `expectation/` for the
+    two-sided tail of E[z]. The unsuffixed overlap is the ACAT call.
     """
     ours_suffix, theirs_suffix = suffixes
     statistics: dict = {"n_genes_shared": int(len(matched))}
-
-    for criterion in ("fdr", "bonferroni"):
-        ours_column = f"significant_{criterion}{ours_suffix}"
-        theirs_column = f"significant_{criterion}{theirs_suffix}"
-        if ours_column not in matched.columns or theirs_column not in matched.columns:
-            continue
-        mine = matched[ours_column].fillna(False)
-        yours = matched[theirs_column].fillna(False)
-        statistics[f"{criterion}_both"] = int((mine & yours).sum())
-        statistics[f"{criterion}_ours_only"] = int((mine & ~yours).sum())
-        statistics[f"{criterion}_ctpred_only"] = int((~mine & yours).sum())
-        union = int((mine | yours).sum())
-        statistics[f"{criterion}_jaccard"] = (
-            statistics[f"{criterion}_both"] / union if union else float("nan")
-        )
+    statistics.update(_hit_overlap(matched, suffixes, flag_suffix=""))
+    expectation_overlap = _hit_overlap(matched, suffixes, flag_suffix="_expectation")
+    if expectation_overlap:
+        statistics.update({
+            f"expectation/{key}": value for key, value in expectation_overlap.items()
+        })
 
     for suffix, side in ((ours_suffix, "ours"), (theirs_suffix, "ctpred")):
         column = f"zscore{suffix}"
@@ -427,6 +424,48 @@ def comparison_metrics(
         pair = matched[[left, right]].dropna()
         if len(pair) > 2:
             statistics["zscore_correlation"] = float(pair[left].corr(pair[right]))
+
+    p_left, p_right = f"pvalue{ours_suffix}", f"pvalue{theirs_suffix}"
+    if p_left in matched.columns and p_right in matched.columns:
+        pair = matched[[p_left, p_right]].dropna()
+        if len(pair) > 2:
+            statistics["pvalue_correlation"] = float(pair[p_left].corr(pair[p_right]))
+
+    ez_left, ez_right = (
+        f"pvalue_expectation{ours_suffix}",
+        f"pvalue_expectation{theirs_suffix}",
+    )
+    if ez_left in matched.columns and ez_right in matched.columns:
+        pair = matched[[ez_left, ez_right]].dropna()
+        if len(pair) > 2:
+            statistics["expectation/pvalue_correlation"] = float(
+                pair[ez_left].corr(pair[ez_right])
+            )
+    return statistics
+
+
+def _hit_overlap(
+    matched: pd.DataFrame,
+    suffixes: tuple[str, str],
+    flag_suffix: str = "",
+) -> dict:
+    """Jaccard and exclusive-hit counts for one pooled-call track."""
+    ours_suffix, theirs_suffix = suffixes
+    statistics: dict = {}
+    for criterion in ("fdr", "bonferroni"):
+        ours_column = f"significant_{criterion}{flag_suffix}{ours_suffix}"
+        theirs_column = f"significant_{criterion}{flag_suffix}{theirs_suffix}"
+        if ours_column not in matched.columns or theirs_column not in matched.columns:
+            continue
+        mine = matched[ours_column].fillna(False)
+        yours = matched[theirs_column].fillna(False)
+        statistics[f"{criterion}_both"] = int((mine & yours).sum())
+        statistics[f"{criterion}_ours_only"] = int((mine & ~yours).sum())
+        statistics[f"{criterion}_ctpred_only"] = int((~mine & yours).sum())
+        union = int((mine | yours).sum())
+        statistics[f"{criterion}_jaccard"] = (
+            statistics[f"{criterion}_both"] / union if union else float("nan")
+        )
     return statistics
 
 

@@ -100,7 +100,9 @@ class _GenomeLayout:
 
 
 def _genome_layout(
-    frame: pd.DataFrame, positions: dict[str, tuple[str, int]]
+    frame: pd.DataFrame,
+    positions: dict[str, tuple[str, int]],
+    pvalue_column: str = "pvalue",
 ) -> Optional[_GenomeLayout]:
     """
     Lay genes out along the genome by cis-window midpoint, or None if none of
@@ -109,7 +111,9 @@ def _genome_layout(
     Shared by the two Manhattan plots so that a gene sits at the same x in
     both, and the chromosome ticks line up between them.
     """
-    data = frame.dropna(subset=["pvalue"]).copy()
+    if pvalue_column not in frame.columns:
+        return None
+    data = frame.dropna(subset=[pvalue_column]).copy()
     data["chrom"] = data["gene"].map(lambda gene: positions.get(gene, (None, None))[0])
     data["bp"] = data["gene"].map(lambda gene: positions.get(gene, (None, None))[1])
     data = data.dropna(subset=["chrom", "bp"])
@@ -194,12 +198,31 @@ def _finish_manhattan(
     return fig
 
 
-GENE_SETS = ("expectation", "all", "any")
+GENE_SETS = ("expectation", "acat", "all", "any")
 GENE_SET_TITLES = {
     "expectation": "E[z] significant",
+    "acat": "ACAT significant",
     "all": "significant in every MI fit",
     "any": "significant in at least one MI fit",
 }
+
+
+def _significance_suffix(gene_set: str) -> str:
+    """Column suffix for the pooled-call track a gene set is drawn from."""
+    return "_expectation" if gene_set.lower() == "expectation" else ""
+
+
+def _track_pvalue_column(gene_set: str) -> str:
+    """Pooled p-value column that belongs with `gene_set`."""
+    return "pvalue_expectation" if gene_set.lower() == "expectation" else "pvalue"
+
+
+def _acat_neg_log10(data: pd.DataFrame, rows: list) -> np.ndarray:
+    """ACAT-combined -log10 p for selected genes, or NaN where it is missing."""
+    if "pvalue" not in data.columns or not rows:
+        return np.full(len(rows), np.nan)
+    values = np.asarray([data.at[row, "pvalue"] for row in rows], dtype=float)
+    return _neg_log10(values)
 
 
 def _gene_set_mask(
@@ -208,18 +231,21 @@ def _gene_set_mask(
     """
     Which genes a Manhattan boxplot is drawn for.
 
-    `expectation` is the call on E[z] -- what the ordinary TWAS table reports.
-    `all` / `any` are the two ends of the MI agreement: every member-bootstrap
-    fit independently significant, or at least one. Those two are only defined
-    when the agreement columns are present, i.e. after an MI aggregation.
+    `acat` is the call on the Cauchy-combined per-draw p-values -- what the
+    ordinary MI TWAS table reports. `expectation` is the same FDR/Bonferroni
+    call on E[z]. `all` / `any` are the two ends of the MI agreement: every
+    member-bootstrap fit independently significant, or at least one. Those two
+    are only defined when the agreement columns are present, i.e. after an MI
+    aggregation.
     """
     gene_set = gene_set.lower()
     if gene_set not in GENE_SETS:
         raise ValueError(
             f"Unknown gene set {gene_set!r}; expected one of {GENE_SETS}."
         )
-    if gene_set == "expectation":
-        flags = data.get(f"significant_{criterion}")
+    if gene_set in ("expectation", "acat"):
+        suffix = _significance_suffix(gene_set)
+        flags = data.get(f"significant_{criterion}{suffix}")
         if flags is None:
             return None
         return flags.fillna(False).to_numpy(dtype=bool)
@@ -301,21 +327,36 @@ def _draw_ld_block_braces(
     return True
 
 
-def _significance_lines(data: pd.DataFrame, fdr: float) -> list[tuple]:
+def _significance_lines(
+    data: pd.DataFrame, fdr: float, suffix: str = ""
+) -> list[tuple]:
     """The Bonferroni and BH threshold lines, as `(y, colour, style, label)`."""
     lines = []
-    if "bonferroni_threshold" in data.columns:
-        threshold = data["bonferroni_threshold"].dropna()
+    threshold_column = f"bonferroni_threshold{suffix}"
+    if threshold_column in data.columns:
+        threshold = data[threshold_column].dropna()
         if not threshold.empty:
+            label = (
+                "E[z] Bonferroni (0.05)"
+                if suffix == "_expectation"
+                else "Bonferroni (0.05)"
+            )
             lines.append((
                 -np.log10(float(threshold.iloc[0])),
-                "firebrick", "--", "Bonferroni (0.05)",
+                "firebrick", "--", label,
             ))
-    significant = data[data.get("significant_fdr", False) == True]  # noqa: E712
+    flags = data.get(f"significant_fdr{suffix}", False)
+    significant = data[flags == True]  # noqa: E712
     if not significant.empty:
+        pvalue_column = (
+            f"pvalue{suffix}" if f"pvalue{suffix}" in significant.columns else "pvalue"
+        )
+        fdr_label = (
+            f"E[z] BH FDR {fdr:g}" if suffix == "_expectation" else f"BH FDR {fdr:g}"
+        )
         lines.append((
-            float(_neg_log10(significant["pvalue"].to_numpy(dtype=float)).min()),
-            "steelblue", ":", f"BH FDR {fdr:g}",
+            float(_neg_log10(significant[pvalue_column].to_numpy(dtype=float)).min()),
+            "steelblue", ":", fdr_label,
         ))
     return lines
 
@@ -328,6 +369,8 @@ def manhattan(
     label_top: int = 10,
     y_break: Optional[tuple[float, float]] = None,
     allow_y_break: bool = True,
+    pvalue_column: str = "pvalue",
+    significance_suffix: str = "",
 ) -> Optional[plt.Figure]:
     """
     Gene-level Manhattan plot, using each gene's cis-window midpoint in the LD
@@ -338,13 +381,13 @@ def manhattan(
     `(low, high)` as `y_break` to place the cut by hand, or `allow_y_break=False`
     for a plain continuous axis.
     """
-    layout = _genome_layout(frame, positions)
+    layout = _genome_layout(frame, positions, pvalue_column=pvalue_column)
     if layout is None:
         return None
     data, x = layout.data, layout.x
 
-    y = _neg_log10(data["pvalue"].to_numpy(dtype=float))
-    lines = _significance_lines(data, fdr)
+    y = _neg_log10(data[pvalue_column].to_numpy(dtype=float))
+    lines = _significance_lines(data, fdr, suffix=significance_suffix)
     fig, upper, lower, axes, y_break = _setup_manhattan_axes(
         y, lines, y_break, allow_y_break, figsize=(12, 5)
     )
@@ -362,7 +405,7 @@ def manhattan(
             ax.axhline(value, color=color, linestyle=style, linewidth=1, label=label)
 
     if label_top:
-        top = data.nsmallest(label_top, "pvalue")
+        top = data.nsmallest(label_top, pvalue_column)
         for row_index, row in top.iterrows():
             # Annotate on whichever side of the break the gene actually landed.
             target = (
@@ -377,9 +420,10 @@ def manhattan(
                 ha="center",
             )
 
+    track = "E[z] " if significance_suffix == "_expectation" else ""
     return _finish_manhattan(
         fig, upper, lower, layout, y_break, float(np.nanmax(y)),
-        f"{cell_type} — S-PrediXcan gene-level association",
+        f"{cell_type} — {track}S-PrediXcan gene-level association",
     )
 
 
@@ -389,7 +433,7 @@ def manhattan_boxplots(
     cell_type: str,
     fdr: float = 0.05,
     criterion: str = "fdr",
-    gene_set: str = "expectation",
+    gene_set: str = "acat",
     y_break: Optional[tuple[float, float]] = None,
     allow_y_break: bool = True,
 ) -> Optional[plt.Figure]:
@@ -397,10 +441,11 @@ def manhattan_boxplots(
     The Manhattan layout, but each selected gene is folded into a chromosome
     boxplot of -log10 p instead of being drawn as its own point.
 
-    `gene_set` chooses which genes go in the boxes: the E[z] call
-    (`expectation`), genes every MI fit called significant (`all`), or genes
-    at least one fit called (`any`). The last two are the two ends of the
-    agreement spectrum and only exist after an MI aggregation.
+    `gene_set` chooses which genes go in the boxes: the ACAT-combined call
+    (`acat`), the E[z] call (`expectation`), genes every MI fit called
+    significant (`all`), or genes at least one fit called (`any`).
+    The last two are the two ends of the agreement spectrum and only exist
+    after an MI aggregation.
 
     A cloud of hits at one locus is hard to read as dots -- they stack, and the
     only thing the eye takes away is that the chromosome is busy. The box shows
@@ -412,7 +457,8 @@ def manhattan_boxplots(
     Positions and chromosome ticks come from the same layout as `manhattan`,
     so the figures overlay.
     """
-    layout = _genome_layout(frame, positions)
+    pvalue_column = _track_pvalue_column(gene_set)
+    layout = _genome_layout(frame, positions, pvalue_column=pvalue_column)
     if layout is None:
         return None
     data, x = layout.data, layout.x
@@ -427,7 +473,7 @@ def manhattan_boxplots(
         )
         return None
 
-    background = _neg_log10(data["pvalue"].to_numpy(dtype=float))
+    background = _neg_log10(data[pvalue_column].to_numpy(dtype=float))
     boxes, box_x, box_colors = [], [], []
     for index, (_, block) in enumerate(data.groupby("chrom_key", sort=True)):
         hit = block.index[significant[block.index]]
@@ -442,7 +488,7 @@ def manhattan_boxplots(
     stats = boxplot_stats(boxes)
     spread = np.concatenate(boxes)
     ymax = float(max(np.nanmax(spread), np.nanmax(background)))
-    lines = _significance_lines(data, fdr)
+    lines = _significance_lines(data, fdr, suffix=_significance_suffix(gene_set))
     fig, upper, lower, axes, y_break = _setup_manhattan_axes(
         spread, lines, y_break, allow_y_break, figsize=(12, 5)
     )
@@ -493,7 +539,7 @@ def manhattan_draw_boxplots(
     cell_type: str,
     fdr: float = 0.05,
     criterion: str = "fdr",
-    gene_set: str = "expectation",
+    gene_set: str = "acat",
     label_top: Optional[int] = None,
     y_break: Optional[tuple[float, float]] = None,
     allow_y_break: bool = True,
@@ -502,12 +548,13 @@ def manhattan_draw_boxplots(
     Significant genes only, evenly spaced, with names and LD-block brackets.
 
     An MI run (several p-values per gene in `long`) is drawn as a boxplot of
-    per-draw -log10 p. A single, mean, or ctPred model has one p-value and is
-    drawn as a dot. `long` may be omitted: the point estimate on `frame` is
-    used.
+    per-draw -log10 p, with the ACAT-combined p-value overlaid as a separate
+    diamond. A single, mean, or ctPred model has one p-value and is drawn as
+    a dot. `long` may be omitted: the point estimate on `frame` is used.
 
-    `gene_set` is the same choice as `manhattan_boxplots`: the E[z] call, the
-    genes every fit agreed on, or the genes any fit called.
+    `gene_set` is the same choice as `manhattan_boxplots`: the ACAT-combined
+    call, the E[z] call, the genes every fit agreed on, or the genes any fit
+    called.
     """
     if long is None or long.empty or "pvalue" not in long.columns:
         long = frame.loc[:, ["gene", "pvalue"]].dropna(subset=["pvalue"]).copy()
@@ -559,9 +606,12 @@ def manhattan_draw_boxplots(
         tick_labels.append(label.removeprefix("chr"))
 
     stats = boxplot_stats(boxes)
+    acat_y = _acat_neg_log10(data, box_rows)
     spread = np.concatenate(boxes)
+    if np.isfinite(acat_y).any():
+        spread = np.concatenate([spread, acat_y[np.isfinite(acat_y)]])
     ymax = float(np.nanmax(spread))
-    lines = _significance_lines(data, fdr)
+    lines = _significance_lines(data, fdr, suffix=_significance_suffix(gene_set))
     n_labels = len(boxes) if label_top is None else max(0, label_top)
     use_boxes = any(values.size > 1 for values in boxes)
     width_inches = float(np.clip(0.16 * len(boxes) + 8.0, 12.0, 48.0))
@@ -605,6 +655,19 @@ def manhattan_draw_boxplots(
         for value, color, style, label in lines:
             ax.axhline(value, color=color, linestyle=style, linewidth=1,
                        label=label, zorder=2)
+        if use_boxes and np.isfinite(acat_y).any():
+            finite = np.isfinite(acat_y)
+            ax.scatter(
+                box_x[finite],
+                acat_y[finite],
+                s=28,
+                marker="D",
+                color="#1f4e79",
+                edgecolor="0.10",
+                linewidth=0.4,
+                zorder=4,
+                label="ACAT" if ax is lower else None,
+            )
 
     block_ids = [
         int(data.at[row, "block_index"])
@@ -643,6 +706,8 @@ def manhattan_draw_boxplots(
         for i in order:
             row = box_rows[i]
             top = float(stats[i]["whishi"]) if use_boxes else float(point_y[i])
+            if np.isfinite(acat_y[i]):
+                top = max(top, float(acat_y[i]))
             target = (
                 upper if y_break is not None and top >= y_break[1] else lower
             )
@@ -690,9 +755,20 @@ def manhattan_draw_boxplots(
     return fig
 
 
-def qq(frame: pd.DataFrame, cell_type: str) -> Optional[plt.Figure]:
-    """QQ plot of the gene-level p-values against the uniform null."""
-    pvalues = frame["pvalue"].to_numpy(dtype=float)
+QQ_ZOOM = 8.0  # -log10 p window used to inspect calibration / larger p-values
+
+
+def qq(frame: pd.DataFrame, cell_type: str, pvalue_column: str = "pvalue") -> Optional[plt.Figure]:
+    """
+    QQ plot of gene-level p-values against the uniform null.
+
+    A few genome-wide hits stretch a single panel so far that inflation in the
+    bulk (the larger p-values) cannot be read. The figure is therefore two
+    panels: a zoom of that calibration region, and the full range.
+    """
+    if pvalue_column not in frame.columns:
+        return None
+    pvalues = frame[pvalue_column].to_numpy(dtype=float)
     pvalues = np.sort(pvalues[np.isfinite(pvalues) & (pvalues > 0)])
     if pvalues.size == 0:
         return None
@@ -701,40 +777,123 @@ def qq(frame: pd.DataFrame, cell_type: str) -> Optional[plt.Figure]:
     expected = _neg_log10((np.arange(1, n + 1) - 0.5) / n)
     observed = _neg_log10(pvalues)
     lambda_gc = genomic_inflation(pvalues)
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.scatter(expected, observed, s=6, alpha=0.6)
-    limit = float(max(expected.max(), observed.max())) * 1.05
-    ax.plot([0, limit], [0, limit], "k--", linewidth=1, label="null")
-    ax.set_xlim(0, limit)
-    ax.set_ylim(0, limit)
-    ax.set_xlabel(r"Expected $-\log_{10}$ p")
-    ax.set_ylabel(r"Observed $-\log_{10}$ p")
-    ax.set_title(f"{cell_type} — TWAS QQ")
-    ax.text(
-        0.03, 0.95,
-        f"$\\lambda_{{GC}}$ = {lambda_gc:.3f}\n{n:,} genes",
-        transform=ax.transAxes,
-        va="top",
+    track = "E[z] " if pvalue_column.endswith("_expectation") else ""
+    return _qq_two_panel(
+        expected,
+        observed,
+        title=f"{cell_type} — TWAS {track}QQ",
+        xlabel=r"Expected $-\log_{10}$ p",
+        ylabel=r"Observed $-\log_{10}$ p",
+        annotation=f"$\\lambda_{{GC}}$ = {lambda_gc:.3f}\n{n:,} genes",
+        diagonal_label="null",
     )
-    ax.legend(loc="lower right", fontsize=8)
+
+
+def _qq_two_panel(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    annotation: str,
+    diagonal_label: str = "null",
+    zoom: float = QQ_ZOOM,
+) -> Optional[plt.Figure]:
+    """Calibration zoom of the larger p-values, plus the full QQ range."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x, y = x[finite], y[finite]
+    if x.size == 0:
+        return None
+
+    # 8 covers a typical transcriptome's expected range and the larger
+    # p-values where lambda_GC is judged; the MHC-scale tail is on the right.
+    zoom = float(zoom)
+    full = float(max(np.max(x), np.max(y))) * 1.05 or 1.0
+    n_above = int(np.sum((x > zoom) | (y > zoom)))
+    show_full = full > zoom * 1.15
+
+    if show_full:
+        fig, (ax_zoom, ax_full) = plt.subplots(1, 2, figsize=(11.2, 5.4))
+    else:
+        fig, ax_zoom = plt.subplots(figsize=(6.0, 5.6))
+        ax_full = None
+
+    _draw_qq_panel(
+        ax_zoom, x, y, limit=zoom, diagonal_label=diagonal_label, equal=True,
+    )
+    ax_zoom.set_title("Larger p-values" if show_full else title, fontsize=11)
+    if n_above:
+        ax_zoom.text(
+            0.97, 0.03,
+            f"{n_above:,} gene(s) above this scale",
+            transform=ax_zoom.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            color="0.35",
+        )
+    ax_zoom.text(
+        0.03, 0.97, annotation,
+        transform=ax_zoom.transAxes, va="top", fontsize=9,
+    )
+    ax_zoom.set_xlabel(xlabel)
+    ax_zoom.set_ylabel(ylabel)
+    ax_zoom.legend(loc="lower right", fontsize=8)
+
+    if ax_full is not None:
+        _draw_qq_panel(
+            ax_full, x, y, limit=full, diagonal_label=diagonal_label, equal=True,
+        )
+        ax_full.set_title("Full range", fontsize=11)
+        ax_full.set_xlabel(xlabel)
+        ax_full.set_ylabel(ylabel)
+        ax_full.legend(loc="lower right", fontsize=8)
+        fig.suptitle(title, fontsize=12)
     fig.tight_layout()
     return fig
 
 
+def _draw_qq_panel(
+    ax: plt.Axes,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    limit: float,
+    diagonal_label: str,
+    equal: bool,
+) -> None:
+    ax.scatter(x, y, s=6, alpha=0.6, color="C0", edgecolors="none", zorder=2)
+    ax.plot([0, limit], [0, limit], "k--", linewidth=1, label=diagonal_label, zorder=1)
+    ax.set_xlim(0, limit)
+    ax.set_ylim(0, limit)
+    if equal:
+        ax.set_aspect("equal", adjustable="box")
+
+
 def volcano(
-    frame: pd.DataFrame, cell_type: str, fdr: float = 0.05, label_top: int = 10
+    frame: pd.DataFrame,
+    cell_type: str,
+    fdr: float = 0.05,
+    label_top: int = 10,
+    pvalue_column: str = "pvalue",
+    significance_suffix: str = "",
 ) -> Optional[plt.Figure]:
     """Direction against strength: predicted-expression effect size vs p-value."""
-    data = frame.dropna(subset=["pvalue", "effect_size"]).reset_index(drop=True)
+    if pvalue_column not in frame.columns or "effect_size" not in frame.columns:
+        return None
+    data = frame.dropna(subset=[pvalue_column, "effect_size"]).reset_index(drop=True)
     if data.empty:
         return None
 
-    y = _neg_log10(data["pvalue"].to_numpy(dtype=float))
+    y = _neg_log10(data[pvalue_column].to_numpy(dtype=float))
     effect = data["effect_size"].to_numpy(dtype=float)
-    significant = data.get("significant_fdr", pd.Series(False, index=data.index)).to_numpy(
-        dtype=bool
-    )
+    significant = data.get(
+        f"significant_fdr{significance_suffix}",
+        pd.Series(False, index=data.index),
+    ).to_numpy(dtype=bool)
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.scatter(effect[~significant], y[~significant], s=6, alpha=0.4, color="0.6", label="ns")
@@ -750,7 +909,7 @@ def volcano(
     ax.axvline(0.0, color="grey", linestyle=":", linewidth=1)
 
     if label_top:
-        top = data.nsmallest(label_top, "pvalue")
+        top = data.nsmallest(label_top, pvalue_column)
         for row_index, row in top.iterrows():
             ax.annotate(
                 _gene_label(row),
@@ -761,9 +920,10 @@ def volcano(
                 ha="center",
             )
 
+    track = "E[z] " if significance_suffix == "_expectation" else ""
     ax.set_xlabel("Effect size (per unit predicted expression)")
     ax.set_ylabel(r"$-\log_{10}$ p")
-    ax.set_title(f"{cell_type} — TWAS volcano")
+    ax.set_title(f"{cell_type} — {track}TWAS volcano")
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     return fig
@@ -1084,6 +1244,7 @@ def qq_comparison(
     cell_type: str,
     ours_label: str = "This study",
     theirs_label: str = "ctPred",
+    pvalue_column: str = "pvalue",
 ) -> Optional[plt.Figure]:
     """
     Quantile-quantile plot of the two methods' evidence, ours on the y-axis.
@@ -1096,35 +1257,29 @@ def qq_comparison(
     """
     from src.twas.compare import two_sample_quantiles
 
+    if pvalue_column not in ours.columns or pvalue_column not in theirs.columns:
+        return None
     x, y = two_sample_quantiles(
-        _neg_log10(theirs["pvalue"].to_numpy(dtype=float)),
-        _neg_log10(ours["pvalue"].to_numpy(dtype=float)),
+        _neg_log10(theirs[pvalue_column].to_numpy(dtype=float)),
+        _neg_log10(ours[pvalue_column].to_numpy(dtype=float)),
     )
     if x.size == 0:
         return None
 
-    limit = float(max(x.max(), y.max())) * 1.05 or 1.0
-    fig, ax = plt.subplots(figsize=(6.5, 6.2))
-    ax.plot([0, limit], [0, limit], "--", color="0.55", linewidth=1.6, label="y = x")
-    ax.scatter(x, y, s=14, color="black", alpha=0.75, edgecolor="none")
-    ax.set_xlim(0, limit)
-    ax.set_ylim(0, limit)
-    ax.set_aspect("equal")
-    ax.set_xlabel(rf"{theirs_label}  $-\log_{{10}}$ p")
-    ax.set_ylabel(rf"{ours_label}  $-\log_{{10}}$ p")
-    ax.set_title(f"Quantile-quantile plot of TWAS $-\\log_{{10}}$p\n{cell_type}", fontsize=11)
     above = float(np.mean(y > x)) if y.size else float("nan")
-    ax.text(
-        0.03, 0.97,
-        f"{above:.0%} of quantiles above y = x\n"
-        f"{len(ours):,} vs {len(theirs):,} genes tested",
-        transform=ax.transAxes,
-        va="top",
-        fontsize=8,
+    track = "E[z] " if pvalue_column.endswith("_expectation") else ""
+    return _qq_two_panel(
+        x,
+        y,
+        title=f"Quantile-quantile plot of TWAS {track}$-\\log_{{10}}$p\n{cell_type}",
+        xlabel=rf"{theirs_label}  $-\log_{{10}}$ p",
+        ylabel=rf"{ours_label}  $-\log_{{10}}$ p",
+        annotation=(
+            f"{above:.0%} of quantiles above y = x\n"
+            f"{len(ours):,} vs {len(theirs):,} genes tested"
+        ),
+        diagonal_label="y = x",
     )
-    ax.legend(loc="lower right", fontsize=8)
-    fig.tight_layout()
-    return fig
 
 
 def pvalue_scatter(
@@ -1134,6 +1289,8 @@ def pvalue_scatter(
     theirs_label: str = "ctPred",
     suffixes: tuple[str, str] = ("_ours", "_ctpred"),
     label_top: int = 8,
+    pvalue_column: str = "pvalue",
+    significance_suffix: str = "",
 ) -> Optional[plt.Figure]:
     """
     Gene-matched evidence, coloured by which method calls the gene significant.
@@ -1144,7 +1301,10 @@ def pvalue_scatter(
     merely about the transcriptome overall.
     """
     ours_suffix, theirs_suffix = suffixes
-    x_column, y_column = f"pvalue{theirs_suffix}", f"pvalue{ours_suffix}"
+    x_column, y_column = (
+        f"{pvalue_column}{theirs_suffix}",
+        f"{pvalue_column}{ours_suffix}",
+    )
     if x_column not in matched.columns or y_column not in matched.columns:
         return None
     data = matched.dropna(subset=[x_column, y_column]).reset_index(drop=True)
@@ -1153,8 +1313,14 @@ def pvalue_scatter(
 
     x = _neg_log10(data[x_column].to_numpy(dtype=float))
     y = _neg_log10(data[y_column].to_numpy(dtype=float))
-    mine = data.get(f"significant_bonferroni{ours_suffix}", pd.Series(False, index=data.index)).fillna(False).to_numpy(bool)
-    yours = data.get(f"significant_bonferroni{theirs_suffix}", pd.Series(False, index=data.index)).fillna(False).to_numpy(bool)
+    mine = data.get(
+        f"significant_bonferroni{significance_suffix}{ours_suffix}",
+        pd.Series(False, index=data.index),
+    ).fillna(False).to_numpy(bool)
+    yours = data.get(
+        f"significant_bonferroni{significance_suffix}{theirs_suffix}",
+        pd.Series(False, index=data.index),
+    ).fillna(False).to_numpy(bool)
 
     groups = [
         (~mine & ~yours, "0.75", "Neither", 8),
@@ -1175,7 +1341,10 @@ def pvalue_scatter(
     ax.set_aspect("equal")
     ax.set_xlabel(rf"{theirs_label}  $-\log_{{10}}$ p")
     ax.set_ylabel(rf"{ours_label}  $-\log_{{10}}$ p")
-    ax.set_title(f"{cell_type} — gene-matched association strength", fontsize=11)
+    track = "E[z] " if significance_suffix == "_expectation" else ""
+    ax.set_title(
+        f"{cell_type} — gene-matched {track}association strength", fontsize=11
+    )
 
     if label_top:
         # Label the genes the two methods disagree about most, but only among
@@ -1208,6 +1377,8 @@ def top_genes(frame: pd.DataFrame, n: int = 25) -> pd.DataFrame:
             "gene", "gene_name", "zscore", "pvalue", "qvalue", "effect_size",
             "zscore_sd", "n_snps_used", "mean_n_snps_used", "n_draws",
             "n_draws_significant_bonferroni", "agreement_bonferroni",
+            "pvalue_expectation", "qvalue_expectation",
+            "significant_fdr_expectation", "significant_bonferroni_expectation",
             "best_gwas_p", "block",
         )
         if c in frame.columns

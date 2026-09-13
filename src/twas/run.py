@@ -335,6 +335,14 @@ def parse_args() -> argparse.Namespace:
         help="Directory for the per-cell-type results, figures and statistics.",
     )
     output.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Re-run cell types that already have results under --output-dir. "
+            "Without it, a finished cell type is skipped."
+        ),
+    )
+    output.add_argument(
         "--wandb-project",
         type=str,
         default=None,
@@ -612,6 +620,16 @@ def analyse_arm(
                         prefix=f"{criterion}_",
                     )
                 )
+            expectation_column = f"significant_{criterion}_expectation"
+            if expectation_column in frame.columns:
+                statistics.update({
+                    f"expectation/{key}": value
+                    for key, value in block_metrics(
+                        frame, blocks,
+                        mask=frame[expectation_column].fillna(False),
+                        prefix=f"{criterion}_",
+                    ).items()
+                })
     statistics.update(summarize(frame, fdr=fdr))
 
     figures: dict[str, Optional[plt.Figure]] = {
@@ -621,18 +639,48 @@ def analyse_arm(
         ),
         "manhattan_hits": plots.manhattan_draw_boxplots(
             long, frame, positions, cell_type, fdr=fdr,
-            criterion="bonferroni", gene_set="expectation",
+            criterion="bonferroni", gene_set="acat",
         ),
         "manhattan_hits_fdr": plots.manhattan_draw_boxplots(
             long, frame, positions, cell_type, fdr=fdr,
-            criterion="fdr", gene_set="expectation",
+            criterion="fdr", gene_set="acat",
         ),
         "qq": plots.qq(frame, cell_type),
         "volcano": plots.volcano(frame, cell_type, fdr=fdr),
         "zscore_histogram": plots.zscore_histogram(frame, cell_type),
     }
+    if "pvalue_expectation" in frame.columns:
+        figures["expectation/manhattan"] = plots.manhattan(
+            frame, positions, cell_type, fdr=fdr,
+            pvalue_column="pvalue_expectation",
+            significance_suffix="_expectation",
+        )
+        figures["expectation/manhattan_boxplots"] = plots.manhattan_boxplots(
+            frame, positions, cell_type, fdr=fdr, gene_set="expectation",
+        )
+        figures["expectation/manhattan_hits"] = plots.manhattan_draw_boxplots(
+            long, frame, positions, cell_type, fdr=fdr,
+            criterion="bonferroni", gene_set="expectation",
+        )
+        figures["expectation/manhattan_hits_fdr"] = plots.manhattan_draw_boxplots(
+            long, frame, positions, cell_type, fdr=fdr,
+            criterion="fdr", gene_set="expectation",
+        )
+        figures["expectation/qq"] = plots.qq(
+            frame, cell_type, pvalue_column="pvalue_expectation",
+        )
+        figures["expectation/volcano"] = plots.volcano(
+            frame, cell_type, fdr=fdr,
+            pvalue_column="pvalue_expectation",
+            significance_suffix="_expectation",
+        )
     if "block_index" in frame.columns:
         figures["ld_block_gene_counts"] = plots.ld_block_gene_counts(frame, cell_type)
+        if "significant_bonferroni_expectation" in frame.columns:
+            figures["expectation/ld_block_gene_counts"] = plots.ld_block_gene_counts(
+                frame, cell_type,
+                significance_column="significant_bonferroni_expectation",
+            )
 
     tables = {"results": frame, "top_genes": plots.top_genes(frame, n=top_n)}
     return frame, _prefix(statistics, arm), _prefix(figures, arm), _prefix(tables, arm)
@@ -693,6 +741,10 @@ def mi_figures(
     figures = {
         "mi_stability": plots.mi_stability(final, cell_type),
         "manhattan_draw_boxplots": plots.manhattan_draw_boxplots(
+            long, final, positions, cell_type, fdr=fdr, criterion=criterion,
+            gene_set="acat",
+        ),
+        "expectation/manhattan_draw_boxplots": plots.manhattan_draw_boxplots(
             long, final, positions, cell_type, fdr=fdr, criterion=criterion,
             gene_set="expectation",
         ),
@@ -789,6 +841,47 @@ def execute_arm(
             tables[f"{arm}/agreement_strata"] = strata
     logging.info("Finished the %s arm for '%s'.", arm, cell_type)
     return final, long, summary, figures, tables
+
+
+def has_cell_type_results(
+    output_dir: Path,
+    cell_type: str,
+    *,
+    require_ctpred: bool = False,
+) -> bool:
+    """
+    True when a previous run finished this cell type.
+
+    `summary.json` is written last, so its presence is the completeness
+    marker. The this-study results table is the minimum usable output;
+    when a ctPred counterpart is in play, that arm's table is required
+    too, otherwise a this-study-only directory would hide a comparison
+    that has not actually been run.
+    """
+    cell_dir = Path(output_dir) / cell_type
+    if not (cell_dir / "summary.json").is_file():
+        return False
+    if not (cell_dir / ARM_OURS / "results.csv").is_file():
+        return False
+    if require_ctpred and not (cell_dir / ARM_CTPRED / "results.csv").is_file():
+        return False
+    return True
+
+
+def load_existing_summary(output_dir: Path, cell_type: str) -> Optional[dict]:
+    """The `summary.json` a previous run left behind, or None if unreadable."""
+    path = Path(output_dir) / cell_type / "summary.json"
+    if not path.is_file():
+        return None
+    try:
+        with path.open() as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        logging.warning(
+            "Could not read existing summary for '%s' at %s: %s",
+            cell_type, path, error,
+        )
+        return None
 
 
 def process_cell_type(
@@ -956,10 +1049,23 @@ def process_cell_type(
             },
             ARM_COMPARISON,
         ))
-        figures.update(_prefix({
+        comparison_figures = {
             "qq": plots.qq_comparison(final, theirs, cell_type),
             "scatter": plots.pvalue_scatter(matched, cell_type),
-        }, ARM_COMPARISON))
+        }
+        if (
+            "pvalue_expectation" in final.columns
+            and "pvalue_expectation" in theirs.columns
+        ):
+            comparison_figures["expectation/qq"] = plots.qq_comparison(
+                final, theirs, cell_type, pvalue_column="pvalue_expectation",
+            )
+            comparison_figures["expectation/scatter"] = plots.pvalue_scatter(
+                matched, cell_type,
+                pvalue_column="pvalue_expectation",
+                significance_suffix="_expectation",
+            )
+        figures.update(_prefix(comparison_figures, ARM_COMPARISON))
         tables[f"{ARM_COMPARISON}/matched_genes"] = matched
 
     # Persist everything before touching WandB, so a logging failure cannot lose
@@ -1010,6 +1116,45 @@ def process_cell_type(
                 summary[f"{arm}/bonferroni_n_ld_blocks_total"],
                 summary[f"{arm}/bonferroni_genes_per_ld_block"],
             )
+        if f"{arm}/expectation/n_significant_fdr" in summary:
+            logging.info(
+                "Cell type '%s' [%s] [E[z]]: %d gene(s) significant at BH FDR %g, "
+                "lambda_GC = %.3f.",
+                cell_type, arm, summary[f"{arm}/expectation/n_significant_fdr"],
+                args.fdr, summary[f"{arm}/expectation/lambda_gc"],
+            )
+        if f"{arm}/expectation/bonferroni_n_ld_blocks" in summary:
+            logging.info(
+                "Cell type '%s' [%s] [E[z]]: %d Bonferroni-significant gene(s) from "
+                "%d different LD block(s) among %d pre-defined blocks (%.2f genes "
+                "per block).",
+                cell_type, arm, summary[f"{arm}/expectation/n_significant_bonferroni"],
+                summary[f"{arm}/expectation/bonferroni_n_ld_blocks"],
+                summary[f"{arm}/expectation/bonferroni_n_ld_blocks_total"],
+                summary[f"{arm}/expectation/bonferroni_genes_per_ld_block"],
+            )
+    if f"{ARM_COMPARISON}/fdr_jaccard" in summary:
+        logging.info(
+            "Cell type '%s' [comparison]: FDR Jaccard = %.3f "
+            "(%d both, %d ours only, %d ctPred only); Bonferroni Jaccard = %.3f.",
+            cell_type,
+            summary[f"{ARM_COMPARISON}/fdr_jaccard"],
+            summary[f"{ARM_COMPARISON}/fdr_both"],
+            summary[f"{ARM_COMPARISON}/fdr_ours_only"],
+            summary[f"{ARM_COMPARISON}/fdr_ctpred_only"],
+            summary.get(f"{ARM_COMPARISON}/bonferroni_jaccard", float("nan")),
+        )
+    if f"{ARM_COMPARISON}/expectation/fdr_jaccard" in summary:
+        logging.info(
+            "Cell type '%s' [E[z] comparison]: FDR Jaccard = %.3f "
+            "(%d both, %d ours only, %d ctPred only); Bonferroni Jaccard = %.3f.",
+            cell_type,
+            summary[f"{ARM_COMPARISON}/expectation/fdr_jaccard"],
+            summary[f"{ARM_COMPARISON}/expectation/fdr_both"],
+            summary[f"{ARM_COMPARISON}/expectation/fdr_ours_only"],
+            summary[f"{ARM_COMPARISON}/expectation/fdr_ctpred_only"],
+            summary.get(f"{ARM_COMPARISON}/expectation/bonferroni_jaccard", float("nan")),
+        )
     return summary
 
 
@@ -1078,14 +1223,32 @@ def main() -> None:
         path.stem for path, other in paired.items() if ctpred_models and other is None
     ]
 
+    pending: dict[Path, Optional[Path]] = {}
+    skipped: list[Path] = []
+    for model_path, ctpred_path in paired.items():
+        if not args.overwrite and has_cell_type_results(
+            args.output_dir,
+            model_path.stem,
+            require_ctpred=ctpred_path is not None,
+        ):
+            skipped.append(model_path)
+        else:
+            pending[model_path] = ctpred_path
+    if skipped:
+        logging.info(
+            "%d of %d cell type(s) already have results and will be skipped "
+            "(pass --overwrite to rebuild): %s",
+            len(skipped), len(paired), [path.stem for path in skipped],
+        )
+
     # Fail here rather than part-way through a sweep, but only for the cell
     # types this run will actually touch. A missing covariance on some other
     # model in the directory is not this job's problem.
     for directory, paths in (
-        (args.models_dir, model_paths),
+        (args.models_dir, list(pending)),
         (
             args.ctpred_models_dir,
-            [path for path in paired.values() if path is not None],
+            [path for path in pending.values() if path is not None],
         ),
     ):
         if not paths:
@@ -1131,23 +1294,31 @@ def main() -> None:
         gene_names.update(shared_names)
     logger = TwasWandBLogger(project=args.wandb_project, entity=args.wandb_entity)
 
-    logging.info("Running TWAS for %d cell type(s).", len(model_paths))
     summaries: list[dict] = []
+    for model_path in skipped:
+        existing = load_existing_summary(output_dir, model_path.stem)
+        if existing is not None:
+            summaries.append(existing)
+
     failures: list[str] = []
-    for model_path, ctpred_path in tqdm(paired.items(), desc="Cell types"):
-        try:
-            summaries.append(
-                process_cell_type(
-                    model_path, args, gwas, gene_names, logger,
-                    blocks=blocks, ctpred_path=ctpred_path,
-                    shared_keys=shared_keys,
+    if not pending:
+        logging.info("Nothing to do.")
+    else:
+        logging.info("Running TWAS for %d cell type(s).", len(pending))
+        for model_path, ctpred_path in tqdm(pending.items(), desc="Cell types"):
+            try:
+                summaries.append(
+                    process_cell_type(
+                        model_path, args, gwas, gene_names, logger,
+                        blocks=blocks, ctpred_path=ctpred_path,
+                        shared_keys=shared_keys,
+                    )
                 )
-            )
-        except Exception as error:  # noqa: BLE001 - one bad cell type must not kill the sweep
-            if not args.continue_on_error:
-                raise
-            logging.error("Cell type '%s' failed: %s", model_path.stem, error)
-            failures.append(model_path.stem)
+            except Exception as error:  # noqa: BLE001 - one bad cell type must not kill the sweep
+                if not args.continue_on_error:
+                    raise
+                logging.error("Cell type '%s' failed: %s", model_path.stem, error)
+                failures.append(model_path.stem)
 
     if summaries:
         overview = pd.DataFrame(summaries).sort_values(
