@@ -1375,9 +1375,16 @@ def top_genes(frame: pd.DataFrame, n: int = 25) -> pd.DataFrame:
         c
         for c in (
             "gene", "gene_name", "zscore", "pvalue", "qvalue", "effect_size",
-            "zscore_sd", "n_snps_used", "mean_n_snps_used", "n_draws",
+            "zscore_var", "zscore_sd", "zscore_ci_low", "zscore_ci_high",
+            "zscore_min", "zscore_max",
+            "pvalue_expectation", "pvalue_expectation_var", "pvalue_expectation_sd",
+            "pvalue_expectation_ci_low", "pvalue_expectation_ci_high",
+            "pvalue_expectation_min", "pvalue_expectation_max",
+            "effect_size_var", "effect_size_sd", "effect_size_ci_low",
+            "effect_size_ci_high", "effect_size_min", "effect_size_max",
+            "n_snps_used", "mean_n_snps_used", "n_draws",
             "n_draws_significant_bonferroni", "agreement_bonferroni",
-            "pvalue_expectation", "qvalue_expectation",
+            "qvalue_expectation",
             "significant_fdr_expectation", "significant_bonferroni_expectation",
             "best_gwas_p", "block",
         )

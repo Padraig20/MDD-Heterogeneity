@@ -13,15 +13,19 @@ Post-processing of S-PrediXcan output: multiple-testing correction for a single
 run, and the multiple-imputation summary across the member-bootstrap draws.
 
 MI aggregation happens on the z-score. Each draw is a complete TWAS, so the
-per-gene z-scores are directly comparable (unlike `effect_size`, whose units
-depend on the gene's expression scale), and the expectation of the z-score is
-the natural point summary.
+per-gene z-scores are directly comparable, and the expectation of the z-score is
+the natural point summary. The same across-draw spread (var, sd, 95% CI, min,
+max) is also written for `effect_size` and for the per-draw p-values (under
+`pvalue_expectation_*`). Effect-size units still depend on the gene's
+expression scale, so those columns are a within-gene stability diagnostic, not
+something to compare across genes.
 
 A caveat worth keeping in mind when reading the numbers: the draws are
 bootstrap refits of one cohort and are therefore strongly correlated, so
-`zscore_var` measures how *stable* a gene's association is across fits, not the
-sampling variance of an estimator. The two-sided tail of `E[z]` alone does not
-absorb that spread, which makes it anti-conservative.
+`zscore_var` (and the matching spread columns) measures how *stable* a gene's
+association is across fits, not the sampling variance of an estimator. The
+two-sided tail of `E[z]` alone does not absorb that spread, which makes it
+anti-conservative.
 
 An MI run therefore combines the per-draw p-values with the Cauchy combination
 test (ACAT; Liu and Xie 2020) and reports that as the primary `pvalue`. ACAT is
@@ -38,6 +42,11 @@ DRAW_COLUMNS = [
 ]
 
 Z_CI_MULTIPLIER = 1.959963984540054  # two-sided 95%
+
+# Across-draw spread written beside each point summary.
+SPREAD_STATS = ("var", "sd", "ci_low", "ci_high", "min", "max")
+# Var / sd / CI are NA off the FDR-significant set; min / max stay filled.
+SPREAD_MASKED_STATS = ("var", "sd", "ci_low", "ci_high")
 
 # Default cut points for the model-agreement curve.
 AGREEMENT_THRESHOLDS = (0.0, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9, 1.0)
@@ -164,6 +173,46 @@ def genomic_inflation(pvalues: Sequence[float]) -> float:
     return float(np.median(chi2) / 0.4549364231195728)
 
 
+def _sample_var(values: pd.Series) -> float:
+    return values.var(ddof=1)
+
+
+def _spread_aggregations(source: str, prefix: str) -> dict:
+    """Named aggregations for the across-draw mean / var / min / max of `source`."""
+    return {
+        f"{prefix}_mean": (source, "mean"),
+        f"{prefix}_var": (source, _sample_var),
+        f"{prefix}_min": (source, "min"),
+        f"{prefix}_max": (source, "max"),
+    }
+
+
+def _spread_columns(prefix: str, stats: Sequence[str] = SPREAD_STATS) -> list[str]:
+    return [f"{prefix}_{stat}" for stat in stats]
+
+
+def _finalize_spread(
+    aggregated: pd.DataFrame,
+    prefix: str,
+    *,
+    clip: Optional[tuple[float, float]] = None,
+) -> None:
+    """Turn mean/var into sd and a 95% CI; drop var when there is only one draw."""
+    var_column = f"{prefix}_var"
+    if var_column not in aggregated.columns:
+        return
+    aggregated.loc[aggregated["n_draws"] < 2, var_column] = np.nan
+    aggregated[f"{prefix}_sd"] = np.sqrt(aggregated[var_column])
+    means = aggregated[f"{prefix}_mean"].to_numpy(dtype=float)
+    sds = aggregated[f"{prefix}_sd"].to_numpy(dtype=float)
+    aggregated[f"{prefix}_ci_low"] = means - Z_CI_MULTIPLIER * sds
+    aggregated[f"{prefix}_ci_high"] = means + Z_CI_MULTIPLIER * sds
+    if clip is not None:
+        low, high = clip
+        aggregated[f"{prefix}_ci_low"] = aggregated[f"{prefix}_ci_low"].clip(low, high)
+        aggregated[f"{prefix}_ci_high"] = aggregated[f"{prefix}_ci_high"].clip(low, high)
+
+
 def aggregate_draws(
     per_draw: dict[str, pd.DataFrame], fdr: float = 0.05
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -173,13 +222,16 @@ def aggregate_draws(
     Returns `(aggregated, long)` where `long` is the tidy per-gene-per-draw
     frame the MI figures are drawn from.
 
-    `zscore_var` is only reported for genes that come out significant under
-    `E[z]` or ACAT FDR; for everything else the spread of a null association
-    is not a number worth reading, so it is left as NA.
+    Across-draw spread (`var`, `sd`, 95% CI) is only reported for genes that
+    come out significant under `E[z]` or ACAT FDR; for everything else the
+    spread of a null association is not a number worth reading, so it is left
+    as NA. `min` / `max` stay filled for every gene.
 
     `pvalue` combines the per-draw p-values with equal-weight ACAT. The
     two-sided tail of `E[z]` is written as `pvalue_expectation` and corrected
-    separately. `zscore` remains `E[z]`.
+    separately. `zscore` remains `E[z]`. The `pvalue_expectation_*` spread
+    columns describe the per-draw p-values, not sampling uncertainty of the
+    `E[z]` tail.
     """
     if not per_draw:
         raise ValueError("No draws to aggregate.")
@@ -197,14 +249,15 @@ def aggregate_draws(
     long = pd.concat(frames, ignore_index=True)
 
     specification = {
-        "zscore_mean": ("zscore", "mean"),
-        "zscore_var": ("zscore", lambda values: values.var(ddof=1)),
-        "zscore_min": ("zscore", "min"),
-        "zscore_max": ("zscore", "max"),
+        **_spread_aggregations("zscore", "zscore"),
         "n_draws": ("zscore", "count"),
     }
     if "effect_size" in long.columns:
-        specification["effect_size_mean"] = ("effect_size", "mean")
+        specification.update(_spread_aggregations("effect_size", "effect_size"))
+    if "pvalue" in long.columns:
+        specification.update(
+            _spread_aggregations("pvalue", "pvalue_expectation")
+        )
     if "n_snps_used" in long.columns:
         specification["mean_n_snps_used"] = ("n_snps_used", "mean")
     if "n_snps_in_model" in long.columns:
@@ -224,9 +277,9 @@ def aggregate_draws(
         names = long.drop_duplicates("gene").set_index("gene")["gene_name"]
         aggregated["gene_name"] = aggregated["gene"].map(names)
 
-    # A single draw has no between-fit spread to report.
-    aggregated.loc[aggregated["n_draws"] < 2, "zscore_var"] = np.nan
-    aggregated["zscore_sd"] = np.sqrt(aggregated["zscore_var"])
+    _finalize_spread(aggregated, "zscore")
+    _finalize_spread(aggregated, "effect_size")
+    _finalize_spread(aggregated, "pvalue_expectation", clip=(0.0, 1.0))
 
     # Model agreement: the share of fits that call the gene significant on their
     # own. This is a stability measure independent of E[z] -- a gene can carry a
@@ -249,10 +302,6 @@ def aggregate_draws(
     if "effect_size_mean" in aggregated.columns:
         aggregated["effect_size"] = aggregated["effect_size_mean"]
 
-    sds = aggregated["zscore_sd"].to_numpy(dtype=float)
-    aggregated["zscore_ci_low"] = zscores - Z_CI_MULTIPLIER * sds
-    aggregated["zscore_ci_high"] = zscores + Z_CI_MULTIPLIER * sds
-
     if "pvalue" in long.columns:
         pvalue_matrix = long.pivot_table(
             index="gene", columns="draw", values="pvalue", aggfunc="first"
@@ -274,8 +323,10 @@ def aggregate_draws(
     fdr_hit = aggregated["significant_fdr"].fillna(False)
     if "significant_fdr_expectation" in aggregated.columns:
         fdr_hit = fdr_hit | aggregated["significant_fdr_expectation"].fillna(False)
-    for column in ("zscore_var", "zscore_sd", "zscore_ci_low", "zscore_ci_high"):
-        aggregated.loc[~fdr_hit, column] = np.nan
+    for prefix in ("zscore", "effect_size", "pvalue_expectation"):
+        for column in _spread_columns(prefix, SPREAD_MASKED_STATS):
+            if column in aggregated.columns:
+                aggregated.loc[~fdr_hit, column] = np.nan
 
     ordered = [
         "gene",
@@ -286,12 +337,9 @@ def aggregate_draws(
         "pvalue_expectation",
         "qvalue_expectation",
         "effect_size",
-        "zscore_var",
-        "zscore_sd",
-        "zscore_ci_low",
-        "zscore_ci_high",
-        "zscore_min",
-        "zscore_max",
+        *_spread_columns("zscore"),
+        *_spread_columns("pvalue_expectation"),
+        *_spread_columns("effect_size"),
         "n_draws",
         "n_draws_significant_bonferroni",
         "agreement_bonferroni",
@@ -498,11 +546,8 @@ def summarize(
         summary["frac_model_snps_used"] = (
             summary["mean_n_snps_used"] / in_model if in_model else float("nan")
         )
-    if "zscore_sd" in frame.columns:
-        sds = frame["zscore_sd"].to_numpy(dtype=float)
-        if np.isfinite(sds).any():
-            summary["mean_zscore_sd_significant"] = float(np.nanmean(sds))
-            summary["max_zscore_sd_significant"] = float(np.nanmax(sds))
+    for prefix in ("zscore", "effect_size"):
+        summary.update(_spread_summary(frame, prefix))
     if extra:
         summary.update(extra)
     summary.update(_prefix(_expectation_summary(frame), "expectation"))
@@ -515,7 +560,7 @@ def _expectation_summary(frame: pd.DataFrame) -> dict:
         return {}
     pvalues = frame["pvalue_expectation"].to_numpy(dtype=float)
     tested = int(np.isfinite(pvalues).sum())
-    return {
+    summary = {
         "n_significant_fdr": int(
             frame.get("significant_fdr_expectation", pd.Series(dtype=bool)).sum()
         ),
@@ -525,6 +570,20 @@ def _expectation_summary(frame: pd.DataFrame) -> dict:
         "lambda_gc": genomic_inflation(pvalues),
         "min_pvalue": float(np.nanmin(pvalues)) if tested else float("nan"),
     }
+    summary.update(_spread_summary(frame, "pvalue_expectation"))
+    return summary
+
+
+def _spread_summary(frame: pd.DataFrame, prefix: str) -> dict:
+    """Scalar across-gene summaries of the MI spread columns, when present."""
+    summary = {}
+    sd_column = f"{prefix}_sd"
+    if sd_column in frame.columns:
+        sds = frame[sd_column].to_numpy(dtype=float)
+        if np.isfinite(sds).any():
+            summary[f"mean_{prefix}_sd_significant"] = float(np.nanmean(sds))
+            summary[f"max_{prefix}_sd_significant"] = float(np.nanmax(sds))
+    return summary
 
 
 def _prefix(mapping: dict, section: str) -> dict:
