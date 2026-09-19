@@ -188,9 +188,9 @@ def parse_args() -> argparse.Namespace:
             "through that rank via the interpolated empirical CDF in "
             "log1p-space (the space those sigmas already inhabit). 'normal' "
             "inverse-quantile-normalizes each gene to N(0, 1) across "
-            "individuals (PrediXcan/GTEx rankit) and maps member sigmas "
-            "through that transform. 'none' leaves both unchanged "
-            "(untransformed teacher)."
+            "individuals (GTEx/PrediXcan: Φ^{-1}(rank/(n+1))) and maps "
+            "member sigmas through that transform. 'none' leaves both "
+            "unchanged (untransformed teacher)."
         ),
     )
     parser.add_argument(
@@ -919,9 +919,10 @@ def main() -> None:
             )
         elif args.norm_targets == "normal":
             logging.info(
-                "Inverse-normal targets enabled: each gene is rankit-"
-                "transformed to N(0, 1) across individuals, and member "
-                "sigmas are mapped through that transform in log1p-space."
+                "Inverse-normal targets enabled: each gene is inverse-"
+                "normal-transformed to N(0, 1) across individuals "
+                "(GTEx: rank/(n+1)), and member sigmas are mapped "
+                "through that transform in log1p-space."
             )
     elif probabilistic:
         logging.info(

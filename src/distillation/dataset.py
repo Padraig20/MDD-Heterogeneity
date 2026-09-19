@@ -565,10 +565,13 @@ class GenotypeDataset(Dataset):
         """Within-gene inverse quantile normalization to N(0, 1).
 
         Ranks individuals separately per gene (average ranks for ties), maps
-        to ``(rank - 0.5) / n_finite``, then through the standard-normal
-        quantile function. Missing values stay NaN. This is the PrediXcan /
-        GTEx rankit transform; the ``(rank - 0.5) / n`` offset keeps
-        quantiles in ``(0, 1)`` so ``Φ^{-1}`` stays finite.
+        to ``rank / (n_finite + 1)``, then through the standard-normal
+        quantile function. Missing values stay NaN. This is the GTEx /
+        PrediXcan inverse-normal transform used by ``pyqtl.norm`` and
+        ``eqtl_prepare_expression.py`` (van der Waerden scores). Dividing
+        by ``n + 1`` keeps quantiles in ``(0, 1)`` so ``Φ^{-1}`` stays
+        finite. When a gene has missing values, ``n`` is the number of
+        finite observations rather than the full cohort width.
         """
         expr = np.asarray(expr, dtype=np.float64)
         if expr.size == 0 or expr.shape[1] == 0:
@@ -577,7 +580,7 @@ class GenotypeDataset(Dataset):
         n_finite = np.isfinite(expr).sum(axis=1, keepdims=True)
         quantiles = np.full(expr.shape, np.nan, dtype=np.float64)
         usable = (n_finite > 0) & np.isfinite(ranks)
-        np.divide(ranks - 0.5, n_finite, out=quantiles, where=usable)
+        np.divide(ranks, n_finite + 1, out=quantiles, where=usable)
         out = np.full(expr.shape, np.nan, dtype=np.float64)
         finite_q = np.isfinite(quantiles)
         out[finite_q] = norm.ppf(quantiles[finite_q])
@@ -603,16 +606,16 @@ class GenotypeDataset(Dataset):
         """Map member SDs through the within-gene inverse-normal transform.
 
         The inverse-normal value of an individual is ``Φ^{-1}`` of that
-        gene's rankit quantile. Member files exported from a log-target
-        teacher keep ``sigmas`` in log1p-space while storing means on the
-        undone (TPM) scale, and ``rank(y) = rank(log1p(y))`` for ``y >= 0``,
-        so the Jacobian is taken on the log1p support whenever a gene's
-        finite means are non-negative.
+        gene's GTEx quantile ``rank / (n + 1)``. Member files exported
+        from a log-target teacher keep ``sigmas`` in log1p-space while
+        storing means on the undone (TPM) scale, and ``rank(y) =
+        rank(log1p(y))`` for ``y >= 0``, so the Jacobian is taken on the
+        log1p support whenever a gene's finite means are non-negative.
 
         The SD in inverse-normal space is the central finite difference
-        ``0.5 * (Φ^{-1}(F(z+σ)) - Φ^{-1}(F(z-σ)))``, with ``F`` the rankit
-        ECDF clipped to ``(0.5/n, 1 - 0.5/n)`` so the quantile function
-        stays finite.
+        ``0.5 * (Φ^{-1}(F(z+σ)) - Φ^{-1}(F(z-σ)))``, with ``F`` the GTEx
+        inverse-normal ECDF clipped to ``(1/(n+1), n/(n+1))`` so the
+        quantile function stays finite.
         """
         values = np.asarray(values, dtype=np.float64)
         sigmas = np.asarray(sigmas, dtype=np.float64)
@@ -647,14 +650,14 @@ class GenotypeDataset(Dataset):
             support = np.log1p(support)
 
         y = support[finite]
-        p = (rankdata(y, method="average") - 0.5) / n
+        p = rankdata(y, method="average") / (n + 1)
         order = np.argsort(y, kind="mergesort")
         y_ord = y[order]
         p_ord = p[order]
         y_uniq, first = np.unique(y_ord, return_index=True)
         p_uniq = p_ord[first]
-        p_min = 0.5 / n
-        p_max = 1.0 - 0.5 / n
+        p_min = 1.0 / (n + 1)
+        p_max = n / (n + 1)
 
         sigma = sigmas[finite].astype(np.float64, copy=False)
         valid_sigma = np.isfinite(sigma) & (sigma >= 0.0)
