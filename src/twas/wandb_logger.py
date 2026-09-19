@@ -53,7 +53,13 @@ class TwasWandBLogger:
                 "WANDB_MODE for authentication."
             )
 
-    def start(self, cell_type: str, config: Optional[dict] = None) -> None:
+    def start(
+        self,
+        cell_type: str,
+        config: Optional[dict] = None,
+        *,
+        name: Optional[str] = None,
+    ) -> None:
         """Open a fresh run for one cell type."""
         if not self.enabled:
             return
@@ -61,7 +67,7 @@ class TwasWandBLogger:
         self._run = self._wandb.init(
             project=self.project,
             entity=self.entity,
-            name=cell_type,
+            name=name or cell_type,
             config=run_config,
             reinit=True,
         )

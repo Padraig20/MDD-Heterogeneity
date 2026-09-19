@@ -222,7 +222,14 @@ GTEx-Brain
 plots
 
 *.png
+*.txt
+*.json
+*.gz
+*.db*
+*.pth
 
 .tmp
 
 src/preprocessing/ablation-variformer/model_weights
+
+experiments
