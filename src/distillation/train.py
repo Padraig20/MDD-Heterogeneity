@@ -69,9 +69,10 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to an optional held-out target directory (same format/filenames as "
-            "--targets, one CSV per cell-type, disjoint individuals). If provided, models "
-            "are trained on *all* individuals in --targets and evaluated on the "
-            "individuals found here, instead of the automatic per-gene 80:20 split."
+            "--targets, one CSV per cell-type, disjoint individuals). If provided, "
+            "models are trained on *all* individuals in --targets and evaluated "
+            "only on the individuals found here. Without this directory, no "
+            "held-out metrics are computed."
         ),
     )
     parser.add_argument(
@@ -80,7 +81,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional held-out per-member output root, with the same member IDs "
-            "and layout as --ensemble-members-dir."
+            "and layout as --ensemble-members-dir. Ensemble distillation is "
+            "evaluated only on this directory; without it, no held-out "
+            "metrics are computed."
         ),
     )
     parser.add_argument(
@@ -103,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Directory to save the trained models. Creates one JSON file per "
-            "cell type; ensemble models retain SNPs meeting --pip-threshold."
+            "cell type."
         ),
     )
     parser.add_argument(
@@ -120,20 +123,13 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of iterations for training."
     )
     parser.add_argument(
-        "-a", "--alphas",
-        type=int,
-        default=15,
-        help="Number of alpha values to try for CV."
-    )
-    parser.add_argument(
-        "--cv",
-        type=int,
-        default=3,
+        "-a", "--alpha",
+        type=float,
+        default=1.0,
         help=(
-            "Number of inner cross-validation folds used to select the penalty per "
-            "gene. Cost scales with the fold count, and on a cis-window (n of a few "
-            "hundred, p of tens of thousands) 3 folds pick effectively the same "
-            "alpha as 5 at ~2/3 of the time."
+            "Fixed elastic-net/ridge penalty for non-ensemble distillation. "
+            "This is not cross-validated. Ensemble distillation uses "
+            "--ensemble-alpha instead."
         ),
     )
     parser.add_argument(
@@ -152,10 +148,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help=(
-            "ElasticNet L1/L2 mixing ratio for the point-estimate model (--model-name "
-            "elasticnet); 1.0 is pure Lasso (sparser), 0.0 is pure Ridge (denser, more "
-            "shrinkage of correlated SNPs). scPrediXcan uses 0.5. Increase towards 1.0 "
-            "for sparser, more outlier-robust fits if Pearson r lags Spearman rho."
+            "Fixed ElasticNet L1/L2 mixing ratio (scPrediXcan uses 0.5; this "
+            "is not cross-validated). 1.0 is pure Lasso, 0.0 is pure Ridge."
         ),
     )
     parser.add_argument(
@@ -197,7 +191,7 @@ def parse_args() -> argparse.Namespace:
         "--seed",
         type=int,
         default=42,
-        help="Random seed for splitting the data."
+        help="Random seed for screening, bootstraps, and solvers."
     )
     parser.add_argument(
         "-j", "--jobs",
@@ -322,27 +316,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Number B of cohort bootstraps per teacher member. Ensemble "
             "distillation performs exactly B times M fixed-penalty elastic-net "
-            "fits per gene after alpha selection."
-        ),
-    )
-    parser.add_argument(
-        "--ensemble-alpha-mode",
-        choices=["shared", "member"],
-        default="shared",
-        help=(
-            "How to tune the elastic-net penalty for ensemble distillation. "
-            "'shared' performs one CV search per gene on the ensemble-mean "
-            "target and reuses its alpha for every member/bootstrap; 'member' "
-            "performs one CV search per member."
+            "fits per gene."
         ),
     )
     parser.add_argument(
         "--ensemble-alpha",
         type=float,
-        default=None,
+        default=1.0,
         help=(
-            "Optional fixed elastic-net alpha for every member/bootstrap. "
-            "This skips alpha CV entirely and overrides --ensemble-alpha-mode."
+            "Fixed elastic-net alpha (lambda) for every member/bootstrap. "
+            "This is not cross-validated. The data term is inverse-variance "
+            "weighted and mixed 50/50 with L1 and L2 penalties."
         ),
     )
     parser.add_argument(
@@ -360,18 +344,8 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help=(
             "Disable inverse-aleatoric-variance weighting in ensemble "
-            "distillation. SNP screening, alpha selection, and elastic-net "
-            "fitting then weight donors equally (apart from bootstrap "
-            "multiplicities)."
-        ),
-    )
-    parser.add_argument(
-        "--pip-threshold",
-        type=float,
-        default=0.5,
-        help=(
-            "A SNP is written when the fraction of member-bootstrap elastic-net "
-            "fits in which its coefficient is non-zero reaches this threshold."
+            "distillation. SNP screening and elastic-net fitting then weight "
+            "donors equally (apart from bootstrap multiplicities)."
         ),
     )
     return parser.parse_args()
@@ -446,8 +420,9 @@ def prepare_cell_type(
         test_path = os.path.join(args.targets_test, ct_file)
         if not os.path.exists(test_path):
             logging.warning(
-                "No held-out target file for cell type '%s' at %s; falling back "
-                "to the automatic 80:20 split for this cell type.", ct_name, test_path,
+                "No held-out target file for cell type '%s' at %s; training "
+                "without held-out evaluation for this cell type.",
+                ct_name, test_path,
             )
         else:
             y_aleatoric_test = y_aleatoric
@@ -485,9 +460,8 @@ def prepare_cell_type(
     model = model_class(
         model_name=args.model_name,
         l1_ratio=args.l1_ratio,
+        alpha=args.alpha,
         max_iter=args.max_iter,
-        alphas=args.alphas,
-        cv=args.cv,
         seed=args.seed,
         n_jobs=jobs,
         screen=screen_snps,
@@ -620,15 +594,11 @@ def prepare_ensemble_cell_type(
 
     model = EnsembleLR(
         l1_ratio=args.l1_ratio,
-        cv=args.cv,
-        alphas=args.alphas,
         max_iter=args.max_iter,
         n_bootstraps=args.ensemble_bootstraps,
-        alpha_mode=args.ensemble_alpha_mode,
         alpha=args.ensemble_alpha,
         sigma_floor=args.sigma_floor,
         aleatoric_weighting=args.aleatoric_weighting,
-        pip_threshold=args.pip_threshold,
         seed=args.seed,
         n_jobs=jobs,
         screen=screen_snps,
@@ -733,22 +703,23 @@ def main() -> None:
     if ensemble_mode and not 0.0 < args.l1_ratio <= 1.0:
         logging.error(
             "Ensemble-member bootstrap distillation requires --l1-ratio in "
-            "(0, 1]; a nonzero L1 component is needed for empirical PIPs."
+            "(0, 1]."
         )
         sys.exit(1)
     if ensemble_mode and (
-        args.ensemble_alpha is not None
-        and (not np.isfinite(args.ensemble_alpha) or args.ensemble_alpha <= 0.0)
+        not np.isfinite(args.ensemble_alpha) or args.ensemble_alpha <= 0.0
     ):
         logging.error("--ensemble-alpha must be finite and positive.")
+        sys.exit(1)
+    if not ensemble_mode and (
+        not np.isfinite(args.alpha) or args.alpha <= 0.0
+    ):
+        logging.error("--alpha must be finite and positive.")
         sys.exit(1)
     if ensemble_mode and (
         not np.isfinite(args.sigma_floor) or args.sigma_floor <= 0.0
     ):
         logging.error("--sigma-floor must be finite and positive.")
-        sys.exit(1)
-    if ensemble_mode and not 0.0 <= args.pip_threshold <= 1.0:
-        logging.error("--pip-threshold must be in [0, 1].")
         sys.exit(1)
 
     member_dirs = None
@@ -856,13 +827,17 @@ def main() -> None:
     )
     if use_external_test:
         logging.info(
-            "Using held-out target directory '%s' for evaluation instead of the "
-            "automatic 80:20 split.",
+            "Evaluating only on the held-out target directory '%s'.",
             (
                 args.ensemble_members_test_dir
                 if ensemble_mode
                 else args.targets_test
             ),
+        )
+    else:
+        logging.info(
+            "No held-out target directory was provided; training without "
+            "held-out evaluation."
         )
 
     if args.output_dir is not None:
@@ -880,8 +855,9 @@ def main() -> None:
         )
     elif screen_snps is not None:
         logging.info(
-            "Screening each cis-window down to its %d SNPs most correlated with the "
-            "target (%d-fold inner CV).", screen_snps, args.cv,
+            "Screening each cis-window down to its %d SNPs most correlated "
+            "with the target.",
+            screen_snps,
         )
     else:
         if ensemble_mode:
@@ -892,8 +868,7 @@ def main() -> None:
         else:
             logging.info(
                 "SNP screening disabled: fitting against every SNP in each "
-                "cis-window (%d-fold inner CV).",
-                args.cv,
+                "cis-window."
             )
 
     probabilistic = args.aleatoric is not None or args.epistemic is not None
@@ -903,13 +878,15 @@ def main() -> None:
     if ensemble_mode:
         logging.info(
             "Frequentist ensemble distillation enabled: %d teacher members x "
-            "%d shared cohort bootstraps = %d elastic-net fits per gene after "
-            "alpha selection (alpha_mode=%s, sigma_floor=%g). SNP screening "
-            "is computed once per gene and reused across all fits.",
+            "%d shared cohort bootstraps = %d inverse-variance-weighted "
+            "elastic-net fits per gene (fixed alpha=%g, l1_ratio=%g, "
+            "sigma_floor=%g). SNP screening is computed once per gene and "
+            "reused across all fits. Alpha is not cross-validated.",
             len(member_dirs),
             args.ensemble_bootstraps,
             len(member_dirs) * args.ensemble_bootstraps,
-            "fixed" if args.ensemble_alpha is not None else args.ensemble_alpha_mode,
+            args.ensemble_alpha,
+            args.l1_ratio,
             args.sigma_floor,
         )
         if args.norm_targets == "percentiles":
@@ -926,9 +903,20 @@ def main() -> None:
             )
     elif probabilistic:
         logging.info(
-            "Probabilistic distillation enabled: fitting three independent elastic-net/"
-            "ridge regressions per gene (mean, aleatoric variance, epistemic variance) "
+            "Probabilistic distillation enabled: fitting three independent "
+            "fixed-penalty elastic-net/ridge regressions per gene (mean, "
+            "aleatoric variance, epistemic variance; alpha=%g, l1_ratio=%g) "
             "directly against the teacher's own uncertainty decomposition.",
+            args.alpha,
+            args.l1_ratio,
+        )
+    else:
+        logging.info(
+            "Point-estimate distillation enabled: fixed-penalty %s "
+            "(alpha=%g, l1_ratio=%g). Alpha is not cross-validated.",
+            args.model_name,
+            args.alpha,
+            args.l1_ratio,
         )
     if probabilistic:
         if (args.aleatoric_test is None) != (args.epistemic_test is None):

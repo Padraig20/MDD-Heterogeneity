@@ -5,7 +5,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNet, ElasticNetCV, Ridge, RidgeCV
+from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
@@ -18,78 +18,39 @@ from src.distillation.utils import (
     safe_pearson,
     safe_spearman,
     screen_snps,
-    train_test_indices,
 )
 
 
 def build_linear_model(
     model_name: str,
     l1_ratio: float,
-    cv: int,
-    alphas: int,
     max_iter: int,
     seed: int,
-    alpha: float | None = None,
+    alpha: float,
 ):
     """
-    Construct a (CV-tuned) linear model, shared by `LR` and `ProbabilisticLR` so both
-    point-estimate and probabilistic (mean/aleatoric/epistemic) fits use the exact same
-    ElasticNet/Ridge construction (alpha path, solver settings, etc.) rather than each
-    approximating it independently.
+    Construct a fixed-penalty linear model, shared by `LR` and `ProbabilisticLR`.
 
-    Inner CV is small (e.g. cv=3, alphas=5), so spawning a joblib pool per ENCV.fit
-    usually costs more than it saves. Outer parallelism over genes (see `fit_dataset`)
-    does the heavy lifting instead.
-
-    Pass `alpha` to skip cross-validation and fit at a single, already-selected
-    penalty. Searching the alpha path costs roughly `cv + 1` path fits, so a model
-    that only needs to be refit at a penalty chosen earlier (see
-    `LR.fit_gene_matrix`) should never pay for a second search.
+    The elastic-net mix is the scPrediXcan value (`l1_ratio=0.5` by default).
+    The penalty `alpha` is not cross-validated.
     """
     if model_name == "ridge":
-        if alpha is not None:
-            return Ridge(alpha=alpha, fit_intercept=True)
-        return RidgeCV(
-            cv=cv,
-            alphas=np.logspace(-6, 6, alphas),
-            fit_intercept=True,
-            scoring="r2",
-            gcv_mode="auto",
-        )
-    elif model_name == "elasticnet":
-        if alpha is not None:
-            return ElasticNet(
-                alpha=alpha,
-                l1_ratio=l1_ratio,
-                max_iter=max_iter,
-                fit_intercept=True,
-                random_state=seed,
-                selection="random",
-            )
-        # Let ElasticNetCV build the alpha path *from the data*: it computes
-        # alpha_max (the smallest penalty that zeros all coefficients) and
-        # logspaces down by `eps`. This is far better conditioned than a fixed
-        # 1e-6..1e6 grid, whose tiny alphas leave the coordinate-descent solver
-        # thrashing against max_iter (slow + ConvergenceWarnings) with almost no
-        # regularization. `selection="random"` also speeds up convergence.
-        return ElasticNetCV(
+        return Ridge(alpha=alpha, fit_intercept=True)
+    if model_name == "elasticnet":
+        return ElasticNet(
+            alpha=alpha,
             l1_ratio=l1_ratio,
-            cv=cv,
-            n_alphas=alphas,
             max_iter=max_iter,
             fit_intercept=True,
             random_state=seed,
             selection="random",
-            n_jobs=1,
         )
-    else:
-        raise ValueError(f"Unknown model name: {model_name}")
+    raise ValueError(f"Unknown model name: {model_name}")
 
 
 def fitted_alpha(model) -> float:
     """
-    Selected penalty of a fitted model, whether it searched for one (`alpha_` on
-    the CV estimators) or was handed one (`alpha` on the fixed-penalty ones).
+    Penalty of a fitted model (`alpha_` or `alpha`).
     """
     alpha = getattr(model, "alpha_", None)
     if alpha is None:
@@ -124,9 +85,9 @@ class LRStruct:
     y_mean_:  float
     y_scale_: float
 
-    # R^2 on held-out individuals (per-gene 20% split); the fair comparison metric.
+    # R^2 on a user-supplied held-out test set; NaN when no test set is given.
     heldout_r2_:  Optional[float] = None
-    # in-sample R^2 of the held-out model on its own train fold (overfitting gap).
+    # in-sample R^2 of the persisted model on its training individuals.
     insample_r2_: Optional[float] = None
     n_train_: int = 0
     n_test_:  int = 0
@@ -144,17 +105,17 @@ class LR:
     def __init__(
         self,
         model_name: str = "elasticnet",
-        l1_ratio: float = 0.5,  # scPrediXcan has 0.5
-        cv: int         = 3,
-        alphas: int     = 100,
+        l1_ratio: float = 0.5,  # scPrediXcan mix; not cross-validated
+        alpha: float    = 1.0,
         max_iter: int   = 10000,
         seed: int       = 42,
         n_jobs: int     = 1,
         screen: Optional[int] = 5000,
     ):
+        if not np.isfinite(alpha) or alpha <= 0:
+            raise ValueError("alpha must be finite and positive.")
         self.l1_ratio   = l1_ratio
-        self.cv         = cv
-        self.alphas     = alphas
+        self.alpha      = float(alpha)
         self.max_iter   = max_iter
         self.seed       = seed
         self.n_jobs     = n_jobs
@@ -164,8 +125,11 @@ class LR:
 
     def _make_model(self, alpha: Optional[float] = None):
         return build_linear_model(
-            self.model_name, self.l1_ratio, self.cv, self.alphas, self.max_iter,
-            self.seed, alpha=alpha,
+            self.model_name,
+            self.l1_ratio,
+            self.max_iter,
+            self.seed,
+            alpha=self.alpha if alpha is None else float(alpha),
         )
 
     @staticmethod
@@ -186,10 +150,8 @@ class LR:
         several targets sharing one design matrix (see `ProbabilisticLR`) also share
         its standardization instead of each rebuilding a full copy of it.
 
-        `sample_weight` weights each individual's squared error; the
-        CV estimators apply it to their inner CV loss as well, so the penalty is
-        selected under the same objective it is later used with. Leave it None for
-        the ordinary, unweighted fit.
+        `sample_weight` weights each individual's squared error. Leave it
+        None for the ordinary, unweighted fit.
         """
         y_scaler = StandardScaler().fit(y.reshape(-1, 1))
         y_scaled = y_scaler.transform(y.reshape(-1, 1)).reshape(-1)
@@ -204,7 +166,7 @@ class LR:
         alpha: Optional[float] = None,
         sample_weight: Optional[np.ndarray] = None,
     ):
-        """Fit X/y standardizers + the (CV) linear model on the given rows."""
+        """Fit X/y standardizers + the fixed-penalty linear model on the given rows."""
         x_scaler, X_scaled = self._scale_x(X)
         y_scaler, enet     = self._fit_prescaled(
             X_scaled, y, alpha=alpha, sample_weight=sample_weight
@@ -254,77 +216,30 @@ class LR:
             else:
                 X, snp_ids = ld_prune(X, snp_ids)
 
-        # The persisted model, once it is known that fitting it again would
-        # reproduce a fit already computed for the held-out metrics.
-        final       = None
-        reuse_alpha = None
+        keep = screen_snps(X, y, self.screen)
+        if keep is not None:
+            X = X[:, keep]
+            snp_ids = np.asarray(snp_ids)[keep]
+            if has_external_test:
+                X_test = X_test[:, keep]
 
-        if has_external_test:
-            # Held-out evaluation on a user-supplied, disjoint test set: train on
-            # *all* individuals from `X`/`y` (no internal split) and score on `X_test`/`y_test`.
-            if y_test.size > 0:
-                keep = screen_snps(X, y, self.screen)
-                if keep is not None:
-                    X       = X[:, keep]
-                    X_test  = X_test[:, keep]
-                    snp_ids = np.asarray(snp_ids)[keep]
-                xs, ys, enet_h = self._fit_scaled(X, y)
-                pred_test   = self._predict_scaled(xs, ys, enet_h, X_test)
-                pred_train  = self._predict_scaled(xs, ys, enet_h, X)
-                heldout_r2  = float(r2_score(y_test, pred_test))
-                insample_r2 = float(r2_score(y, pred_train))
-                heldout_pearson_r  = safe_pearson(y_test, pred_test)
-                insample_pearson_r = safe_pearson(y, pred_train)
-                heldout_spearman_r  = safe_spearman(y_test, pred_test)
-                insample_spearman_r = safe_spearman(y, pred_train)
-                n_train, n_test = int(y.size), int(y_test.size)
-                # This fit already saw every individual, so it *is* the model that
-                # would be persisted; refitting it would repeat identical work.
-                final = (xs, ys, enet_h)
-            else:
-                heldout_r2, insample_r2 = float("nan"), float("nan")
-                heldout_pearson_r, insample_pearson_r = float("nan"), float("nan")
-                heldout_spearman_r, insample_spearman_r = float("nan"), float("nan")
-                n_train, n_test = int(y.size), 0
+        x_scaler, y_scaler, enet = self._fit_scaled(X, y)
+        pred_train = self._predict_scaled(x_scaler, y_scaler, enet, X)
+        insample_r2 = float(r2_score(y, pred_train))
+        insample_pearson_r = safe_pearson(y, pred_train)
+        insample_spearman_r = safe_spearman(y, pred_train)
+        n_train = int(y.size)
+
+        nan = float("nan")
+        if has_external_test and y_test.size > 0:
+            pred_test = self._predict_scaled(x_scaler, y_scaler, enet, X_test)
+            heldout_r2 = float(r2_score(y_test, pred_test))
+            heldout_pearson_r = safe_pearson(y_test, pred_test)
+            heldout_spearman_r = safe_spearman(y_test, pred_test)
+            n_test = int(y_test.size)
         else:
-            # Held-out evaluation: fit on a per-gene 80% split of the individuals and
-            # score R^2 on the remaining 20%, so the number is comparable to any model
-            # evaluated out-of-sample (and exposes overfitting for p >> n cis windows).
-            # The saved coefficients below are refit on *all* individuals.
-            train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
-            if test_idx is not None:
-                # Screened on the train fold alone: screening on all rows would let
-                # the test fold influence which SNPs the scored model may use.
-                keep = screen_snps(X[train_idx], y[train_idx], self.screen)
-                X_h  = X if keep is None else X[:, keep]
-                xs, ys, enet_h = self._fit_scaled(X_h[train_idx], y[train_idx])
-                pred_test   = self._predict_scaled(xs, ys, enet_h, X_h[test_idx])
-                pred_train  = self._predict_scaled(xs, ys, enet_h, X_h[train_idx])
-                heldout_r2  = float(r2_score(y[test_idx], pred_test))
-                insample_r2 = float(r2_score(y[train_idx], pred_train))
-                heldout_pearson_r  = safe_pearson(y[test_idx], pred_test)
-                insample_pearson_r = safe_pearson(y[train_idx], pred_train)
-                heldout_spearman_r  = safe_spearman(y[test_idx], pred_test)
-                insample_spearman_r = safe_spearman(y[train_idx], pred_train)
-                n_train, n_test = int(train_idx.size), int(test_idx.size)
-                reuse_alpha = fitted_alpha(enet_h)
-            else:
-                # too few individuals to hold out: no honest generalization estimate
-                heldout_r2, insample_r2 = float("nan"), float("nan")
-                heldout_pearson_r, insample_pearson_r = float("nan"), float("nan")
-                heldout_spearman_r, insample_spearman_r = float("nan"), float("nan")
-                n_train, n_test = int(y.size), 0
-
-        # Final model refit on all individuals -> these are the persisted coefficients.
-        # The penalty selected on the train fold is carried over instead of searching
-        # the alpha path a second time.
-        if final is None:
-            keep = screen_snps(X, y, self.screen)
-            if keep is not None:
-                X       = X[:, keep]
-                snp_ids = np.asarray(snp_ids)[keep]
-            final = self._fit_scaled(X, y, alpha=reuse_alpha)
-        x_scaler, y_scaler, enet = final
+            heldout_r2 = heldout_pearson_r = heldout_spearman_r = nan
+            n_test = 0
 
         model = LRStruct(
             model_name=self.model_name,

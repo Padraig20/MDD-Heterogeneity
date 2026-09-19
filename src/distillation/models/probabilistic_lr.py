@@ -28,7 +28,6 @@ from src.distillation.utils import (
     safe_pearson,
     safe_spearman,
     screen_snps,
-    train_test_indices,
 )
 
 
@@ -72,12 +71,10 @@ class ProbabilisticLRStruct:
     x_mean_:  np.ndarray
     x_scale_: np.ndarray
 
-    # Diagnostics (native log-expression space). All distribution-matching metrics are
-    # evaluated on HELD-OUT individuals (per-gene 20% split); the heads that produce
-    # them are trained only on the 80% train fold, while the persisted heads above are
-    # refit on all individuals.
+    # Diagnostics (native log-expression space). Held-out metrics are populated
+    # only when a user-supplied test set is provided; otherwise they are NaN.
     train_r2_:           Optional[float] = None  # held-out R^2 of the mean prediction
-    insample_r2_:        Optional[float] = None  # in-sample R^2 on the train fold (overfitting gap)
+    insample_r2_:        Optional[float] = None  # in-sample R^2 on the training individuals
     n_train_:            int = 0
     n_test_:             int = 0
     pearson_r_:          Optional[float] = None  # held-out Pearson r of the mean (bounded [-1, 1])
@@ -118,8 +115,7 @@ class ProbabilisticLR:
         self,
         model_name: str      = "elasticnet",
         l1_ratio: float      = 0.5,
-        cv: int              = 3,
-        alphas: int          = 100,
+        alpha: float         = 1.0,
         max_iter: int        = 10000,
         seed: int            = 42,
         n_jobs: int          = 1,
@@ -127,20 +123,22 @@ class ProbabilisticLR:
     ):
         self.model_name = model_name
         self.l1_ratio   = l1_ratio
-        self.cv         = cv
-        self.alphas     = alphas
+        self.alpha      = float(alpha)
         self.max_iter   = max_iter
         self.seed       = seed
         self.n_jobs     = n_jobs
         self.screen     = screen
         # A single shared `LR` instance whose `_scale_x`/`_fit_prescaled` helpers
         # are reused for all three heads: identical ElasticNet/Ridge construction
-        # (alpha path, solver settings, ...), just called with a different target
-        # each time. Never calls `LR.fit_gene_matrix` itself, since that bundles its
-        # own held-out split + persisted-model refit for a single target.
+        # just called with a different target each time. Never calls
+        # `LR.fit_gene_matrix` itself.
         self._lr = LR(
-            model_name=model_name, l1_ratio=l1_ratio, cv=cv, alphas=alphas,
-            max_iter=max_iter, seed=seed, screen=screen,
+            model_name=model_name,
+            l1_ratio=l1_ratio,
+            alpha=alpha,
+            max_iter=max_iter,
+            seed=seed,
+            screen=screen,
         )
         self.models_: Dict[str, ProbabilisticLRStruct] = {}
 
@@ -150,15 +148,11 @@ class ProbabilisticLR:
         y: np.ndarray,
         y_aleatoric_log: np.ndarray,
         y_epistemic_log: np.ndarray,
-        alphas: Optional[dict] = None,
     ) -> dict:
         """
         Fit the mean/aleatoric/epistemic heads, all on one shared standardization of
         `X`. The three heads differ only in their target, so standardizing X once and
         reusing it avoids building three identical (n x p) copies per gene.
-
-        Pass `alphas` (head name -> penalty) to refit at penalties selected earlier
-        instead of searching the alpha path again for each head.
         """
         x_scaler, X_scaled = self._lr._scale_x(X)
         heads = {}
@@ -167,8 +161,7 @@ class ProbabilisticLR:
             ("aleatoric", y_aleatoric_log, True),
             ("epistemic", y_epistemic_log, True),
         ):
-            alpha          = None if alphas is None else alphas.get(name)
-            y_scaler, enet = self._lr._fit_prescaled(X_scaled, target, alpha=alpha)
+            y_scaler, enet = self._lr._fit_prescaled(X_scaled, target)
             head = LinearHead(
                 coef_=enet.coef_.copy(),
                 intercept_=float(enet.intercept_),
@@ -180,11 +173,6 @@ class ProbabilisticLR:
             )
             heads[name] = (head, x_scaler, y_scaler)
         return heads
-
-    @staticmethod
-    def _head_alphas(heads: dict) -> dict:
-        """Penalty selected by each head, for refitting without a second search."""
-        return {name: head.alpha_ for name, (head, _, _) in heads.items()}
 
     @staticmethod
     def _nan_metrics(y_aleatoric: np.ndarray, y_epistemic: np.ndarray) -> dict:
@@ -365,90 +353,30 @@ class ProbabilisticLR:
             else:
                 X, snp_ids = ld_prune(X, snp_ids)
 
-        # The persisted heads, once it is known that fitting them again would
-        # reproduce heads already computed for the held-out metrics.
-        heads_final  = None
-        reuse_alphas = None
+        keep = screen_snps(
+            X, [y, y_aleatoric_log, y_epistemic_log], self.screen
+        )
+        if keep is not None:
+            X = X[:, keep]
+            snp_ids = np.asarray(snp_ids)[keep]
+            if has_external_test:
+                X_test = X_test[:, keep]
 
-        if has_external_test:
-            # Held-out evaluation on a user-supplied, disjoint test set: train on
-            # *all* individuals from `X`/`y`/uncertainty targets (no internal split)
-            # and evaluate on the `_test` arrays.
-            if y_test.size > 0:
-                keep = screen_snps(
-                    X, [y, y_aleatoric_log, y_epistemic_log], self.screen
-                )
-                if keep is not None:
-                    X       = X[:, keep]
-                    X_test  = X_test[:, keep]
-                    snp_ids = np.asarray(snp_ids)[keep]
-                heads_h     = self._fit_heads(X, y, y_aleatoric_log, y_epistemic_log)
-                metrics     = self._evaluate(heads_h, X_test, y_test, y_aleatoric_test, y_epistemic_test)
-                insample    = self._evaluate(heads_h, X, y, y_aleatoric, y_epistemic)
-                insample_r2 = insample["r2"]
-                insample_pearson_r = insample["pearson_r"]
-                insample_spearman_r = insample["spearman_r"]
-                n_train, n_test = int(y.size), int(y_test.size)
-                # These heads already saw every individual, so they *are* the heads
-                # that would be persisted; refitting would repeat identical work.
-                heads_final = heads_h
-            else:
-                metrics = self._nan_metrics(y_aleatoric, y_epistemic)
-                insample_r2 = float("nan")
-                insample_pearson_r = float("nan")
-                insample_spearman_r = float("nan")
-                n_train, n_test = int(y.size), 0
+        heads_final = self._fit_heads(X, y, y_aleatoric_log, y_epistemic_log)
+        insample = self._evaluate(heads_final, X, y, y_aleatoric, y_epistemic)
+        insample_r2 = insample["r2"]
+        insample_pearson_r = insample["pearson_r"]
+        insample_spearman_r = insample["spearman_r"]
+        n_train = int(y.size)
+        if has_external_test and y_test.size > 0:
+            metrics = self._evaluate(
+                heads_final, X_test, y_test, y_aleatoric_test, y_epistemic_test
+            )
+            n_test = int(y_test.size)
         else:
-            # Held-out evaluation: train on a per-gene 80% split of the individuals and
-            # score every distribution-matching metric on the remaining 20%, so the
-            # numbers are comparable to the point-estimate LR (also held-out) and expose
-            # overfitting for p >> n cis windows. The persisted heads are refit on all
-            # individuals afterwards.
-            train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
-            if test_idx is not None:
-                # Screened on the train fold alone: screening on all rows would let
-                # the test fold influence which SNPs the scored heads may use.
-                keep = screen_snps(
-                    X[train_idx],
-                    [y[train_idx], y_aleatoric_log[train_idx], y_epistemic_log[train_idx]],
-                    self.screen,
-                )
-                X_h = X if keep is None else X[:, keep]
-                heads_h = self._fit_heads(
-                    X_h[train_idx], y[train_idx], y_aleatoric_log[train_idx], y_epistemic_log[train_idx]
-                )
-                metrics = self._evaluate(
-                    heads_h, X_h[test_idx], y[test_idx], y_aleatoric[test_idx], y_epistemic[test_idx]
-                )
-                insample = self._evaluate(
-                    heads_h, X_h[train_idx], y[train_idx], y_aleatoric[train_idx], y_epistemic[train_idx]
-                )
-                insample_r2 = insample["r2"]
-                insample_pearson_r = insample["pearson_r"]
-                insample_spearman_r = insample["spearman_r"]
-                n_train, n_test = int(train_idx.size), int(test_idx.size)
-                reuse_alphas = self._head_alphas(heads_h)
-            else:
-                # too few individuals to hold out: no honest generalization estimate
-                metrics = self._nan_metrics(y_aleatoric, y_epistemic)
-                insample_r2 = float("nan")
-                insample_pearson_r = float("nan")
-                insample_spearman_r = float("nan")
-                n_train, n_test = int(y.size), 0
+            metrics = self._nan_metrics(y_aleatoric, y_epistemic)
+            n_test = 0
 
-        # Final heads refit on all individuals -> these are the persisted coefficients.
-        # The penalties selected on the train fold are carried over instead of
-        # searching the alpha path a second time for each head.
-        if heads_final is None:
-            keep = screen_snps(
-                X, [y, y_aleatoric_log, y_epistemic_log], self.screen
-            )
-            if keep is not None:
-                X       = X[:, keep]
-                snp_ids = np.asarray(snp_ids)[keep]
-            heads_final = self._fit_heads(
-                X, y, y_aleatoric_log, y_epistemic_log, alphas=reuse_alphas
-            )
         mean_head,      x_scaler, _ = heads_final["mean"]
         aleatoric_head, _,        _ = heads_final["aleatoric"]
         epistemic_head, _,        _ = heads_final["epistemic"]
