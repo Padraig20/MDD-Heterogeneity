@@ -9,8 +9,10 @@ size of every *exact* intersection retained in the plot.
 Figures and sharing statistics are logged to two WandB runs named after
 the model arms (``this-study`` and ``ctPred``). Every artifact is
 namespaced under ``general/<scope>/...`` so it sits in its own section
-inside each run. Optional ``--output`` still writes a local copy of each
-figure.
+inside each run. Each scope also gets a table and figure of genes that
+are significant in exactly one displayed cell type (ENSID, gene name,
+p-value, and that cell type). Optional ``--output`` still writes a local
+copy of each figure.
 
     For example::
 
@@ -75,6 +77,7 @@ GENE_SCOPE_CHOICES = GENE_SCOPES + tuple(GENE_SCOPE_ALIASES)
 DEFAULT_MHC_REGION = "6:25000000-34000000"
 DEFAULT_GTF = Path("data/hg38/Homo_sapiens.GRCh38.115.gtf")
 GENERAL_PREFIX = "general"
+SPECIFIC_GENE_PLOT_ROWS = 80
 
 _GTF_GENE_ID = re.compile(r'gene_id\s+"([^"]+)"')
 
@@ -576,6 +579,34 @@ def _pvalue_series(
     return pvalues
 
 
+def _gene_names_from_results(path: Path) -> dict[str, str]:
+    """Map Ensembl IDs in one results table to gene symbols when present."""
+    wanted = {"gene", "gene_name"}
+    frame = pd.read_csv(path, usecols=lambda name: name in wanted)
+    if "gene" not in frame.columns or "gene_name" not in frame.columns:
+        return {}
+    genes = frame["gene"].astype("string").str.strip()
+    valid = genes.notna() & genes.ne("")
+    names: dict[str, str] = {}
+    for gene, name in zip(genes[valid], frame.loc[valid, "gene_name"].astype(str)):
+        name = name.strip()
+        if name and name.lower() not in {"nan", "none"}:
+            names[str(gene)] = name
+    return names
+
+
+def _pvalues_and_names(
+    result_files: Sequence[tuple[str, Path]],
+    pvalue_column: str,
+) -> tuple[dict[str, pd.Series], dict[str, str]]:
+    pvalues: dict[str, pd.Series] = {}
+    names: dict[str, str] = {}
+    for cell_type, path in result_files:
+        pvalues[cell_type] = _pvalue_series(path, pvalue_column=pvalue_column)
+        names.update(_gene_names_from_results(path))
+    return pvalues, names
+
+
 def _call_combined_genes(
     pvalues: pd.Series, criterion: str, alpha: float
 ) -> set[str]:
@@ -784,6 +815,49 @@ def group_onek1k_gene_sets(
     if not grouped:
         raise ValueError("No recognized OneK1K cell types were available to group.")
     return grouped
+
+
+def group_onek1k_pvalues(
+    result_files: Sequence[tuple[str, Path]],
+    *,
+    pvalue_column: str = "pvalue",
+) -> tuple[dict[str, pd.Series], dict[str, str]]:
+    """Pooled p-values for the displayed OneK1K groups (ACAT across subtypes)."""
+    by_key: dict[str, tuple[str, Path]] = {}
+    for item in result_files:
+        key = _onek1k_key(item[0])
+        if key in by_key:
+            raise ValueError(
+                f"Ambiguous cell-type directories {by_key[key][0]!r} and "
+                f"{item[0]!r}."
+            )
+        by_key[key] = item
+
+    grouped: dict[str, pd.Series] = {}
+    names: dict[str, str] = {}
+    for group_name, expected_members in ONEK1K_GROUPS:
+        members = [
+            by_key[key]
+            for member in expected_members
+            if (key := _onek1k_key(member)) in by_key
+        ]
+        if not members:
+            continue
+        for _, path in members:
+            names.update(_gene_names_from_results(path))
+        if len(members) == 1:
+            grouped[group_name] = _pvalue_series(
+                members[0][1], pvalue_column=pvalue_column
+            )
+            continue
+        columns = {
+            cell_type: _pvalue_series(path, pvalue_column=pvalue_column)
+            for cell_type, path in members
+        }
+        grouped[group_name] = acat_rows(pd.concat(columns, axis=1))
+    if not grouped:
+        raise ValueError("No recognized OneK1K cell types were available to group.")
+    return grouped, names
 
 
 def select_gene_sets(
@@ -1094,6 +1168,113 @@ def _intersection_table(intersections: pd.DataFrame, arm: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["arm", "members", "n_members", "n_genes"])
 
 
+def cell_type_specific_genes(
+    gene_sets: Mapping[str, set[str]],
+    pvalues: Mapping[str, pd.Series],
+    gene_names: Mapping[str, str],
+) -> pd.DataFrame:
+    """Genes significant in exactly one displayed cell type."""
+    rows = []
+    all_genes: set[str] = set().union(*gene_sets.values()) if gene_sets else set()
+    for gene in all_genes:
+        members = [
+            cell_type for cell_type, genes in gene_sets.items() if gene in genes
+        ]
+        if len(members) != 1:
+            continue
+        cell_type = members[0]
+        series = pvalues.get(cell_type)
+        pvalue = float("nan")
+        if series is not None and gene in series.index:
+            pvalue = float(series.loc[gene])
+        rows.append(
+            {
+                "ensid": gene,
+                "gene_name": gene_names.get(gene, ""),
+                "pvalue": pvalue,
+                "cell_type": cell_type,
+            }
+        )
+    frame = pd.DataFrame(
+        rows, columns=["ensid", "gene_name", "pvalue", "cell_type"]
+    )
+    if frame.empty:
+        return frame
+    return frame.sort_values(
+        ["cell_type", "pvalue", "ensid"], na_position="last"
+    ).reset_index(drop=True)
+
+
+def plot_specific_genes(
+    frame: pd.DataFrame,
+    *,
+    title: str | None = None,
+) -> Figure:
+    """Table of cell-type-specific hits: ENSID, symbol, p-value, cell type."""
+    note = ""
+    display = frame
+    if len(frame) > SPECIFIC_GENE_PLOT_ROWS:
+        display = frame.nsmallest(SPECIFIC_GENE_PLOT_ROWS, "pvalue")
+        display = display.sort_values(
+            ["cell_type", "pvalue", "ensid"], na_position="last"
+        ).reset_index(drop=True)
+        note = (
+            f"Showing the {len(display):,} most significant of "
+            f"{len(frame):,} cell-type-specific genes."
+        )
+
+    figure_height = 2.2 if display.empty else min(24.0, 1.6 + 0.26 * max(len(display), 1))
+    figure, ax = plt.subplots(figsize=(11.2, figure_height))
+    ax.axis("off")
+    if title:
+        ax.set_title(title, fontsize=12, fontweight="bold", pad=8)
+    if display.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No cell-type-specific genes",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color="0.35",
+        )
+        figure.tight_layout()
+        return figure
+
+    cells = []
+    for row in display.itertuples(index=False):
+        pvalue = "" if not np.isfinite(row.pvalue) else f"{row.pvalue:.3g}"
+        cells.append(
+            [
+                row.ensid,
+                row.gene_name,
+                pvalue,
+                _display_name(str(row.cell_type)),
+            ]
+        )
+    table = ax.table(
+        cellText=cells,
+        colLabels=["ENSID", "Gene name", "p-value", "Cell type"],
+        loc="center",
+        cellLoc="left",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8)
+    table.scale(1.0, 1.2)
+    for (row, column), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(fontweight="bold")
+            cell.set_facecolor("#e8e8ef")
+        elif row % 2 == 0:
+            cell.set_facecolor("#f7f7f7")
+        if column == 2:
+            cell.get_text().set_ha("right")
+    if note:
+        figure.text(0.5, 0.01, note, ha="center", fontsize=8, color="0.35")
+    figure.tight_layout()
+    return figure
+
+
 def _wandb_config(args: argparse.Namespace, arm: str) -> dict:
     """Record the analysis settings on one arm's run."""
     return {
@@ -1151,6 +1332,28 @@ def load_arm_gene_sets(
         min_agreement=min_agreement,
         combination=args.combination,
     )
+
+
+def load_arm_pvalues(
+    args: argparse.Namespace, arm: str
+) -> tuple[dict[str, pd.Series], dict[str, str]]:
+    """Pooled p-values and gene names for the cell types shown on one arm."""
+    pvalue_column = (
+        "pvalue_expectation" if args.combination == "expectation" else "pvalue"
+    )
+    if args.group_onek1k:
+        files = discover_result_files(args.input_dir, arm)
+        pvalues, names = group_onek1k_pvalues(
+            files, pvalue_column=pvalue_column
+        )
+        if args.cell_types is not None:
+            selected = select_gene_sets(
+                {name: set() for name in pvalues}, args.cell_types
+            )
+            pvalues = {name: pvalues[name] for name in selected}
+        return pvalues, names
+    files = discover_result_files(args.input_dir, arm, args.cell_types)
+    return _pvalues_and_names(files, pvalue_column)
 
 
 def _figure_title(title: str | None, arm: str) -> str:
@@ -1383,6 +1586,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             figures: dict[str, Figure] = {}
             wandb_summary: dict[str, int | float] = {}
             tables: dict[str, pd.DataFrame] = {}
+            try:
+                arm_pvalues, arm_gene_names = load_arm_pvalues(args, arm)
+            except (FileNotFoundError, ValueError) as error:
+                logging.warning(
+                    "Skipping cell-type-specific gene table for %s: %s",
+                    arm,
+                    error,
+                )
+                arm_pvalues, arm_gene_names = {}, {}
             for scope in scopes:
                 gene_sets = filter_gene_sets_by_scope(
                     base_gene_sets, scope, mhc_gene_ids
@@ -1414,6 +1626,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 tables[_log_key(scope, "intersections")] = (
                     _intersection_table(intersections, arm)
                 )
+                specific = cell_type_specific_genes(
+                    gene_sets, arm_pvalues, arm_gene_names
+                )
+                tables[_log_key(scope, "specific_genes")] = specific
+                specific_figure = plot_specific_genes(
+                    specific,
+                    title=_figure_title(
+                        f"Cell-type-specific genes ({scope})", arm
+                    ),
+                )
+                figures[_log_key(scope, "specific_genes")] = specific_figure
+                wandb_summary[_log_key(scope, "n_specific_genes")] = int(
+                    len(specific)
+                )
 
                 if args.output is not None:
                     output = output_for_variant(
@@ -1425,16 +1651,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                     )
                     figure.savefig(output, dpi=args.dpi, bbox_inches="tight")
                     logging.info("Wrote %s [%s/%s].", output, arm, scope)
+                    specific_output = output.with_name(
+                        f"{output.stem}_specific_genes{output.suffix}"
+                    )
+                    specific_figure.savefig(
+                        specific_output, dpi=args.dpi, bbox_inches="tight"
+                    )
+                    logging.info(
+                        "Wrote %s [%s/%s].", specific_output, arm, scope
+                    )
 
                 sentence = format_sharing_summary(sharing, hit_kind=hit_kind)
                 logging.info(
-                    "%s [%s/%s]: %d cell types, %d candidate genes, %d of %d "
-                    "intersections shown.",
+                    "%s [%s/%s]: %d cell types, %d candidate genes, %d "
+                    "cell-type-specific, %d of %d intersections shown.",
                     arm,
                     GENERAL_PREFIX,
                     scope,
                     stats["n_cell_types"],
                     stats["n_hits"],
+                    len(specific),
                     stats["n_intersections_shown"],
                     stats["n_intersections_available"],
                 )
