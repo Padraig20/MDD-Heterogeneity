@@ -5,7 +5,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNet, Ridge
+from sklearn.linear_model import ElasticNet, ElasticNetCV, Ridge, RidgeCV
 from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
@@ -18,32 +18,57 @@ from src.distillation.utils import (
     safe_pearson,
     safe_spearman,
     screen_snps,
+    train_test_indices,
 )
 
 
 def build_linear_model(
     model_name: str,
     l1_ratio: float,
+    cv: int,
+    alphas: int,
     max_iter: int,
     seed: int,
-    alpha: float,
+    alpha: float | None = None,
 ):
     """
-    Construct a fixed-penalty linear model, shared by `LR` and `ProbabilisticLR`.
+    Construct a linear model shared by `LR` and `ProbabilisticLR`.
 
-    The elastic-net mix is the scPrediXcan value (`l1_ratio=0.5` by default).
-    The penalty `alpha` is not cross-validated.
+    The elastic-net mix is the scPrediXcan value (`l1_ratio=0.5` by default)
+    and is never searched. The penalty (sklearn `alpha`, glmnet `lambda`) is
+    chosen by inner CV unless an explicit `alpha` is supplied.
     """
     if model_name == "ridge":
-        return Ridge(alpha=alpha, fit_intercept=True)
+        if alpha is not None:
+            return Ridge(alpha=alpha, fit_intercept=True)
+        return RidgeCV(
+            cv=cv,
+            alphas=np.logspace(-6, 6, alphas),
+            fit_intercept=True,
+            scoring="r2",
+            gcv_mode="auto",
+        )
     if model_name == "elasticnet":
-        return ElasticNet(
-            alpha=alpha,
+        if alpha is not None:
+            return ElasticNet(
+                alpha=alpha,
+                l1_ratio=l1_ratio,
+                max_iter=max_iter,
+                fit_intercept=True,
+                random_state=seed,
+                selection="random",
+            )
+        # Data-dependent path: alpha_max down by `eps`, not a fixed 1e-6..1e6
+        # grid whose tiny values thrash coordinate descent.
+        return ElasticNetCV(
             l1_ratio=l1_ratio,
+            cv=cv,
+            n_alphas=alphas,
             max_iter=max_iter,
             fit_intercept=True,
             random_state=seed,
             selection="random",
+            n_jobs=1,
         )
     raise ValueError(f"Unknown model name: {model_name}")
 
@@ -85,9 +110,9 @@ class LRStruct:
     y_mean_:  float
     y_scale_: float
 
-    # R^2 on a user-supplied held-out test set; NaN when no test set is given.
+    # R^2 on the per-gene 20% held-out split.
     heldout_r2_:  Optional[float] = None
-    # in-sample R^2 of the persisted model on its training individuals.
+    # in-sample R^2 of the held-out model on its 80% train fold.
     insample_r2_: Optional[float] = None
     n_train_: int = 0
     n_test_:  int = 0
@@ -106,16 +131,24 @@ class LR:
         self,
         model_name: str = "elasticnet",
         l1_ratio: float = 0.5,  # scPrediXcan mix; not cross-validated
-        alpha: float    = 1.0,
+        alpha: Optional[float] = None,
+        cv: int         = 3,
+        alphas: int     = 15,
         max_iter: int   = 10000,
         seed: int       = 42,
         n_jobs: int     = 1,
         screen: Optional[int] = 5000,
     ):
-        if not np.isfinite(alpha) or alpha <= 0:
-            raise ValueError("alpha must be finite and positive.")
+        if alpha is not None and (not np.isfinite(alpha) or alpha <= 0):
+            raise ValueError("alpha must be finite and positive when supplied.")
+        if cv < 2:
+            raise ValueError("cv must be at least 2.")
+        if alphas <= 0:
+            raise ValueError("alphas must be positive.")
         self.l1_ratio   = l1_ratio
-        self.alpha      = float(alpha)
+        self.alpha      = None if alpha is None else float(alpha)
+        self.cv         = int(cv)
+        self.alphas     = int(alphas)
         self.max_iter   = max_iter
         self.seed       = seed
         self.n_jobs     = n_jobs
@@ -124,12 +157,15 @@ class LR:
         self.models_: Dict[str, LRStruct] = {}
 
     def _make_model(self, alpha: Optional[float] = None):
+        chosen = self.alpha if alpha is None else float(alpha)
         return build_linear_model(
             self.model_name,
             self.l1_ratio,
+            self.cv,
+            self.alphas,
             self.max_iter,
             self.seed,
-            alpha=self.alpha if alpha is None else float(alpha),
+            alpha=chosen,
         )
 
     @staticmethod
@@ -150,8 +186,9 @@ class LR:
         several targets sharing one design matrix (see `ProbabilisticLR`) also share
         its standardization instead of each rebuilding a full copy of it.
 
-        `sample_weight` weights each individual's squared error. Leave it
-        None for the ordinary, unweighted fit.
+        `sample_weight` weights each individual's squared error; the CV
+        estimators apply it to their inner CV loss as well. Leave it None
+        for the ordinary, unweighted fit.
         """
         y_scaler = StandardScaler().fit(y.reshape(-1, 1))
         y_scaled = y_scaler.transform(y.reshape(-1, 1)).reshape(-1)
@@ -166,7 +203,7 @@ class LR:
         alpha: Optional[float] = None,
         sample_weight: Optional[np.ndarray] = None,
     ):
-        """Fit X/y standardizers + the fixed-penalty linear model on the given rows."""
+        """Fit X/y standardizers + the (CV or fixed-penalty) linear model."""
         x_scaler, X_scaled = self._scale_x(X)
         y_scaler, enet     = self._fit_prescaled(
             X_scaled, y, alpha=alpha, sample_weight=sample_weight
@@ -185,8 +222,6 @@ class LR:
         y: np.ndarray,
         snp_ids: np.ndarray,
         chr: int,
-        X_test: Optional[np.ndarray] = None,
-        y_test: Optional[np.ndarray] = None,
     ) -> LRStruct:
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y, dtype=np.float32)
@@ -199,47 +234,47 @@ class LR:
         if y.size == 0:
             raise ValueError("No non-missing target values available")
 
-        has_external_test = X_test is not None and y_test is not None
-        if has_external_test:
-            X_test = np.asarray(X_test, dtype=np.float32)
-            y_test = np.asarray(y_test, dtype=np.float32)
-            has_target_test = ~np.isnan(y_test)
-            if not has_target_test.all():
-                X_test = X_test[has_target_test]
-                y_test = y_test[has_target_test]
+        nan = float("nan")
+        reuse_alpha = self.alpha
+        train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
+        if test_idx is not None:
+            X_tr, y_tr = X[train_idx], y[train_idx]
+            X_te, y_te = X[test_idx], y[test_idx]
+            if self.model_name == "ridge":
+                X_tr, _, (X_te,) = ld_prune(X_tr, snp_ids, align=[X_te])
+            keep = screen_snps(X_tr, y_tr, self.screen)
+            if keep is not None:
+                X_tr = X_tr[:, keep]
+                X_te = X_te[:, keep]
+            xs, ys, enet_h = self._fit_scaled(X_tr, y_tr, alpha=reuse_alpha)
+            if reuse_alpha is None:
+                reuse_alpha = fitted_alpha(enet_h)
+            pred_test = self._predict_scaled(xs, ys, enet_h, X_te)
+            pred_train = self._predict_scaled(xs, ys, enet_h, X_tr)
+            heldout_r2 = float(r2_score(y_te, pred_test))
+            insample_r2 = float(r2_score(y_tr, pred_train))
+            heldout_pearson_r = safe_pearson(y_te, pred_test)
+            insample_pearson_r = safe_pearson(y_tr, pred_train)
+            heldout_spearman_r = safe_spearman(y_te, pred_test)
+            insample_spearman_r = safe_spearman(y_tr, pred_train)
+            n_train, n_test = int(train_idx.size), int(test_idx.size)
+        else:
+            heldout_r2 = heldout_pearson_r = heldout_spearman_r = nan
+            insample_r2 = insample_pearson_r = insample_spearman_r = nan
+            n_train, n_test = int(y.size), 0
 
         if self.model_name == "ridge":
-            # perform LD pruning (dropping the same SNP columns from the external
-            # test matrix, if any, so train/test stay column-aligned)
-            if has_external_test:
-                X, snp_ids, (X_test,) = ld_prune(X, snp_ids, align=[X_test])
-            else:
-                X, snp_ids = ld_prune(X, snp_ids)
-
+            X, snp_ids = ld_prune(X, snp_ids)
         keep = screen_snps(X, y, self.screen)
         if keep is not None:
             X = X[:, keep]
             snp_ids = np.asarray(snp_ids)[keep]
-            if has_external_test:
-                X_test = X_test[:, keep]
-
-        x_scaler, y_scaler, enet = self._fit_scaled(X, y)
-        pred_train = self._predict_scaled(x_scaler, y_scaler, enet, X)
-        insample_r2 = float(r2_score(y, pred_train))
-        insample_pearson_r = safe_pearson(y, pred_train)
-        insample_spearman_r = safe_spearman(y, pred_train)
-        n_train = int(y.size)
-
-        nan = float("nan")
-        if has_external_test and y_test.size > 0:
-            pred_test = self._predict_scaled(x_scaler, y_scaler, enet, X_test)
-            heldout_r2 = float(r2_score(y_test, pred_test))
-            heldout_pearson_r = safe_pearson(y_test, pred_test)
-            heldout_spearman_r = safe_spearman(y_test, pred_test)
-            n_test = int(y_test.size)
-        else:
-            heldout_r2 = heldout_pearson_r = heldout_spearman_r = nan
-            n_test = 0
+        x_scaler, y_scaler, enet = self._fit_scaled(X, y, alpha=reuse_alpha)
+        if test_idx is None:
+            pred_train = self._predict_scaled(x_scaler, y_scaler, enet, X)
+            insample_r2 = float(r2_score(y, pred_train))
+            insample_pearson_r = safe_pearson(y, pred_train)
+            insample_spearman_r = safe_spearman(y, pred_train)
 
         model = LRStruct(
             model_name=self.model_name,
@@ -270,25 +305,15 @@ class LR:
         self,
         dataset: GenotypeDataset,
         gene: str,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> LRStruct:
         X, y, snp_ids, chr = dataset.get_gene_matrix(gene)
-        X_test, y_test = None, None
-        if test_dataset is not None:
-            try:
-                X_test, y_test, _, _ = test_dataset.get_gene_matrix(gene)
-            except ValueError:
-                # Gene has no rows in the external test set; train on all of `X`/`y`
-                # but report held-out metrics as NaN (see fit_gene_matrix).
-                X_test, y_test = np.empty((0, X.shape[1]), dtype=X.dtype), np.empty(0, dtype=y.dtype)
-        return self.fit_gene_matrix(gene, X, y, snp_ids, chr, X_test=X_test, y_test=y_test)
+        return self.fit_gene_matrix(gene, X, y, snp_ids, chr)
 
     def fit_gene_from_design(
         self,
         dataset: GenotypeDataset,
         gene: str,
         design: tuple,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> LRStruct:
         """
         Fit one gene against a design matrix read elsewhere (see
@@ -297,14 +322,7 @@ class LR:
         """
         X, snp_ids, chr, individuals = design
         y, _, _ = dataset.gene_targets(gene, individuals)
-
-        X_test, y_test = None, None
-        if test_dataset is not None:
-            try:
-                X_test, y_test, _, _ = test_dataset.get_gene_matrix(gene)
-            except ValueError:
-                X_test, y_test = np.empty((0, X.shape[1]), dtype=X.dtype), np.empty(0, dtype=y.dtype)
-        return self.fit_gene_matrix(gene, X, y, snp_ids, chr, X_test=X_test, y_test=y_test)
+        return self.fit_gene_matrix(gene, X, y, snp_ids, chr)
 
     def _fit_one(
         self,
@@ -313,10 +331,9 @@ class LR:
         i: int,
         n: int,
         verbose: bool,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> Optional[LRStruct]:
         try:
-            model = self.fit_gene_from_dataset(dataset, gene, test_dataset=test_dataset)
+            model = self.fit_gene_from_dataset(dataset, gene)
             if verbose:
                 nnz = int(np.sum(model.coef_ != 0))
                 print(
@@ -338,7 +355,6 @@ class LR:
         self,
         dataset: GenotypeDataset,
         verbose: bool = True,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> Dict[str, LRStruct]:
         genes = list(dataset.genes)
         n     = len(genes)
@@ -348,7 +364,7 @@ class LR:
 
         if n_jobs == 1:
             for i, gene in enumerate(genes, start=1):
-                self._fit_one(dataset, gene, i, n, verbose, test_dataset=test_dataset)
+                self._fit_one(dataset, gene, i, n, verbose)
             return self.models_
 
         # Parallel path: thread pool over genes with BLAS pinned to 1 thread per
@@ -357,7 +373,7 @@ class LR:
         with threadpool_limits(limits=1):
             with ThreadPoolExecutor(max_workers=n_jobs) as ex:
                 futures = {
-                    ex.submit(self._fit_one, dataset, gene, i, n, verbose, test_dataset): gene
+                    ex.submit(self._fit_one, dataset, gene, i, n, verbose): gene
                     for i, gene in enumerate(genes, start=1)
                 }
                 iterator = as_completed(futures)
@@ -384,13 +400,13 @@ class LR:
         """
         return {
             "gene": gene,
-            "r2": model.heldout_r2_,          # held-out (per-gene 20%) R^2
+            "r2": model.heldout_r2_,
             "insample_r2": model.insample_r2_,
             "n_train": model.n_train_,
             "n_test": model.n_test_,
-            "pearson_r": model.heldout_pearson_r_,   # held-out, bounded [-1, 1]
+            "pearson_r": model.heldout_pearson_r_,
             "insample_pearson_r": model.insample_pearson_r_,
-            "spearman_r": model.heldout_spearman_r_,   # held-out, rank-based, bounded [-1, 1]
+            "spearman_r": model.heldout_spearman_r_,
             "insample_spearman_r": model.insample_spearman_r_,
             "nonzero_weights": int(np.sum(model.coef_ != 0)),
             "alpha": model.alpha_,

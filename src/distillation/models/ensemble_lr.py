@@ -1,12 +1,14 @@
 """Fast frequentist distillation of deep-ensemble members.
 
 For every gene, one common SNP screen is shared by all teacher members and all
-bootstrap replicates.  Each member mean is then distilled with a fixed-penalty
+bootstrap replicates.  Each member mean is then distilled with an
 elastic net whose data term is inverse-aleatoric-variance weighted:
 
     sum_j (1/σ_{j}^{2}) (μ_{j} - μ̂_{j})^{2} + λ (0.5 ||w||_1 + 0.5 ||w||_2^{2})
 
-Alpha is never cross-validated.  Bootstrap resampling is represented by integer
+The mix is fixed at ``l1_ratio=0.5``.  The penalty (sklearn ``alpha``,
+glmnet ``lambda``) is chosen once per gene by inner CV unless a fixed
+``alpha`` is supplied.  Bootstrap resampling is represented by integer
 donor multiplicities in ``sample_weight``; the genotype matrix is never
 physically resampled.
 
@@ -28,7 +30,7 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import ElasticNet, ElasticNetCV
 from sklearn.metrics import r2_score
 from threadpoolctl import threadpool_limits
 from tqdm import tqdm
@@ -39,6 +41,7 @@ from src.distillation.utils import (
     marginal_abs_corr,
     safe_pearson,
     safe_spearman,
+    train_test_indices,
 )
 
 
@@ -275,11 +278,14 @@ class EnsembleLR:
         self,
         *,
         l1_ratio: float = 0.5,
+        cv: int = 3,
+        alphas: int = 15,
         max_iter: int = 2000,
         n_bootstraps: int = 5,
-        alpha: Optional[float] = 1.0,
+        alpha: Optional[float] = None,
         sigma_floor: float = 1e-4,
         aleatoric_weighting: bool = True,
+        pip_threshold: float = 0.5,
         zero_tol: float = DEFAULT_ZERO_TOL,
         seed: int = 42,
         n_jobs: int = 1,
@@ -287,25 +293,32 @@ class EnsembleLR:
     ):
         if not 0.0 < l1_ratio <= 1.0:
             raise ValueError("l1_ratio must be in (0, 1] for sparse elastic nets.")
+        if cv < 2:
+            raise ValueError("cv must be at least 2.")
+        if alphas <= 0:
+            raise ValueError("alphas must be positive.")
         if max_iter <= 0:
             raise ValueError("max_iter must be positive.")
         if n_bootstraps <= 0:
             raise ValueError("n_bootstraps must be positive.")
-        if alpha is None:
-            alpha = 1.0
-        if not np.isfinite(alpha) or alpha <= 0:
-            raise ValueError("alpha must be finite and positive.")
+        if alpha is not None and (not np.isfinite(alpha) or alpha <= 0):
+            raise ValueError("alpha must be finite and positive when supplied.")
         if not np.isfinite(sigma_floor) or sigma_floor <= 0:
             raise ValueError("sigma_floor must be finite and positive.")
+        if not 0.0 <= pip_threshold <= 1.0:
+            raise ValueError("pip_threshold must be in [0, 1].")
         if not np.isfinite(zero_tol) or zero_tol < 0:
             raise ValueError("zero_tol must be finite and non-negative.")
 
         self.l1_ratio = float(l1_ratio)
+        self.cv = int(cv)
+        self.alphas = int(alphas)
         self.max_iter = int(max_iter)
         self.n_bootstraps = int(n_bootstraps)
-        self.alpha = float(alpha)
+        self.alpha = None if alpha is None else float(alpha)
         self.sigma_floor = float(sigma_floor)
         self.aleatoric_weighting = bool(aleatoric_weighting)
+        self.pip_threshold = float(pip_threshold)
         self.zero_tol = float(zero_tol)
         self.seed = int(seed)
         self.n_jobs = max(1, int(n_jobs))
@@ -431,9 +444,59 @@ class EnsembleLR:
         n_iter = int(np.max(np.atleast_1d(estimator.n_iter_)))
         return coef, intercept, n_iter
 
-    def _member_alphas(self, n_members: int) -> np.ndarray:
-        """Fixed penalty for every member; alpha is never cross-validated."""
-        return np.full(n_members, self.alpha, dtype=np.float64)
+    def _cv_alpha(
+        self,
+        X_scaled: np.ndarray,
+        y: np.ndarray,
+        sample_weight: np.ndarray,
+        random_state: int,
+    ) -> float:
+        weights = self._normalize_weights(sample_weight)
+        y_scaled, _, _ = self._scale_target(y, weights)
+        cv = min(self.cv, X_scaled.shape[0])
+        if cv < 2:
+            raise ValueError("At least two individuals are required to tune alpha.")
+        model = ElasticNetCV(
+            l1_ratio=self.l1_ratio,
+            cv=cv,
+            n_alphas=self.alphas,
+            max_iter=self.max_iter,
+            fit_intercept=True,
+            random_state=int(random_state),
+            selection="random",
+            n_jobs=1,
+            precompute=False,
+            copy_X=True,
+        )
+        model.fit(X_scaled, y_scaled, sample_weight=weights)
+        return float(model.alpha_)
+
+    def _select_alphas(
+        self,
+        gene: str,
+        X_scaled: np.ndarray,
+        means: np.ndarray,
+        sigmas: np.ndarray,
+    ) -> np.ndarray:
+        """One shared CV-selected penalty per gene, unless `alpha` is fixed."""
+        n_members = means.shape[0]
+        if self.alpha is not None:
+            return np.full(n_members, self.alpha, dtype=np.float64)
+
+        sigma_safe = np.maximum(sigmas, self.sigma_floor)
+        reference_y = means.mean(axis=0)
+        sample_weight = (
+            np.mean(sigma_safe**2, axis=0) ** -1
+            if self.aleatoric_weighting
+            else np.ones(means.shape[1], dtype=np.float64)
+        )
+        alpha = self._cv_alpha(
+            X_scaled,
+            reference_y,
+            sample_weight,
+            self._gene_seed(gene),
+        )
+        return np.full(n_members, alpha, dtype=np.float64)
 
     def _gene_seed(self, gene: str) -> int:
         offset = zlib.crc32(str(gene).encode("utf-8"))
@@ -463,7 +526,7 @@ class EnsembleLR:
         np.ndarray,
     ]:
         X_scaled, x_mean, x_scale = self._scale_design(X)
-        alphas = self._member_alphas(means.shape[0])
+        alphas = self._select_alphas(gene, X_scaled, means, sigmas)
         counts = self._bootstrap_counts(gene, X.shape[0])
         sigma_safe = np.maximum(sigmas, self.sigma_floor)
         precision = (
@@ -603,9 +666,6 @@ class EnsembleLR:
         chr: str | int,
         *,
         member_ids: Optional[Sequence[str | int]] = None,
-        X_test: Optional[np.ndarray] = None,
-        member_means_test: Optional[np.ndarray] = None,
-        member_sigmas_test: Optional[np.ndarray] = None,
     ) -> EnsembleLRStruct:
         X = np.asarray(X, dtype=np.float64)
         means = np.asarray(member_means, dtype=np.float64)
@@ -637,33 +697,48 @@ class EnsembleLR:
         if X.shape[0] < 2:
             raise ValueError("At least two finite individuals are required.")
 
-        external_inputs = (X_test, member_means_test, member_sigmas_test)
-        if any(value is not None for value in external_inputs) and not all(
-            value is not None for value in external_inputs
-        ):
-            raise ValueError(
-                "X_test, member_means_test, and member_sigmas_test must be "
-                "provided together."
+        train_idx, test_idx = train_test_indices(X.shape[0], seed=self.seed, key=gene)
+        if test_idx is not None:
+            selected_h = self._select_snps(
+                X[train_idx], means[:, train_idx], sigmas[:, train_idx]
             )
-        has_external_test = all(value is not None for value in external_inputs)
-        if has_external_test:
-            X_test = np.asarray(X_test, dtype=np.float64)
-            means_test = np.asarray(member_means_test, dtype=np.float64)
-            sigmas_test = np.asarray(member_sigmas_test, dtype=np.float64)
-            if (
-                X_test.ndim != 2
-                or X_test.shape[1] != X.shape[1]
-                or means_test.shape != sigmas_test.shape
-                or means_test.shape != (means.shape[0], X_test.shape[0])
-            ):
-                raise ValueError("Held-out ensemble targets/design are misaligned.")
-            valid_test = self._common_valid_rows(X_test, means_test, sigmas_test)
-            X_test = X_test[valid_test]
-            means_test = means_test[:, valid_test]
-            sigmas_test = sigmas_test[:, valid_test]
+            _, coef_h, intercept_h, _ = self._fit_bootstraps(
+                gene,
+                X[train_idx][:, selected_h],
+                means[:, train_idx],
+                sigmas[:, train_idx],
+                member_ids,
+            )
+            # Same PIP mask as the persisted mean: drop SNPs that are
+            # rarely non-zero before scoring the pooled prediction.
+            retained_h = (
+                empirical_weight_moments(coef_h, zero_tol=self.zero_tol)["pip"]
+                >= self.pip_threshold
+            )
+            coef_h = coef_h[:, :, retained_h]
+            X_tr_h = X[train_idx][:, selected_h][:, retained_h]
+            X_te_h = X[test_idx][:, selected_h][:, retained_h]
+            train_pred = self._sample_predictions(
+                X_tr_h, coef_h, intercept_h
+            ).mean(axis=1)
+            test_pred = self._sample_predictions(
+                X_te_h, coef_h, intercept_h
+            ).mean(axis=1)
+            train_metrics = self._metrics_from_predictions(
+                train_pred, means[:, train_idx], sigmas[:, train_idx]
+            )
+            test_metrics = self._metrics_from_predictions(
+                test_pred, means[:, test_idx], sigmas[:, test_idx]
+            )
+            n_train, n_test = int(train_idx.size), int(test_idx.size)
+            evaluation = "split"
+        else:
+            train_metrics = test_metrics = None
+            n_train, n_test = int(X.shape[0]), 0
+            evaluation = "none"
 
-        # This is the only target-dependent screening pass for the gene. Its
-        # selected columns are reused by every member/bootstrap.
+        # Persist the all-data refit. Screening and bootstrap campaigns used
+        # for held-out metrics stay on the 80% fold and are not reused here.
         selected = self._select_snps(X, means, sigmas)
         X_selected = X[:, selected]
         snp_ids = snp_ids[selected]
@@ -680,44 +755,44 @@ class EnsembleLR:
             coef_samples,
             zero_tol=self.zero_tol,
         )
+
+        # Keep the full screened matrix only while fitting. Persist the same
+        # PIP-selected SNP set for the pooled mean and every member-bootstrap
+        # draw so MI and the covariance share one gene-level SNP list.
+        retained = moments["pip"] >= self.pip_threshold
+        X_selected = X_selected[:, retained]
+        snp_ids = snp_ids[retained]
+        coef_samples = coef_samples[:, :, retained]
+        for member in members:
+            member.coef_samples_ = member.coef_samples_[:, retained]
+            member.coef_ = member.coef_[retained]
+            member.coef_var_ = member.coef_var_[retained]
+            member.inclusion_probability_ = member.inclusion_probability_[retained]
+        moments = empirical_weight_moments(
+            coef_samples,
+            zero_tol=self.zero_tol,
+        )
         intercept_mean, intercept_var, _, _ = combine_member_moments(
             intercept_samples.mean(axis=1)[:, None],
             np.var(intercept_samples, axis=1, ddof=0)[:, None],
         )
 
-        train_sample_predictions = self._sample_predictions(
-            X_selected,
-            coef_samples,
-            intercept_samples,
-        )
-        train_member_predictions = train_sample_predictions.mean(axis=1)
-        train_metrics = self._metrics_from_predictions(
-            train_member_predictions,
-            means,
-            sigmas,
-        )
-
-        if has_external_test:
-            test_samples = self._sample_predictions(
-                X_test[:, selected],
+        if train_metrics is None:
+            train_sample_predictions = self._sample_predictions(
+                X_selected,
                 coef_samples,
                 intercept_samples,
             )
-            test_metrics = self._metrics_from_predictions(
-                test_samples.mean(axis=1),
-                means_test,
-                sigmas_test,
+            train_metrics = self._metrics_from_predictions(
+                train_sample_predictions.mean(axis=1),
+                means,
+                sigmas,
             )
-            evaluation = "external"
-            n_test = int(X_test.shape[0])
-        else:
             test_metrics = self._metrics_from_predictions(
-                np.empty((means.shape[0], 0)),
+                np.empty((means.shape[0], 0), dtype=np.float64),
                 means[:, :0],
                 sigmas[:, :0],
             )
-            evaluation = "none"
-            n_test = 0
 
         model = EnsembleLRStruct(
             gene=gene,
@@ -734,7 +809,7 @@ class EnsembleLR:
             intercept_var_=float(intercept_var[0]),
             n_bootstraps_=self.n_bootstraps,
             n_screened_snps_=n_screened_snps,
-            alpha_mode_="fixed",
+            alpha_mode_="fixed" if self.alpha is not None else "shared",
             evaluation_=evaluation,
             heldout_r2_=test_metrics["r2"],
             insample_r2_=train_metrics["r2"],
@@ -748,43 +823,18 @@ class EnsembleLR:
             insample_gaussian_nll_=train_metrics["gaussian_nll"],
             member_heldout_r2_=test_metrics["member_r2"],
             member_insample_r2_=train_metrics["member_r2"],
-            n_train_=int(X.shape[0]),
+            n_train_=n_train,
             n_test_=n_test,
         )
         self.models_[gene] = model
         return model
 
-    @staticmethod
-    def _empty_test_targets(
-        n_members: int,
-        n_snps: int,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        return (
-            np.empty((0, n_snps), dtype=np.float64),
-            np.empty((n_members, 0), dtype=np.float64),
-            np.empty((n_members, 0), dtype=np.float64),
-        )
-
     def fit_gene_from_dataset(
         self,
         dataset: EnsembleGenotypeDataset,
         gene: str,
-        test_dataset: Optional[EnsembleGenotypeDataset] = None,
     ) -> EnsembleLRStruct:
         X, means, sigmas, snp_ids, chrom = dataset.get_gene_matrix(gene)
-        X_test = means_test = sigmas_test = None
-        if test_dataset is not None:
-            try:
-                X_test, means_test, sigmas_test, test_snps, _ = (
-                    test_dataset.get_gene_matrix(gene)
-                )
-            except ValueError:
-                X_test, means_test, sigmas_test = self._empty_test_targets(
-                    len(dataset.members), X.shape[1]
-                )
-            else:
-                if not np.array_equal(snp_ids, test_snps):
-                    raise ValueError("Training and held-out SNP IDs are not aligned.")
         return self.fit_gene_matrix(
             gene,
             X,
@@ -793,9 +843,6 @@ class EnsembleLR:
             snp_ids,
             chrom,
             member_ids=dataset.member_ids,
-            X_test=X_test,
-            member_means_test=means_test,
-            member_sigmas_test=sigmas_test,
         )
 
     def fit_gene_from_design(
@@ -803,23 +850,9 @@ class EnsembleLR:
         dataset: EnsembleGenotypeDataset,
         gene: str,
         design: tuple,
-        test_dataset: Optional[EnsembleGenotypeDataset] = None,
     ) -> EnsembleLRStruct:
         X, snp_ids, chrom, individuals = design
         means, sigmas = dataset.member_targets(gene, individuals)
-        X_test = means_test = sigmas_test = None
-        if test_dataset is not None:
-            try:
-                X_test, means_test, sigmas_test, test_snps, _ = (
-                    test_dataset.get_gene_matrix(gene)
-                )
-            except ValueError:
-                X_test, means_test, sigmas_test = self._empty_test_targets(
-                    len(dataset.members), X.shape[1]
-                )
-            else:
-                if not np.array_equal(snp_ids, test_snps):
-                    raise ValueError("Training and held-out SNP IDs are not aligned.")
         return self.fit_gene_matrix(
             gene,
             X,
@@ -828,9 +861,6 @@ class EnsembleLR:
             snp_ids,
             chrom,
             member_ids=dataset.member_ids,
-            X_test=X_test,
-            member_means_test=means_test,
-            member_sigmas_test=sigmas_test,
         )
 
     def _fit_one(
@@ -840,19 +870,14 @@ class EnsembleLR:
         i: int,
         n: int,
         verbose: bool,
-        test_dataset: Optional[EnsembleGenotypeDataset],
     ) -> Optional[EnsembleLRStruct]:
         try:
-            model = self.fit_gene_from_dataset(
-                dataset,
-                gene,
-                test_dataset=test_dataset,
-            )
+            model = self.fit_gene_from_dataset(dataset, gene)
             if verbose:
                 print(
                     f"[{i}/{n}] fit {gene}: snps={int(model.snp_ids.size)}, "
                     f"fits={len(model.members_) * model.n_bootstraps_}, "
-                    f"{model.evaluation_}_r2={model.heldout_r2_:.4f}, "
+                    f"heldout_r2={model.heldout_r2_:.4f}, "
                     f"pearson_r={model.heldout_pearson_r_:.4f}, "
                     f"n_test={model.n_test_}"
                 )
@@ -866,19 +891,16 @@ class EnsembleLR:
         self,
         dataset: EnsembleGenotypeDataset,
         verbose: bool = True,
-        test_dataset: Optional[EnsembleGenotypeDataset] = None,
     ) -> Dict[str, EnsembleLRStruct]:
         if not isinstance(dataset, EnsembleGenotypeDataset):
             raise TypeError("EnsembleLR requires an EnsembleGenotypeDataset.")
-        if test_dataset is not None and dataset.member_ids != test_dataset.member_ids:
-            raise ValueError("Training and held-out ensemble member IDs differ.")
         genes = list(dataset.genes)
         n = len(genes)
         configure_convergence_warnings(verbose)
 
         if self.n_jobs == 1:
             for i, gene in enumerate(genes, start=1):
-                self._fit_one(dataset, gene, i, n, verbose, test_dataset)
+                self._fit_one(dataset, gene, i, n, verbose)
             return self.models_
 
         with threadpool_limits(limits=1):
@@ -891,7 +913,6 @@ class EnsembleLR:
                         i,
                         n,
                         verbose,
-                        test_dataset,
                     )
                     for i, gene in enumerate(genes, start=1)
                 ]
@@ -1020,46 +1041,53 @@ class EnsembleLR:
         """Save empirical raw-dosage weight distributions to JSON."""
         output = {}
         for gene, model in self.models_.items():
+            selected = model.inclusion_probability_ >= self.pip_threshold
+            snp_ids = model.snp_ids[selected]
             output[gene] = {
-                # Backward-compatible point-prediction fields: mean weights
-                # across all member-bootstrap fits, with every screened SNP kept.
-                "snp_ids": [str(snp) for snp in model.snp_ids],
-                "coefs": [float(value) for value in model.coef_],
+                # Backward-compatible point-prediction fields. The same PIP
+                # mask is applied to the pooled mean and every MI draw.
+                "snp_ids": [str(snp) for snp in snp_ids],
+                "coefs": [float(value) for value in model.coef_[selected]],
                 "chr": self._json_chromosome(model.chr),
                 "intercept": float(model.intercept_),
                 # Empirical distribution across all member-bootstrap fits.
-                "coef_sds": [float(value) for value in model.coef_sd_],
+                "coef_sds": [float(value) for value in model.coef_sd_[selected]],
                 "coef_variances": [
-                    float(value) for value in model.coef_var_
+                    float(value) for value in model.coef_var_[selected]
                 ],
                 "coef_within_variances": [
-                    float(value) for value in model.coef_within_var_
+                    float(value) for value in model.coef_within_var_[selected]
                 ],
                 "coef_between_variances": [
-                    float(value) for value in model.coef_between_var_
+                    float(value) for value in model.coef_between_var_[selected]
                 ],
                 "inclusion_probabilities": [
-                    float(value) for value in model.inclusion_probability_
+                    float(value)
+                    for value in model.inclusion_probability_[selected]
                 ],
                 "sign_stabilities": [
-                    float(value) for value in model.sign_stability_
+                    float(value) for value in model.sign_stability_[selected]
                 ],
                 "intercept_sd": float(model.intercept_sd_),
                 # Full bootstrap vectors preserve cross-SNP covariance for TWAS.
                 "members": [
                     {
                         "member_id": member.member_id,
-                        "coefs": [float(value) for value in member.coef_],
-                        "coef_sds": [float(value) for value in member.coef_sd_],
+                        "coefs": [
+                            float(value) for value in member.coef_[selected]
+                        ],
+                        "coef_sds": [
+                            float(value) for value in member.coef_sd_[selected]
+                        ],
                         "coef_variances": [
-                            float(value) for value in member.coef_var_
+                            float(value) for value in member.coef_var_[selected]
                         ],
                         "inclusion_probabilities": [
                             float(value)
-                            for value in member.inclusion_probability_
+                            for value in member.inclusion_probability_[selected]
                         ],
                         "bootstrap_coefs": [
-                            [float(value) for value in replicate]
+                            [float(value) for value in replicate[selected]]
                             for replicate in member.coef_samples_
                         ],
                         "intercept": float(member.intercept_),
@@ -1077,15 +1105,17 @@ class EnsembleLR:
                     "n_bootstraps": model.n_bootstraps_,
                     "n_fits": len(model.members_) * model.n_bootstraps_,
                     "n_screened_snps": model.n_screened_snps_,
-                    "n_retained_snps": int(model.snp_ids.size),
+                    "n_retained_snps": int(snp_ids.size),
                     "l1_ratio": self.l1_ratio,
                     "alpha_mode": model.alpha_mode_,
                     "sigma_floor": self.sigma_floor,
                     "aleatoric_weighting": self.aleatoric_weighting,
+                    "pip_threshold": self.pip_threshold,
+                    "pip_definition": "fraction_nonzero_across_member_bootstrap_fits",
                     "aggregation": "mean_across_member_bootstrap_fits",
                     "evaluation": model.evaluation_,
                     "screening": "once_per_gene_reused_for_all_fits",
-                    "storage": "all_screened_snps_retained",
+                    "storage": "below_pip_threshold_discarded_after_fitting",
                     "design_scaling": "once_per_gene_reused_for_all_fits",
                     "coefficient_scale": "raw_dosage",
                 },

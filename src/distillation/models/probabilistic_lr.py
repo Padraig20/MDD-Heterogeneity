@@ -28,6 +28,7 @@ from src.distillation.utils import (
     safe_pearson,
     safe_spearman,
     screen_snps,
+    train_test_indices,
 )
 
 
@@ -71,8 +72,8 @@ class ProbabilisticLRStruct:
     x_mean_:  np.ndarray
     x_scale_: np.ndarray
 
-    # Diagnostics (native log-expression space). Held-out metrics are populated
-    # only when a user-supplied test set is provided; otherwise they are NaN.
+    # Diagnostics (native log-expression space). Held-out metrics come from the
+    # per-gene 80:20 split; the persisted heads are refit on all individuals.
     train_r2_:           Optional[float] = None  # held-out R^2 of the mean prediction
     insample_r2_:        Optional[float] = None  # in-sample R^2 on the training individuals
     n_train_:            int = 0
@@ -115,7 +116,9 @@ class ProbabilisticLR:
         self,
         model_name: str      = "elasticnet",
         l1_ratio: float      = 0.5,
-        alpha: float         = 1.0,
+        alpha: Optional[float] = None,
+        cv: int              = 3,
+        alphas: int          = 15,
         max_iter: int        = 10000,
         seed: int            = 42,
         n_jobs: int          = 1,
@@ -123,7 +126,9 @@ class ProbabilisticLR:
     ):
         self.model_name = model_name
         self.l1_ratio   = l1_ratio
-        self.alpha      = float(alpha)
+        self.alpha      = None if alpha is None else float(alpha)
+        self.cv         = int(cv)
+        self.alphas     = int(alphas)
         self.max_iter   = max_iter
         self.seed       = seed
         self.n_jobs     = n_jobs
@@ -136,6 +141,8 @@ class ProbabilisticLR:
             model_name=model_name,
             l1_ratio=l1_ratio,
             alpha=alpha,
+            cv=cv,
+            alphas=alphas,
             max_iter=max_iter,
             seed=seed,
             screen=screen,
@@ -148,6 +155,7 @@ class ProbabilisticLR:
         y: np.ndarray,
         y_aleatoric_log: np.ndarray,
         y_epistemic_log: np.ndarray,
+        alphas: Optional[dict] = None,
     ) -> dict:
         """
         Fit the mean/aleatoric/epistemic heads, all on one shared standardization of
@@ -161,7 +169,10 @@ class ProbabilisticLR:
             ("aleatoric", y_aleatoric_log, True),
             ("epistemic", y_epistemic_log, True),
         ):
-            y_scaler, enet = self._lr._fit_prescaled(X_scaled, target)
+            head_alpha = None if alphas is None else alphas.get(name)
+            y_scaler, enet = self._lr._fit_prescaled(
+                X_scaled, target, alpha=head_alpha
+            )
             head = LinearHead(
                 coef_=enet.coef_.copy(),
                 intercept_=float(enet.intercept_),
@@ -298,10 +309,6 @@ class ProbabilisticLR:
         y_epistemic: np.ndarray,
         snp_ids: np.ndarray,
         chr: int,
-        X_test: Optional[np.ndarray] = None,
-        y_test: Optional[np.ndarray] = None,
-        y_aleatoric_test: Optional[np.ndarray] = None,
-        y_epistemic_test: Optional[np.ndarray] = None,
     ) -> ProbabilisticLRStruct:
         X           = np.asarray(X, dtype=np.float32)
         y           = np.asarray(y, dtype=np.float32)
@@ -324,58 +331,75 @@ class ProbabilisticLR:
         y_aleatoric_log = np.log1p(y_aleatoric)
         y_epistemic_log = np.log1p(y_epistemic)
 
-        has_external_test = (
-            X_test is not None and y_test is not None
-            and y_aleatoric_test is not None and y_epistemic_test is not None
+        nan_metrics = self._nan_metrics(y_aleatoric, y_epistemic)
+        reuse_alphas = (
+            None
+            if self.alpha is None
+            else {"mean": self.alpha, "aleatoric": self.alpha, "epistemic": self.alpha}
         )
-        if has_external_test:
-            X_test           = np.asarray(X_test, dtype=np.float32)
-            y_test           = np.asarray(y_test, dtype=np.float32)
-            y_aleatoric_test = np.asarray(y_aleatoric_test, dtype=np.float32)
-            y_epistemic_test = np.asarray(y_epistemic_test, dtype=np.float32)
-            valid_test = (
-                np.isfinite(y_test) & np.isfinite(y_aleatoric_test) & np.isfinite(y_epistemic_test)
+        train_idx, test_idx = train_test_indices(y.size, seed=self.seed, key=gene)
+        if test_idx is not None:
+            X_tr = X[train_idx]
+            X_te = X[test_idx]
+            if self.model_name == "ridge":
+                X_tr, _, (X_te,) = ld_prune(X_tr, snp_ids, align=[X_te])
+            keep = screen_snps(
+                X_tr,
+                [y[train_idx], y_aleatoric_log[train_idx], y_epistemic_log[train_idx]],
+                self.screen,
             )
-            if not valid_test.all():
-                X_test           = X_test[valid_test]
-                y_test           = y_test[valid_test]
-                y_aleatoric_test = y_aleatoric_test[valid_test]
-                y_epistemic_test = y_epistemic_test[valid_test]
-            y_aleatoric_test = np.clip(y_aleatoric_test, 0.0, None)
-            y_epistemic_test = np.clip(y_epistemic_test, 0.0, None)
+            if keep is not None:
+                X_tr = X_tr[:, keep]
+                X_te = X_te[:, keep]
+            heads_h = self._fit_heads(
+                X_tr,
+                y[train_idx],
+                y_aleatoric_log[train_idx],
+                y_epistemic_log[train_idx],
+                alphas=reuse_alphas,
+            )
+            if reuse_alphas is None:
+                reuse_alphas = {
+                    name: heads_h[name][0].alpha_ for name in heads_h
+                }
+            insample = self._evaluate(
+                heads_h,
+                X_tr,
+                y[train_idx],
+                y_aleatoric[train_idx],
+                y_epistemic[train_idx],
+            )
+            metrics = self._evaluate(
+                heads_h,
+                X_te,
+                y[test_idx],
+                y_aleatoric[test_idx],
+                y_epistemic[test_idx],
+            )
+            n_train, n_test = int(train_idx.size), int(test_idx.size)
+        else:
+            insample = nan_metrics
+            metrics = nan_metrics
+            n_train, n_test = int(y.size), 0
 
         if self.model_name == "ridge":
-            # perform LD pruning (dropping the same SNP columns from the external test
-            # matrix, if any, so train/test stay column-aligned); shared across all
-            # three heads since they all use the same X.
-            if has_external_test:
-                X, snp_ids, (X_test,) = ld_prune(X, snp_ids, align=[X_test])
-            else:
-                X, snp_ids = ld_prune(X, snp_ids)
-
+            X, snp_ids = ld_prune(X, snp_ids)
         keep = screen_snps(
             X, [y, y_aleatoric_log, y_epistemic_log], self.screen
         )
         if keep is not None:
             X = X[:, keep]
             snp_ids = np.asarray(snp_ids)[keep]
-            if has_external_test:
-                X_test = X_test[:, keep]
 
-        heads_final = self._fit_heads(X, y, y_aleatoric_log, y_epistemic_log)
-        insample = self._evaluate(heads_final, X, y, y_aleatoric, y_epistemic)
+        heads_final = self._fit_heads(
+            X, y, y_aleatoric_log, y_epistemic_log, alphas=reuse_alphas
+        )
+        if test_idx is None:
+            insample = self._evaluate(heads_final, X, y, y_aleatoric, y_epistemic)
+
         insample_r2 = insample["r2"]
         insample_pearson_r = insample["pearson_r"]
         insample_spearman_r = insample["spearman_r"]
-        n_train = int(y.size)
-        if has_external_test and y_test.size > 0:
-            metrics = self._evaluate(
-                heads_final, X_test, y_test, y_aleatoric_test, y_epistemic_test
-            )
-            n_test = int(y_test.size)
-        else:
-            metrics = self._nan_metrics(y_aleatoric, y_epistemic)
-            n_test = 0
 
         mean_head,      x_scaler, _ = heads_final["mean"]
         aleatoric_head, _,        _ = heads_final["aleatoric"]
@@ -425,37 +449,17 @@ class ProbabilisticLR:
         self,
         dataset: GenotypeDataset,
         gene: str,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> ProbabilisticLRStruct:
         X, y, y_aleatoric, y_epistemic, snp_ids, chr = dataset.get_gene_matrix(
             gene, return_uncertainty=True
         )
-        X_test, y_test, y_aleatoric_test, y_epistemic_test = None, None, None, None
-        if test_dataset is not None:
-            try:
-                X_test, y_test, y_aleatoric_test, y_epistemic_test, _, _ = (
-                    test_dataset.get_gene_matrix(gene, return_uncertainty=True)
-                )
-            except ValueError:
-                # Gene has no rows in the external test set; train on all of `X`/`y`/
-                # uncertainty targets but report held-out metrics as NaN (see
-                # fit_gene_matrix).
-                X_test = np.empty((0, X.shape[1]), dtype=X.dtype)
-                y_test = np.empty(0, dtype=y.dtype)
-                y_aleatoric_test = np.empty(0, dtype=y_aleatoric.dtype)
-                y_epistemic_test = np.empty(0, dtype=y_epistemic.dtype)
-        return self.fit_gene_matrix(
-            gene, X, y, y_aleatoric, y_epistemic, snp_ids, chr,
-            X_test=X_test, y_test=y_test,
-            y_aleatoric_test=y_aleatoric_test, y_epistemic_test=y_epistemic_test,
-        )
+        return self.fit_gene_matrix(gene, X, y, y_aleatoric, y_epistemic, snp_ids, chr)
 
     def fit_gene_from_design(
         self,
         dataset: GenotypeDataset,
         gene: str,
         design: tuple,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> ProbabilisticLRStruct:
         """
         Fit one gene against a design matrix read elsewhere (see
@@ -464,23 +468,7 @@ class ProbabilisticLR:
         """
         X, snp_ids, chr, individuals = design
         y, y_aleatoric, y_epistemic  = dataset.gene_targets(gene, individuals)
-
-        X_test, y_test, y_aleatoric_test, y_epistemic_test = None, None, None, None
-        if test_dataset is not None:
-            try:
-                X_test, y_test, y_aleatoric_test, y_epistemic_test, _, _ = (
-                    test_dataset.get_gene_matrix(gene, return_uncertainty=True)
-                )
-            except ValueError:
-                X_test = np.empty((0, X.shape[1]), dtype=X.dtype)
-                y_test = np.empty(0, dtype=y.dtype)
-                y_aleatoric_test = np.empty(0, dtype=y_aleatoric.dtype)
-                y_epistemic_test = np.empty(0, dtype=y_epistemic.dtype)
-        return self.fit_gene_matrix(
-            gene, X, y, y_aleatoric, y_epistemic, snp_ids, chr,
-            X_test=X_test, y_test=y_test,
-            y_aleatoric_test=y_aleatoric_test, y_epistemic_test=y_epistemic_test,
-        )
+        return self.fit_gene_matrix(gene, X, y, y_aleatoric, y_epistemic, snp_ids, chr)
 
     def _fit_one(
         self,
@@ -489,10 +477,9 @@ class ProbabilisticLR:
         i: int,
         n: int,
         verbose: bool,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> Optional[ProbabilisticLRStruct]:
         try:
-            model = self.fit_gene_from_dataset(dataset, gene, test_dataset=test_dataset)
+            model = self.fit_gene_from_dataset(dataset, gene)
             if verbose:
                 print(
                     f"[{i}/{n}] fit {gene}: "
@@ -514,17 +501,11 @@ class ProbabilisticLR:
         self,
         dataset: GenotypeDataset,
         verbose: bool = True,
-        test_dataset: Optional[GenotypeDataset] = None,
     ) -> Dict[str, ProbabilisticLRStruct]:
         if not getattr(dataset, "has_uncertainty", False):
             raise ValueError(
                 "ProbabilisticLR requires a dataset built with both aleatoric and "
                 "epistemic targets. Pass --aleatoric and --epistemic to train.py."
-            )
-        if test_dataset is not None and not getattr(test_dataset, "has_uncertainty", False):
-            raise ValueError(
-                "ProbabilisticLR requires the held-out test dataset to also carry "
-                "aleatoric/epistemic targets; pass --aleatoric/--epistemic to train.py."
             )
 
         genes  = list(dataset.genes)
@@ -535,7 +516,7 @@ class ProbabilisticLR:
 
         if n_jobs == 1:
             for i, gene in enumerate(genes, start=1):
-                self._fit_one(dataset, gene, i, n, verbose, test_dataset=test_dataset)
+                self._fit_one(dataset, gene, i, n, verbose)
             return self.models_
 
         # Parallel path: thread pool over genes with BLAS pinned to 1 thread per call.
@@ -544,7 +525,7 @@ class ProbabilisticLR:
         with threadpool_limits(limits=1):
             with ThreadPoolExecutor(max_workers=n_jobs) as ex:
                 futures = {
-                    ex.submit(self._fit_one, dataset, gene, i, n, verbose, test_dataset): gene
+                    ex.submit(self._fit_one, dataset, gene, i, n, verbose): gene
                     for i, gene in enumerate(genes, start=1)
                 }
                 iterator = as_completed(futures)
@@ -579,13 +560,13 @@ class ProbabilisticLR:
             rows.append(
                 {
                     "gene": gene,
-                    "r2": model.train_r2_,           # held-out (per-gene 20%) R^2 of the mean
+                    "r2": model.train_r2_,
                     "insample_r2": model.insample_r2_,
                     "n_train": model.n_train_,
                     "n_test": model.n_test_,
-                    "pearson_r": model.pearson_r_,   # held-out, bounded [-1, 1] mean-fit correlation
+                    "pearson_r": model.pearson_r_,
                     "insample_pearson_r": model.insample_pearson_r_,
-                    "spearman_r": model.spearman_r_,  # held-out, rank-based, bounded [-1, 1]
+                    "spearman_r": model.spearman_r_,
                     "insample_spearman_r": model.insample_spearman_r_,
                     "wasserstein": model.train_w2_,
                     "mean_w2": model.mean_w2_,

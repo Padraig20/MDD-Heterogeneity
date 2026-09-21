@@ -53,7 +53,7 @@ class WandBLogger:
         mean_nnz   = float(df["nonzero_weights"].mean())
         median_nnz = float(df["nonzero_weights"].median())
 
-        # in-sample (train fold of the same held-out split), for the overfitting gap
+        # in-sample metrics of the persisted model, for the overfitting gap
         has_insample  = "insample_r2" in df.columns
         mean_insample = float(df["insample_r2"].mean()) if has_insample else float("nan")
 
@@ -70,7 +70,13 @@ class WandBLogger:
             # sample size (n_test). Added as a column so it shows up in the summary
             # table too; NaN wherever pearson_r or n_test is unavailable/undefined.
             if "n_test" in df.columns:
-                df["pearson_pvalue"] = pearson_pvalue(df["pearson_r"].to_numpy(), df["n_test"].to_numpy())
+                n_eval = df["n_test"].to_numpy()
+                if "n_train" in df.columns:
+                    n_train = df["n_train"].to_numpy()
+                    n_eval = np.where(n_eval > 0, n_eval, n_train)
+                df["pearson_pvalue"] = pearson_pvalue(
+                    df["pearson_r"].to_numpy(), n_eval
+                )
             else:
                 df["pearson_pvalue"] = float("nan")
 
@@ -93,9 +99,9 @@ class WandBLogger:
 
             fig_r2, ax = plt.subplots(figsize=(8, 5))
             ax.scatter(rank_r2, df_by_r2["r2"], s=4, alpha=0.5)
-            ax.set_title(f"{cell_type} — {model_label} held-out R² (per-gene)")
+            ax.set_title(f"{cell_type} — {model_label} R² (per-gene)")
             ax.set_xlabel("Gene rank (sorted by R² ascending)")
-            ax.set_ylabel("Held-out R²")
+            ax.set_ylabel("R²")
             annot = f"mean_R² = {mean_r2:.3f}\nmedian_R² = {median_r2:.3f}"
             if has_insample:
                 annot += f"\nmean in-sample_R² = {mean_insample:.3f}"
@@ -134,9 +140,9 @@ class WandBLogger:
                 ax.scatter(rank_pearson, df_by_pearson["pearson_r"], s=4, alpha=0.5)
                 ax.axhline(0.0, color="grey", linestyle=":", linewidth=1)
                 ax.set_ylim(-1.05, 1.05)
-                ax.set_title(f"{cell_type} — {model_label} held-out Pearson r (per-gene)")
+                ax.set_title(f"{cell_type} — {model_label} Pearson r (per-gene)")
                 ax.set_xlabel("Gene rank (sorted by Pearson r ascending)")
-                ax.set_ylabel("Held-out Pearson r")
+                ax.set_ylabel("Pearson r")
                 annot = f"mean_r = {mean_pearson_r:.3f}\nmedian_r = {median_pearson_r:.3f}"
                 if has_insample_pearson:
                     annot += f"\nmean in-sample_r = {mean_insample_pearson:.3f}"
@@ -345,7 +351,7 @@ class WandBLogger:
         fig, ax = plt.subplots(figsize=(7, 5))
         ax.hist(vals, bins=n_bins, range=(-1.0, 1.0), edgecolor="white", color="0.45")
         ax.set_xlim(-1.0, 1.0)
-        ax.set_title(f"{cell_type} — {model_label} held-out Spearman r (per-gene)")
+        ax.set_title(f"{cell_type} — {model_label} Spearman r (per-gene)")
         ax.set_xlabel("Spearman correlation")
         ax.set_ylabel("number of genes")
         annot = f"mean = {mean_r:.3f}\nmedian = {median_r:.3f}\nn_genes = {vals.size}"
