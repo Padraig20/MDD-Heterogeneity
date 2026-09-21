@@ -165,8 +165,8 @@ def _entry_chrom(entry: dict) -> str:
 def _bootstrap_replicates(entry: dict) -> list[tuple[str, list]]:
     """
     Every member-bootstrap elastic-net fit of one ensemble gene entry, as
-    `(draw_id, coefs)`. Each replicate is already restricted to the same
-    PIP-selected SNPs as the pooled `coefs`, so all draws stay aligned.
+    `(draw_id, coefs)`. Each replicate is aligned with the pooled `coefs`
+    over the same PIP-selected SNPs.
     """
     replicates = []
     for member in entry.get("members", []):

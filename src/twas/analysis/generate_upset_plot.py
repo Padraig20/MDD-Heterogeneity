@@ -11,8 +11,10 @@ the model arms (``this-study`` and ``ctPred``). Every artifact is
 namespaced under ``general/<scope>/...`` so it sits in its own section
 inside each run. Each scope also gets a table and figure of genes that
 are significant in exactly one displayed cell type (ENSID, gene name,
-p-value, and that cell type). Optional ``--output`` still writes a local
-copy of each figure.
+p-value, and that cell type), plus a bulk summary-stat table that
+ACAT-combines each gene's p-values across the displayed cell types and
+averages the remaining numeric columns. Optional ``--output`` still
+writes a local copy of each figure and bulk table.
 
     For example::
 
@@ -58,7 +60,12 @@ import pandas as pd
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
 
-from src.twas.aggregate import acat_rows, benjamini_hochberg
+from src.twas.aggregate import (
+    acat_rows,
+    annotate_significance,
+    benjamini_hochberg,
+    summarize,
+)
 from src.twas.compare import normalize_cell_type
 from src.twas.wandb_logger import TwasWandBLogger
 
@@ -78,6 +85,60 @@ DEFAULT_MHC_REGION = "6:25000000-34000000"
 DEFAULT_GTF = Path("data/hg38/Homo_sapiens.GRCh38.115.gtf")
 GENERAL_PREFIX = "general"
 SPECIFIC_GENE_PLOT_ROWS = 80
+BULK_ACAT_COLUMNS = ("pvalue", "pvalue_expectation")
+BULK_LABEL_COLUMNS = ("gene_name", "block", "block_index")
+BULK_COLUMN_ORDER = (
+    "gene",
+    "gene_name",
+    "zscore",
+    "pvalue",
+    "qvalue",
+    "pvalue_expectation",
+    "qvalue_expectation",
+    "effect_size",
+    "n_cell_types",
+    "zscore_var",
+    "zscore_sd",
+    "zscore_ci_low",
+    "zscore_ci_high",
+    "zscore_min",
+    "zscore_max",
+    "pvalue_expectation_var",
+    "pvalue_expectation_sd",
+    "pvalue_expectation_ci_low",
+    "pvalue_expectation_ci_high",
+    "pvalue_expectation_min",
+    "pvalue_expectation_max",
+    "effect_size_var",
+    "effect_size_sd",
+    "effect_size_ci_low",
+    "effect_size_ci_high",
+    "effect_size_min",
+    "effect_size_max",
+    "n_draws",
+    "n_draws_significant_bonferroni",
+    "agreement_bonferroni",
+    "n_draws_significant_fdr",
+    "agreement_fdr",
+    "n_snps_used",
+    "mean_n_snps_used",
+    "n_snps_in_model",
+    "n_snps_in_cov",
+    "best_gwas_p",
+    "var_g",
+    "pred_perf_r2",
+    "pred_perf_pval",
+    "pred_perf_qval",
+    "largest_weight",
+    "significant_fdr",
+    "significant_bonferroni",
+    "bonferroni_threshold",
+    "significant_fdr_expectation",
+    "significant_bonferroni_expectation",
+    "bonferroni_threshold_expectation",
+    "block_index",
+    "block",
+)
 
 _GTF_GENE_ID = re.compile(r'gene_id\s+"([^"]+)"')
 
@@ -223,7 +284,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Optional local figure (.png, .pdf, .svg, or another Matplotlib "
-            "format). Omit to log only to WandB."
+            "format). A bulk_results.csv is written beside each figure. "
+            "Omit to log only to WandB."
         ),
     )
     parser.add_argument(
@@ -1356,6 +1418,209 @@ def load_arm_pvalues(
     return _pvalues_and_names(files, pvalue_column)
 
 
+def _is_derived_significance_column(name: str) -> bool:
+    """True for TWAS multiple-testing columns recomputed after ACAT."""
+    return (
+        name.startswith("qvalue")
+        or name.startswith("significant_")
+        or name.startswith("bonferroni_threshold")
+    )
+
+
+def _read_results_table(path: Path) -> pd.DataFrame:
+    """Load one run.py ``results.csv`` indexed later by gene."""
+    frame = pd.read_csv(path)
+    if "gene" not in frame.columns:
+        raise ValueError(f"{path} is missing required column 'gene'.")
+    genes = frame["gene"].astype("string").str.strip()
+    valid = genes.notna() & genes.ne("")
+    frame = frame.loc[valid].copy()
+    frame["gene"] = genes.loc[valid].astype(str)
+    if bool(frame["gene"].duplicated().any()):
+        duplicated = frame.loc[frame["gene"].duplicated(), "gene"].iloc[0]
+        raise ValueError(f"{path}: duplicate gene identifier {duplicated!r}.")
+    return frame
+
+
+def _index_results_by_gene(frame: pd.DataFrame) -> pd.DataFrame:
+    """Gene-indexed copy of one results table."""
+    indexed = frame.copy()
+    if indexed.index.name == "gene" and "gene" not in indexed.columns:
+        return indexed
+    return indexed.set_index("gene")
+
+
+def _first_nonempty_by_gene(values: pd.Series) -> pd.Series:
+    """First non-missing label per gene in a stacked cell-type column."""
+    labels = values
+    if pd.api.types.is_string_dtype(values) or values.dtype == object:
+        text = values.astype("string").str.strip()
+        labels = text.where(
+            text.notna() & text.ne("") & ~text.str.lower().isin({"nan", "none"})
+        )
+    return labels.groupby(level="gene").first()
+
+
+def _order_bulk_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Put the usual TWAS columns first; keep any extras on the right."""
+    ordered = [column for column in BULK_COLUMN_ORDER if column in frame.columns]
+    extras = [column for column in frame.columns if column not in ordered]
+    return frame[ordered + extras]
+
+
+def combine_result_tables(
+    tables: Mapping[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Build one bulk table: ACAT p-values, mean of other numeric columns.
+
+    Identifier columns (``gene_name``, LD-block labels) keep the first
+    non-missing value. Multiple-testing flags are dropped so the caller can
+    recompute them on the combined p-values.
+    """
+    if not tables:
+        raise ValueError("At least one results table is required for a bulk summary.")
+
+    indexed = {
+        name: _index_results_by_gene(frame)
+        for name, frame in tables.items()
+    }
+    stacked = pd.concat(indexed, axis=0, names=["cell_type", "gene"])
+    result = pd.DataFrame(
+        index=pd.Index(stacked.index.get_level_values("gene").unique(), name="gene")
+    )
+
+    for column in BULK_LABEL_COLUMNS:
+        if column in stacked.columns:
+            result[column] = _first_nonempty_by_gene(stacked[column]).reindex(
+                result.index
+            )
+
+    for column in BULK_ACAT_COLUMNS:
+        if column not in stacked.columns:
+            continue
+        matrix = stacked[column].unstack(level="cell_type")
+        result[column] = acat_rows(matrix.reindex(result.index))
+
+    if "pvalue" in stacked.columns:
+        finite = np.isfinite(pd.to_numeric(stacked["pvalue"], errors="coerce"))
+        result["n_cell_types"] = (
+            pd.Series(finite, index=stacked.index)
+            .groupby(level="gene")
+            .sum()
+            .reindex(result.index)
+            .fillna(0)
+            .astype(int)
+        )
+    else:
+        result["n_cell_types"] = (
+            stacked.groupby(level="gene").size().reindex(result.index).fillna(0).astype(int)
+        )
+
+    skip = set(BULK_ACAT_COLUMNS) | set(BULK_LABEL_COLUMNS) | {"n_cell_types"}
+    numeric_columns = [
+        column
+        for column in stacked.columns
+        if column not in skip
+        and not _is_derived_significance_column(column)
+        and pd.api.types.is_numeric_dtype(stacked[column])
+    ]
+    if numeric_columns:
+        means = stacked[numeric_columns].groupby(level="gene").mean()
+        for column in means.columns:
+            result[column] = means[column].reindex(result.index)
+
+    return _order_bulk_columns(result.reset_index())
+
+
+def group_onek1k_result_tables(
+    result_files: Sequence[tuple[str, Path]],
+) -> dict[str, pd.DataFrame]:
+    """Collapse fine OneK1K results to scPrediXcan groups for a bulk table."""
+    by_key: dict[str, tuple[str, Path]] = {}
+    for item in result_files:
+        key = _onek1k_key(item[0])
+        if key in by_key:
+            raise ValueError(
+                f"Ambiguous cell-type directories {by_key[key][0]!r} and "
+                f"{item[0]!r}."
+            )
+        by_key[key] = item
+
+    grouped: dict[str, pd.DataFrame] = {}
+    for group_name, expected_members in ONEK1K_GROUPS:
+        members = [
+            by_key[key]
+            for member in expected_members
+            if (key := _onek1k_key(member)) in by_key
+        ]
+        if not members:
+            continue
+        tables = {
+            cell_type: _read_results_table(path) for cell_type, path in members
+        }
+        if len(members) == 1:
+            grouped[group_name] = next(iter(tables.values()))
+            continue
+        grouped[group_name] = combine_result_tables(tables)
+    if not grouped:
+        raise ValueError("No recognized OneK1K cell types were available to group.")
+    return grouped
+
+
+def load_arm_result_tables(
+    args: argparse.Namespace, arm: str
+) -> dict[str, pd.DataFrame]:
+    """Per-displayed-cell-type results used to build one arm's bulk table."""
+    if args.group_onek1k:
+        files = discover_result_files(args.input_dir, arm)
+        tables = group_onek1k_result_tables(files)
+        if args.cell_types is not None:
+            selected = select_gene_sets(
+                {name: set() for name in tables}, args.cell_types
+            )
+            tables = {name: tables[name] for name in selected}
+        return tables
+    files = discover_result_files(args.input_dir, arm, args.cell_types)
+    return {cell_type: _read_results_table(path) for cell_type, path in files}
+
+
+def filter_results_by_scope(
+    frame: pd.DataFrame,
+    scope: str,
+    mhc_gene_ids: set[str] | None = None,
+) -> pd.DataFrame:
+    """Restrict a bulk results table to all, inside-MHC, or outside-MHC genes."""
+    if scope not in GENE_SCOPES:
+        raise ValueError(f"Unknown gene scope: {scope}")
+    if scope == "all":
+        return frame.copy()
+    if mhc_gene_ids is None:
+        raise ValueError(f"MHC gene IDs are required for scope {scope!r}.")
+    if "gene" not in frame.columns:
+        raise ValueError("Bulk results table is missing required column 'gene'.")
+    in_mhc = frame["gene"].map(_gene_identifier_key).isin(mhc_gene_ids)
+    keep = in_mhc if scope == "in-mhc" else ~in_mhc
+    return frame.loc[keep].copy()
+
+
+def annotate_bulk_results(frame: pd.DataFrame, alpha: float) -> pd.DataFrame:
+    """Recompute FDR/Bonferroni calls on ACAT-combined (or E[z]) p-values."""
+    if frame.empty:
+        return _order_bulk_columns(frame.copy())
+    annotated = frame.copy()
+    if "pvalue" in annotated.columns:
+        annotated = annotate_significance(annotated, fdr=alpha, sort=True)
+    if "pvalue_expectation" in annotated.columns:
+        annotated = annotate_significance(
+            annotated,
+            fdr=alpha,
+            pvalue_column="pvalue_expectation",
+            suffix="_expectation",
+            sort="pvalue" not in annotated.columns,
+        )
+    return _order_bulk_columns(annotated)
+
+
 def _figure_title(title: str | None, arm: str) -> str:
     """Keep the arm visible on the figure itself, not only in the WandB key."""
     return f"{title} ({arm})" if title else arm
@@ -1595,6 +1860,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     error,
                 )
                 arm_pvalues, arm_gene_names = {}, {}
+            try:
+                arm_result_tables = load_arm_result_tables(args, arm)
+                bulk_results = combine_result_tables(arm_result_tables)
+                n_source_cell_types = len(arm_result_tables)
+            except (FileNotFoundError, ValueError) as error:
+                logging.warning(
+                    "Skipping bulk summary-stat table for %s: %s",
+                    arm,
+                    error,
+                )
+                bulk_results = None
+                n_source_cell_types = 0
             for scope in scopes:
                 gene_sets = filter_gene_sets_by_scope(
                     base_gene_sets, scope, mhc_gene_ids
@@ -1641,6 +1918,27 @@ def main(argv: Sequence[str] | None = None) -> None:
                     len(specific)
                 )
 
+                scoped_bulk: pd.DataFrame | None = None
+                if bulk_results is not None:
+                    scoped_bulk = annotate_bulk_results(
+                        filter_results_by_scope(
+                            bulk_results, scope, mhc_gene_ids
+                        ),
+                        args.alpha,
+                    )
+                    tables[_log_key(scope, "bulk_results")] = scoped_bulk
+                    bulk_stats = summarize(
+                        scoped_bulk,
+                        fdr=args.alpha,
+                        extra={"n_source_cell_types": n_source_cell_types},
+                    )
+                    wandb_summary.update(
+                        {
+                            _log_key(scope, f"bulk/{name}"): value
+                            for name, value in bulk_stats.items()
+                        }
+                    )
+
                 if args.output is not None:
                     output = output_for_variant(
                         args.output,
@@ -1660,6 +1958,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                     logging.info(
                         "Wrote %s [%s/%s].", specific_output, arm, scope
                     )
+                    if scoped_bulk is not None:
+                        bulk_output = output.with_name(
+                            f"{output.stem}_bulk_results.csv"
+                        )
+                        scoped_bulk.to_csv(bulk_output, index=False)
+                        logging.info(
+                            "Wrote %s [%s/%s].", bulk_output, arm, scope
+                        )
 
                 sentence = format_sharing_summary(sharing, hit_kind=hit_kind)
                 logging.info(
@@ -1674,6 +1980,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                     stats["n_intersections_shown"],
                     stats["n_intersections_available"],
                 )
+                if scoped_bulk is not None:
+                    n_bulk_hits = 0
+                    hit_column = f"significant_{args.criterion}"
+                    if hit_column in scoped_bulk.columns:
+                        n_bulk_hits = int(scoped_bulk[hit_column].sum())
+                    logging.info(
+                        "%s [%s/%s]: bulk table %d gene(s), %d significant by "
+                        "%s (ACAT p-values, other stats averaged).",
+                        arm,
+                        GENERAL_PREFIX,
+                        scope,
+                        len(scoped_bulk),
+                        n_bulk_hits,
+                        args.criterion,
+                    )
                 logging.info("%s", sentence)
 
             logger.start(arm, config=_wandb_config(args, arm))
