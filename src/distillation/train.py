@@ -136,6 +136,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--sequence-window",
+        type=int,
+        default=500_000,
+        help=(
+            "Half-width in base pairs of the cis-window around each gene's TSS "
+            "from which SNPs are collected (e.g. 500_000 keeps SNPs within "
+            "500 kb of the TSS). Defaults to 500000."
+        ),
+    )
+    parser.add_argument(
         "-l1", "--l1-ratio",
         type=float,
         default=0.5,
@@ -377,6 +387,7 @@ def prepare_cell_type(
         idx2ind=idx2ind,
         y=os.path.join(args.targets, ct_file),
         bim_dir=args.observations,
+        window_size=args.sequence_window,
         select_genes=args.select_genes,
         normalize=args.norm_targets,
         max_individuals=args.max_individuals,
@@ -494,6 +505,7 @@ def prepare_ensemble_cell_type(
                 y=member_dir / "preds" / ct_file,
                 y_sigma=member_dir / "sigmas" / ct_file,
                 bim_dir=args.observations,
+                window_size=args.sequence_window,
                 select_genes=args.select_genes,
                 normalize=args.norm_targets,
                 max_individuals=args.max_individuals,
@@ -621,6 +633,9 @@ def main() -> None:
     if args.alphas <= 0:
         logging.error("--alphas must be positive.")
         sys.exit(1)
+    if args.sequence_window <= 0:
+        logging.error("--sequence-window must be positive.")
+        sys.exit(1)
     if ensemble_mode and (
         not np.isfinite(args.sigma_floor) or args.sigma_floor <= 0.0
     ):
@@ -725,6 +740,10 @@ def main() -> None:
     logging.info("Fitting genes per cell type with %d parallel workers.", jobs)
 
     screen_snps = args.screen_snps if args.screen_snps and args.screen_snps > 0 else None
+    logging.info(
+        "Collecting SNPs in a ±%d bp cis-window around each TSS.",
+        args.sequence_window,
+    )
     if screen_snps is not None and ensemble_mode:
         logging.info(
             "Screening each cis-window to the %d SNPs with the strongest "
