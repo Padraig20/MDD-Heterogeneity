@@ -24,11 +24,15 @@ a standard QQ plot (with genomic-control ``lambda`` and ``N``) and a QQ that
 splits silver-standard genes from all others. Comparison figures, overlap
 metrics, and the this-study-vs-ctPred QQ (silver-standard vs other genes)
 are logged only on the this-study run. The bulk QQs combine each gene's
-p-values across cell types with ACAT.
+p-values across cell types with ACAT. If a sign silver standard is provided,
+pooled effect-size signs are compared with its reference signs for significant
+genes. MI model sign conflicts and cross-cell-type sign conflicts are reported
+separately; cell types have equal weight in the bulk direction table.
 
     python -m src.twas.analysis.compare_silver_standard \\
         --input-dir sle-twas/reg-model-mi-sep-norm/results \\
         --silver-standard sle_silver_standard.tsv \\
+        --sle-sign-silver-standard data/sle_sign_silver_standard.tsv \\
         --wandb-project sle-twas \\
         --criterion fdr
 """
@@ -164,6 +168,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=Path,
         required=True,
         help="TSV written by get_sle_silver_standard.py.",
+    )
+    parser.add_argument(
+        "--sle-sign-silver-standard",
+        type=Path,
+        default=None,
+        help=(
+            "Optional TSV with gene_id, gene_symbol and reference_sign (-1/+1) "
+            "for comparing TWAS effect directions."
+        ),
     )
     parser.add_argument(
         "--wandb-project",
@@ -1464,6 +1477,265 @@ def plot_qq_comparison(
     return figure
 
 
+def load_sign_standard(path: Path) -> pd.DataFrame:
+    """Load one reference direction per Ensembl gene ID."""
+    if not path.is_file():
+        raise FileNotFoundError(f"SLE sign silver standard not found: {path}")
+    frame = pd.read_csv(path, sep="\t", dtype={"gene_id": "string", "gene_symbol": "string"})
+    required = {"gene_id", "gene_symbol", "reference_sign"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"{path} is missing required column(s) {sorted(missing)}.")
+    frame = frame.copy()
+    frame["gene_id"] = frame["gene_id"].map(_gene_identifier_key)
+    frame["reference_sign"] = pd.to_numeric(frame["reference_sign"], errors="coerce")
+    if (
+        frame.empty
+        or frame["gene_id"].isin(("", "NAN", "NONE", "<NA>")).any()
+        or frame["gene_id"].duplicated().any()
+        or not frame["reference_sign"].isin((-1, 1)).all()
+    ):
+        raise ValueError(
+            f"{path} needs unique, nonempty gene IDs and reference_sign values "
+            "of -1 or +1."
+        )
+    frame["reference_sign"] = frame["reference_sign"].astype(int)
+    return frame.sort_values("gene_symbol").reset_index(drop=True)
+
+
+def _direction_arm_frame(
+    path: Path, arm: str, args: argparse.Namespace, reference_ids: set[str]
+) -> pd.DataFrame:
+    """Read pooled signs and, when available, signs for individual MI models."""
+    frame = pd.read_csv(path)
+    if not {"gene", "effect_size"} <= set(frame.columns):
+        raise ValueError(f"{path} needs gene and effect_size for direction analysis.")
+    keys = frame["gene"].astype("string").str.strip().map(_gene_identifier_key)
+    keep = keys.isin(reference_ids)
+    if keys[keep].duplicated().any():
+        raise ValueError(f"{path} has duplicate reference gene IDs.")
+    prefix = "this_study" if arm == "this-study" else "ctpred"
+    effect = pd.to_numeric(frame["effect_size"], errors="coerce")
+    minimum = pd.to_numeric(frame.get("effect_size_min", effect), errors="coerce")
+    maximum = pd.to_numeric(frame.get("effect_size_max", effect), errors="coerce")
+    n_draws = pd.to_numeric(
+        frame.get("n_draws", pd.Series(1, index=frame.index)), errors="coerce"
+    )
+    result = pd.DataFrame({
+        "gene_id": keys[keep].astype(str).to_numpy(),
+        f"{prefix}_tested": True,
+        f"{prefix}_significant": _hit_mask(
+            frame, path, args.criterion, args.combination,
+            _arm_min_agreement(args, arm),
+        )[keep].to_numpy(dtype=bool),
+        f"{prefix}_effect_size": effect[keep].to_numpy(dtype=float),
+        f"{prefix}_effect_min": minimum[keep].to_numpy(dtype=float),
+        f"{prefix}_effect_max": maximum[keep].to_numpy(dtype=float),
+        f"{prefix}_n_models": n_draws[keep].to_numpy(dtype=float),
+    })
+    result[f"{prefix}_sign"] = np.sign(result[f"{prefix}_effect_size"])
+
+    # run.py writes this table for MI runs. It permits a positive/negative
+    # model count; min/max from results.csv still detects disagreement if absent.
+    draw_path = path.parent / "per_draw_zscores.csv"
+    has_draws = draw_path.is_file()
+    has_extrema = {"effect_size_min", "effect_size_max"} <= set(frame.columns)
+    result[f"{prefix}_model_signs_unavailable"] = (
+        (not has_draws)
+        & result[f"{prefix}_n_models"].gt(1)
+        & (
+            (not has_extrema)
+            | result[f"{prefix}_effect_min"].isna()
+            | result[f"{prefix}_effect_max"].isna()
+        )
+    )
+    if has_draws:
+        draws = pd.read_csv(draw_path, usecols=["gene", "effect_size"])
+        draw_keys = draws["gene"].astype("string").str.strip().map(_gene_identifier_key)
+        draw_signs = np.sign(pd.to_numeric(draws["effect_size"], errors="coerce"))
+        counts = pd.DataFrame({"gene_id": draw_keys, "sign": draw_signs})
+        counts = counts[counts["gene_id"].isin(reference_ids)]
+        counts = counts.groupby(["gene_id", "sign"]).size().unstack(fill_value=0)
+        for sign, label in ((1.0, "positive"), (-1.0, "negative"), (0.0, "zero")):
+            result[f"{prefix}_n_models_{label}"] = result["gene_id"].map(
+                counts.get(sign, pd.Series(dtype=int))
+            ).fillna(0).astype(int)
+        observed = sum(
+            result[f"{prefix}_n_models_{label}"]
+            for label in ("positive", "negative", "zero")
+        )
+        result[f"{prefix}_model_signs_unavailable"] |= (
+            result[f"{prefix}_n_models"].gt(1)
+            & observed.lt(result[f"{prefix}_n_models"])
+        )
+    else:
+        single = result[f"{prefix}_n_models"].eq(1)
+        for sign, label in ((1.0, "positive"), (-1.0, "negative"), (0.0, "zero")):
+            result[f"{prefix}_n_models_{label}"] = np.where(
+                single, result[f"{prefix}_sign"].eq(sign).astype(int), np.nan
+            )
+    observed = sum(
+        result[f"{prefix}_n_models_{label}"]
+        for label in ("positive", "negative", "zero")
+    )
+    result[f"{prefix}_fraction_positive_models"] = (
+        result[f"{prefix}_n_models_positive"] / observed.replace(0, np.nan)
+    )
+    result[f"{prefix}_model_disagreement"] = (
+        (result[f"{prefix}_effect_min"] < 0)
+        & (result[f"{prefix}_effect_max"] > 0)
+    ) | (
+        (result[f"{prefix}_n_models_positive"] > 0)
+        & (result[f"{prefix}_n_models_negative"] > 0)
+    )
+    return result
+
+
+def _direction_status(row: pd.Series, prefix: str) -> str:
+    if not row[f"{prefix}_tested"]:
+        return "not_tested"
+    if not row[f"{prefix}_significant"]:
+        return "not_significant"
+    if row[f"{prefix}_model_disagreement"]:
+        return "mixed_models"
+    if row[f"{prefix}_model_signs_unavailable"]:
+        return "models_unavailable"
+    sign = row[f"{prefix}_sign"]
+    if pd.isna(sign) or sign == 0:
+        return "missing_or_zero"
+    return "concordant" if sign == row["reference_sign"] else "discordant"
+
+
+def direction_cell_table(
+    reference: pd.DataFrame,
+    cell_type: str,
+    ours_path: Path,
+    theirs_path: Path,
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    """One row per reference gene, with both arms side by side."""
+    table = reference.copy()
+    table.insert(0, "cell_type", cell_type)
+    reference_ids = set(reference["gene_id"])
+    for arm, path, prefix in (
+        ("this-study", ours_path, "this_study"),
+        ("ctPred", theirs_path, "ctpred"),
+    ):
+        table = table.merge(
+            _direction_arm_frame(path, arm, args, reference_ids),
+            on="gene_id", how="left", validate="one_to_one",
+        )
+        for column in (
+            "tested", "significant", "model_disagreement", "model_signs_unavailable"
+        ):
+            table[f"{prefix}_{column}"] = (
+                table[f"{prefix}_{column}"].astype("boolean").fillna(False).astype(bool)
+            )
+        table[f"{prefix}_status"] = table.apply(
+            _direction_status, axis=1, prefix=prefix
+        )
+    return table
+
+
+def direction_bulk_table(tables: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    """Combine significant cell types as equal votes, retaining model conflicts."""
+    combined = pd.concat(tables, ignore_index=True)
+    rows = []
+    for gene_id, group in combined.groupby("gene_id", sort=False):
+        row = {
+            "gene_id": gene_id,
+            "gene_symbol": group["gene_symbol"].iloc[0],
+            "reference_sign": int(group["reference_sign"].iloc[0]),
+        }
+        for column in (
+            "direction_interpretation", "max_source_coloc_pp_h4",
+            "any_coloc_pp4_gt_0_8", "source_url",
+        ):
+            if column in group:
+                row[column] = group[column].iloc[0]
+        for prefix in ("this_study", "ctpred"):
+            hits = group[group[f"{prefix}_significant"]]
+            signs = hits[f"{prefix}_sign"]
+            positive = int(signs.eq(1).sum())
+            negative = int(signs.eq(-1).sum())
+            missing = int(len(hits) - positive - negative)
+            mixed_models = int(hits[f"{prefix}_model_disagreement"].sum())
+            unavailable = int(hits[f"{prefix}_model_signs_unavailable"].sum())
+            row[f"{prefix}_n_tested_cell_types"] = int(group[f"{prefix}_tested"].sum())
+            row[f"{prefix}_n_significant_cell_types"] = len(hits)
+            row[f"{prefix}_n_positive_cell_types"] = positive
+            row[f"{prefix}_n_negative_cell_types"] = negative
+            row[f"{prefix}_n_missing_or_zero_cell_types"] = missing
+            row[f"{prefix}_n_model_disagreement_cell_types"] = mixed_models
+            row[f"{prefix}_n_models_unavailable_cell_types"] = unavailable
+            row[f"{prefix}_across_cell_disagreement"] = bool(positive and negative)
+            if hits.empty:
+                status = "no_hit"
+            elif mixed_models:
+                status = "mixed_models"
+            elif unavailable:
+                status = "models_unavailable"
+            elif positive and negative:
+                status = "mixed_cell_types"
+            elif missing:
+                status = "missing_or_zero"
+            else:
+                sign = 1 if positive else -1
+                status = "concordant" if sign == row["reference_sign"] else "discordant"
+            row[f"{prefix}_status"] = status
+            row[f"{prefix}_sign"] = (
+                1 if status in ("concordant", "discordant") and positive else
+                -1 if status in ("concordant", "discordant") else np.nan
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _direction_metrics(table: pd.DataFrame, arm: str, *, bulk: bool) -> dict[str, int | float]:
+    prefix = "this_study" if arm == "this-study" else "ctpred"
+    status = table[f"{prefix}_status"]
+    no_hit = "no_hit" if bulk else "not_significant"
+    metrics: dict[str, int | float] = {
+        "n_reference_genes": len(table),
+        "n_tested": int((
+            table[f"{prefix}_n_tested_cell_types"].gt(0) if bulk
+            else table[f"{prefix}_tested"]
+        ).sum()),
+        "n_significant": int((~status.isin((no_hit, "not_tested"))).sum()),
+    }
+    for label in (
+        "concordant", "discordant", "mixed_models",
+        "mixed_cell_types", "missing_or_zero", "models_unavailable",
+    ):
+        metrics[f"n_{label}"] = int(status.eq(label).sum())
+    definite = metrics["n_concordant"] + metrics["n_discordant"]
+    metrics["fraction_concordant_definite"] = _rate(metrics["n_concordant"], definite)
+    return metrics
+
+
+def _direction_comparison_metrics(
+    table: pd.DataFrame, *, bulk: bool
+) -> dict[str, int | float]:
+    ours = table["this_study_status"]
+    theirs = table["ctpred_status"]
+    excluded = ("no_hit", "not_tested") if bulk else ("not_significant", "not_tested")
+    both = ~ours.isin(excluded) & ~theirs.isin(excluded)
+    definite = (
+        both
+        & ours.isin(("concordant", "discordant"))
+        & theirs.isin(("concordant", "discordant"))
+    )
+    n_same = int((definite & ours.eq(theirs)).sum())
+    return {
+        "n_both_significant": int(both.sum()),
+        "n_both_definite": int(definite.sum()),
+        "n_same_sign": n_same,
+        "n_opposite_sign": int((definite & ours.ne(theirs)).sum()),
+        "n_any_uncertain": int((both & ~definite).sum()),
+        "fraction_same_sign_definite": _rate(n_same, int(definite.sum())),
+    }
+
+
 def _arm_min_agreement(args: argparse.Namespace, arm: str) -> float | None:
     if arm != "this-study":
         return None
@@ -1504,6 +1776,9 @@ def _wandb_config(args: argparse.Namespace, arm: str, cell_type: str) -> dict:
         "mhc_region": args.mhc_region,
         "input_dir": str(args.input_dir),
         "silver_standard": str(args.silver_standard),
+        "sle_sign_silver_standard": (
+            str(args.sle_sign_silver_standard) if args.sle_sign_silver_standard else None
+        ),
     }
 
 
@@ -1634,6 +1909,7 @@ def _arm_payload(
     other_pvalues: pd.Series | None = None,
     other_pvalue_gene_names: dict[str, str] | None = None,
     include_shared: bool = True,
+    direction_table: pd.DataFrame | None = None,
 ) -> tuple[dict[str, int | float], dict[str, Figure], dict[str, pd.DataFrame]]:
     summary: dict[str, int | float] = {}
     tables: dict[str, pd.DataFrame] = {}
@@ -1734,6 +2010,17 @@ def _arm_payload(
             silver,
             cell_type,
         )
+    if direction_table is not None:
+        for name, value in _direction_metrics(
+            direction_table, arm, bulk=cell_type == BULK_LABEL
+        ).items():
+            summary[_log_key("direction", name)] = value
+        if include_shared:
+            tables[_log_key("direction", "gene_signs")] = direction_table
+            for name, value in _direction_comparison_metrics(
+                direction_table, bulk=cell_type == BULK_LABEL
+            ).items():
+                summary[_log_key("direction/comparison", name)] = value
     return summary, figures, tables
 
 
@@ -1784,6 +2071,7 @@ def _emit_from_scores(
     extra_config: dict | None = None,
     pvalues_by_arm: dict[str, pd.Series] | None = None,
     gene_names_by_arm: dict[str, dict[str, str]] | None = None,
+    direction_table: pd.DataFrame | None = None,
 ) -> None:
     for arm in ARMS:
         include_shared = arm == SHARED_ARM
@@ -1810,6 +2098,7 @@ def _emit_from_scores(
             other_pvalues=other_pvalues,
             other_pvalue_gene_names=other_names,
             include_shared=include_shared,
+            direction_table=direction_table,
         )
         _write_local(args.output_dir, cell_type, arm, figures, tables, args.dpi)
         run_name = f"benchmark-{arm}/{cell_type}"
@@ -1834,6 +2123,7 @@ def _emit_benchmark(
     silver: SilverStandard,
     args: argparse.Namespace,
     logger: TwasWandBLogger,
+    direction_table: pd.DataFrame | None = None,
 ) -> tuple[
     dict[str, dict[str, dict[str, Recovery]]],
     dict[str, dict[str, float]],
@@ -1867,6 +2157,7 @@ def _emit_benchmark(
         args=args,
         logger=logger,
         universe_size=float(len(universe)),
+        direction_table=direction_table,
     )
     return scores, gene_overlap, block_overlap, len(universe)
 
@@ -1890,6 +2181,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         silver = load_silver_standard(
             args.silver_standard, args.mhc_region, mhc_gene_ids
         )
+        sign_reference = (
+            load_sign_standard(args.sle_sign_silver_standard)
+            if args.sle_sign_silver_standard is not None else None
+        )
         logger = TwasWandBLogger(
             project=args.wandb_project, entity=args.wandb_entity
         )
@@ -1899,6 +2194,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         universe_sizes: list[float] = []
         collected_ours: list[ArmHits] = []
         collected_theirs: list[ArmHits] = []
+        direction_tables: list[pd.DataFrame] = []
         for cell_type, ours_path, theirs_path in paired:
             ours = load_arm_hits(
                 ours_path,
@@ -1920,6 +2216,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.mhc_region,
                 mhc_gene_ids,
             )
+            direction_table = (
+                direction_cell_table(
+                    sign_reference, cell_type, ours_path, theirs_path, args
+                )
+                if sign_reference is not None else None
+            )
+            if direction_table is not None:
+                direction_tables.append(direction_table)
             scores, gene_overlap, block_overlap, n_universe = _emit_benchmark(
                 cell_type=cell_type,
                 ours=ours,
@@ -1927,6 +2231,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 silver=silver,
                 args=args,
                 logger=logger,
+                direction_table=direction_table,
             )
             collected_scores.append(scores)
             collected_gene_overlap.append(gene_overlap)
@@ -1943,6 +2248,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         ours_pvalues, ours_names = _acat_arm_pvalues(collected_ours)
         theirs_pvalues, theirs_names = _acat_arm_pvalues(collected_theirs)
+        bulk_directions = (
+            direction_bulk_table(direction_tables) if direction_tables else None
+        )
         _log_scores(BULK_LABEL, mean_scores, n_cell_types=len(paired))
         _emit_from_scores(
             cell_type=BULK_LABEL,
@@ -1963,6 +2271,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "this-study": ours_names,
                 "ctPred": theirs_names,
             },
+            direction_table=bulk_directions,
         )
     except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as error:
         LOGGER.error("%s", error)
